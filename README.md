@@ -128,9 +128,9 @@ process(2);
 
 Supports `for (let i = <lit>; i <(=) <lit>; i(++|+= <lit>)) { ... }` and `for (const x of <array literal>) { ... }`. Warns and leaves the loop untouched if the trip count isn't static or the body has loop-crossing `break`/`continue`/`return`.
 
-### `@cc-optimize` — umbrella
+### `@cc-optimize`
 
-Implies `@cc-inline-body` + `@cc-sroa` + `@cc-unroll`. Intentionally does **not** imply `@cc-inline` — whether V8 sees a function at all at its declaration site is a separate concern from how aggressively its body is optimized.
+Applies `@cc-inline-body` + `@cc-sroa` + `@cc-unroll`. Intentionally does **not** apply `@cc-inline`.
 
 ```ts
 /* @cc-optimize */
