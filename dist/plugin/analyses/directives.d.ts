@@ -6,12 +6,12 @@
  * sroa / unroll transforms, the unplugin skip-gate) import from this file
  * so adding or renaming a directive is a one-line change.
  */
-export type DirectiveKind = 'inline' | 'inline-body' | 'sroa' | 'unroll' | 'optimize';
+export type DirectiveKind = 'inline' | 'flatten' | 'sroa' | 'unroll' | 'optimize';
 /**
- * Authored-form patterns. The `inline` regex excludes the `-body` suffix so
- * `@inline-body` doesn't also register as `@inline`. `\b` at the tail stops
- * `@inline` from matching the `@inlined` breadcrumb compilecat writes back
- * into the output.
+ * Authored-form patterns. `\b` at the tail of `@inline` stops it from
+ * matching the `@applied-inline` breadcrumb compilecat writes back into the
+ * output. `@flatten` takes `__attribute__((flatten))`'s name — it means
+ * "treat every resolvable call inside this scope as `@inline`."
  */
 export declare const DIRECTIVE_PATTERNS: Record<DirectiveKind, RegExp>;
 /**
@@ -23,11 +23,11 @@ export declare const DIRECTIVE_PATTERNS: Record<DirectiveKind, RegExp>;
 export declare const OPTIMIZE_DIRECTIVES: readonly DirectiveKind[];
 /**
  * True iff `value` (the text inside a `/* ... *​/` block comment) matches
- * the inline-specific directives — `@inline` or `@inline-body`. Used
- * by the post-inline sweep to strip consumed inline markers without touching
+ * the inline-specific directives — `@inline` or `@flatten`. Used by the
+ * post-inline sweep to strip consumed inline markers without touching
  * `@sroa`, `@unroll`, or `@optimize`, which later passes still need to read.
  *
- * Matches directives authored in the source, not the `@inlined` breadcrumb
+ * Matches directives authored in the source, not the `@applied-inline` breadcrumb
  * compilecat writes back into the output.
  */
 export declare function commentIsInlineDirective(value: string): boolean;

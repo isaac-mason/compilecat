@@ -72,12 +72,12 @@ function step(out: Vec3, v: Vec3) {
 
 Library (`node_modules`) inlining happens only at explicitly annotated call sites — compilecat never eagerly scans `node_modules`.
 
-### `@inline-body` — inline every call inside this function
+### `@flatten` — inline every call inside this function
 
 A caller-side bulk directive. Every resolvable call inside the annotated function's body is treated as if its call site had `/* @inline */`.
 
 ```ts
-/* @inline-body */
+/* @flatten */
 function step(out: Vec3, v: Vec3) {
     vec3.normalize(out, v);
     vec3.scale(out, out, 2);
@@ -130,7 +130,7 @@ Supports `for (let i = <lit>; i <(=) <lit>; i(++|+= <lit>)) { ... }` and `for (c
 
 ### `@optimize`
 
-Applies `@inline-body` + `@sroa` + `@unroll`. Intentionally does **not** apply `@inline`.
+Applies `@flatten` + `@sroa` + `@unroll`. Intentionally does **not** apply `@inline`.
 
 ```ts
 /* @optimize */

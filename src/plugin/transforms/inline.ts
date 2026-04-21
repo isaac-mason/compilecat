@@ -111,7 +111,7 @@ export function applyInline(
     const requiredModuleVars = new Map<string, RequiredModuleVar>();
     const requiredImports = new Map<string, RequiredImport>();
 
-    // Fixpoint: an `@inline-body` zone can expose chained calls only revealed
+    // Fixpoint: an `@flatten` zone can expose chained calls only revealed
     // after the first pass. Each pass is O(AST) so we cap at a small N.
     const MAX_PASSES = 8;
     let overallChanged = false;
@@ -154,9 +154,9 @@ export function applyInline(
     // from their own file — we only operate on the consumer AST.
     removeInlinedDeclarations(ast, localPool);
 
-    // `@inline` / `@inline-body` markers are directives consumed by this
+    // `@inline` / `@flatten` markers are directives consumed by this
     // transform. Once we've inlined, leaving them in the output is noise
-    // (often alongside `@inlined` breadcrumbs). Babel can also park a
+    // (often alongside `@applied-inline` breadcrumbs). Babel can also park a
     // block comment authored between two statements as a *trailing* comment
     // on the preceding one, so per-callsite stripping by itself isn't enough.
     stripInlineMarkersGlobally(ast);
@@ -328,7 +328,7 @@ function inlineDependenciesBottomUp(pool: Map<string, Inlineable>): void {
         const localOnly = new Map<string, RequiredModuleVar>();
         const localImports = new Map<string, RequiredImport>();
         // Fresh zones state per wrapper — the wrapper's synthetic
-        // `__inline_wrapper__` function has no `@inline-body` comment, so
+        // `__inline_wrapper__` function has no `@flatten` comment, so
         // there's nothing meaningful to cache between pool entries.
         inlineCallsitesInAst(
             wrapper,
@@ -346,7 +346,7 @@ function inlineDependenciesBottomUp(pool: Map<string, Inlineable>): void {
             // the enclosing function's *params* (e.g. `proximity(o, a)` where
             // o/a are select's params). Those disappear once select gets
             // inlined at its real callsite, leaving a misleading breadcrumb.
-            // Only the final outer pass tags breadcrumbs so every `@inlined`
+            // Only the final outer pass tags breadcrumbs so every `@applied-inline`
             // sig reflects a call that actually appeared in the source.
             false,
         );
@@ -375,12 +375,12 @@ function walkCalls(node: t.Node, cb: (callee: string) => void): void {
 
 /**
  * A callsite is opted-in when either the original `@inline` marker is present
- * or any ancestor carries an `@inline-body` comment. The ancestor walk is
+ * or any ancestor carries an `@flatten` comment. The ancestor walk is
  * delegated to `Zones.isInZone`, which caches results per node so repeated
  * queries in the same function body are O(1) after the first resolution.
  */
 function isCallOptedIn(path: NodePath<t.CallExpression>, zones: Zones.State): boolean {
-    return callSiteHasInlineAnnotation(path) || Zones.isInZone(zones, path, 'inline-body');
+    return callSiteHasInlineAnnotation(path) || Zones.isInZone(zones, path, 'flatten');
 }
 
 /**
@@ -388,7 +388,7 @@ function isCallOptedIn(path: NodePath<t.CallExpression>, zones: Zones.State): bo
  * inlined. Non-null result means the callsite is eligible:
  *   - a decl-annotated local callee (no callsite annotation needed), or
  *   - any other callee the callsite has opted into via `/* @inline *​/` or
- *     by sitting inside an `@inline-body`-annotated function.
+ *     by sitting inside an `@flatten`-annotated function.
  */
 function resolveCallee(
     path: NodePath<t.CallExpression>,
@@ -428,7 +428,7 @@ function resolveCallee(
         }
 
         // Local function without decl-annotation — needs callsite opt-in
-        // (either `/* @inline */` at the call, or caller is `@inline-body`).
+        // (either `/* @inline */` at the call, or caller is `@flatten`).
         if (!isCallOptedIn(path, zones)) return null;
         const localFn = consumerIndex.functions.get(name);
         if (localFn) {
@@ -556,7 +556,7 @@ function resolveImportBinding(
     }
 
     // Not decl-annotated in the donor — needs callsite opt-in (direct
-    // `/* @inline */` or an enclosing `@inline-body` function).
+    // `/* @inline */` or an enclosing `@flatten` function).
     if (!isCallOptedIn(path, zones)) return null;
     const fn = entry.index.functions.get(importedName);
     if (!fn) return null;
@@ -723,7 +723,7 @@ function isSimpleReturnBody(body: t.BlockStatement): boolean {
 /**
  * Strip any `@inline` block comment from `node.leadingComments`. Called
  * before we splice in a replacement so the original marker doesn't float
- * onto whatever we emit. We tag the replacement with `@inlined <sig>`.
+ * onto whatever we emit. We tag the replacement with `@applied-inline <sig>`.
  */
 function stripInlineLeading(node: t.Node): void {
     const n = node as { leadingComments?: readonly t.Comment[] | null };
@@ -742,7 +742,7 @@ function isInlineMarkerComment(value: string): boolean {
 }
 
 /**
- * Final sweep: drop every `@inline` / `@inline-body` block comment from every
+ * Final sweep: drop every `@inline` / `@flatten` block comment from every
  * comment slot in the consumer AST. Covers the cases where Babel attached the
  * marker as trailing on a preceding sibling, inner on a parent block, or
  * leading on a node we didn't touch directly.
@@ -792,9 +792,14 @@ function breadcrumbFor(callPath: NodePath<t.CallExpression>): string {
     return src.replace(/\s+/g, ' ').trim();
 }
 
-/** Add a leading ` @inlined <sig> ` block comment to `node`. */
+/**
+ * Add a leading ` @applied-inline <sig> ` block comment to `node`. The
+ * `@applied-*` prefix marks compilecat-emitted breadcrumbs — never user-
+ * authored — so they're trivially distinguishable from consumable directives
+ * when reading the output.
+ */
 function tagInlined(node: t.Node, sig: string): void {
-    t.addComment(node, 'leading', ` @inlined ${sig} `);
+    t.addComment(node, 'leading', ` @applied-inline ${sig} `);
 }
 
 // ============================================================================
@@ -834,7 +839,7 @@ function inlineSimpleReturn(
 
     // Strip the original `@inline` marker from the callsite and any enclosing
     // statement before replacement, then tag the substituted expression with
-    // `@inlined <sig>` as a breadcrumb.
+    // `@applied-inline <sig>` as a breadcrumb.
     stripInlineLeading(callPath.node);
     const parentStmt = callPath.parentPath;
     if (parentStmt?.isStatement()) stripInlineLeading(parentStmt.node);

@@ -25,13 +25,13 @@ function runProject(files: Record<string, string>, entry: string): string {
 	return generate(ast, { retainLines: false, comments: false }).code.trim();
 }
 
-describe('plugin-alt/transforms/inline — @inline-body', () => {
+describe('plugin-alt/transforms/inline — @flatten', () => {
 	it('inlines unannotated local calls inside a zoned function', () => {
 		const code = `
 			function neg(x) { return -x; }
 			function add(a, b) { return a + b; }
 
-			/* @inline-body */
+			/* @flatten */
 			export function work(x, y) {
 				return add(neg(x), y);
 			}
@@ -64,7 +64,7 @@ describe('plugin-alt/transforms/inline — @inline-body', () => {
 			function b(x) { return a(x) * 2; }
 			function c(x) { return b(x) - 3; }
 
-			/* @inline-body */
+			/* @flatten */
 			export function work(x) {
 				return c(x);
 			}
@@ -76,12 +76,12 @@ describe('plugin-alt/transforms/inline — @inline-body', () => {
 	});
 
 	it('is distinct from @inline (does not cause cross-file callsite opt-in elsewhere)', () => {
-		// `@inline-body` on `work` opts in every call *inside work*. It must
+		// `@flatten` on `work` opts in every call *inside work*. It must
 		// NOT retroactively opt in unannotated calls elsewhere in the file.
 		const code = `
 			function helper(x) { return x * 10; }
 
-			/* @inline-body */
+			/* @flatten */
 			export function work(x) {
 				return helper(x);
 			}
@@ -105,7 +105,7 @@ describe('plugin-alt/transforms/inline — @inline-body', () => {
 			'/proj/main.ts': `
 				import { square } from './util';
 
-				/* @inline-body */
+				/* @flatten */
 				export function work(x) {
 					return square(x) + 1;
 				}
@@ -120,7 +120,7 @@ describe('plugin-alt/transforms/inline — @inline-body', () => {
 		const code = `
 			function cube(out, x) { out[0] = x; out[1] = x * x; out[2] = x * x * x; }
 
-			/* @inline-body */
+			/* @flatten */
 			export function work(buf, v) {
 				cube(buf, v);
 			}
@@ -129,6 +129,6 @@ describe('plugin-alt/transforms/inline — @inline-body', () => {
 		applyInline(ast, '/proj/main.ts', { effects: Effects.init() });
 		const out = generate(ast, { retainLines: false }).code;
 		// breadcrumb preserves the arg names as authored
-		expect(out).toContain('@inlined cube(buf, v)');
+		expect(out).toContain('@applied-inline cube(buf, v)');
 	});
 });

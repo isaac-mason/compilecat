@@ -1,7 +1,7 @@
 import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 export declare function hasInlineAnnotation(node: t.Node | null | undefined): boolean;
-export declare function hasInlineBodyAnnotation(node: t.Node | null | undefined): boolean;
+export declare function hasFlattenAnnotation(node: t.Node | null | undefined): boolean;
 export declare function hasSroaAnnotation(node: t.Node | null | undefined): boolean;
 export declare function hasUnrollAnnotation(node: t.Node | null | undefined): boolean;
 /**
@@ -19,10 +19,11 @@ export type IndexedFunction = {
     body: t.BlockStatement;
     hasInlineAnnotation: boolean;
     /**
-     * `@inline-body` — caller-side bulk directive. Any resolvable call
+     * `@flatten` — caller-side bulk directive. Any resolvable call
      * inside this function's body is treated as if its callsite had `@inline`.
+     * Mirrors GCC's `__attribute__((flatten))`.
      */
-    hasInlineBodyAnnotation: boolean;
+    hasFlattenAnnotation: boolean;
     /** body is `{ return <expr>; }` with no other statements. */
     isSimpleReturn: boolean;
     /** when isSimpleReturn, the expression returned. */

@@ -20,7 +20,7 @@ import { DIRECTIVE_PATTERNS } from './directives';
 // Directive patterns live in `directives.ts` — imported here rather than
 // duplicated so adding or renaming a directive is a one-line change.
 const INLINE_PATTERN = DIRECTIVE_PATTERNS.inline;
-const INLINE_BODY_PATTERN = DIRECTIVE_PATTERNS['inline-body'];
+const FLATTEN_PATTERN = DIRECTIVE_PATTERNS.flatten;
 const SROA_PATTERN = DIRECTIVE_PATTERNS.sroa;
 const UNROLL_PATTERN = DIRECTIVE_PATTERNS.unroll;
 const OPTIMIZE_PATTERN = DIRECTIVE_PATTERNS.optimize;
@@ -36,8 +36,8 @@ export function hasInlineAnnotation(node: t.Node | null | undefined): boolean {
     return hasBlockAnnotation(node, INLINE_PATTERN);
 }
 
-export function hasInlineBodyAnnotation(node: t.Node | null | undefined): boolean {
-    return hasBlockAnnotation(node, INLINE_BODY_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
+export function hasFlattenAnnotation(node: t.Node | null | undefined): boolean {
+    return hasBlockAnnotation(node, FLATTEN_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
 }
 
 export function hasSroaAnnotation(node: t.Node | null | undefined): boolean {
@@ -72,10 +72,11 @@ export type IndexedFunction = {
     body: t.BlockStatement;
     hasInlineAnnotation: boolean;
     /**
-     * `@inline-body` — caller-side bulk directive. Any resolvable call
+     * `@flatten` — caller-side bulk directive. Any resolvable call
      * inside this function's body is treated as if its callsite had `@inline`.
+     * Mirrors GCC's `__attribute__((flatten))`.
      */
-    hasInlineBodyAnnotation: boolean;
+    hasFlattenAnnotation: boolean;
     /** body is `{ return <expr>; }` with no other statements. */
     isSimpleReturn: boolean;
     /** when isSimpleReturn, the expression returned. */
@@ -146,10 +147,10 @@ function collectStatement(
     imports: Map<string, ImportBinding>,
     namespaceReexports: Map<string, string>,
     inheritedInline: boolean,
-    inheritedInlineBody: boolean,
+    inheritedFlatten: boolean,
 ): void {
     const localInline = inheritedInline || hasInlineAnnotation(stmt);
-    const localInlineBody = inheritedInlineBody || hasInlineBodyAnnotation(stmt);
+    const localFlatten = inheritedFlatten || hasFlattenAnnotation(stmt);
 
     if (t.isImportDeclaration(stmt)) {
         recordImports(stmt, imports);
@@ -172,7 +173,7 @@ function collectStatement(
                 imports,
                 namespaceReexports,
                 localInline,
-                localInlineBody,
+                localFlatten,
             );
         }
         return;
@@ -180,12 +181,12 @@ function collectStatement(
     if (t.isExportDefaultDeclaration(stmt)) {
         const decl = stmt.declaration;
         if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
-            functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localInlineBody));
+            functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localFlatten));
         }
         return;
     }
     if (t.isFunctionDeclaration(stmt) && stmt.id) {
-        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localInlineBody));
+        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localFlatten));
         return;
     }
     if (t.isVariableDeclaration(stmt)) {
@@ -193,7 +194,7 @@ function collectStatement(
             if (!t.isIdentifier(decl.id)) continue;
             const name = decl.id.name;
             if (decl.init && (t.isArrowFunctionExpression(decl.init) || t.isFunctionExpression(decl.init))) {
-                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localInlineBody));
+                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localFlatten));
             } else {
                 moduleVars.set(name, { name, declaration: stmt, isExported: false });
             }
@@ -208,7 +209,7 @@ function buildFunctionEntry(
     fn: t.FunctionDeclaration | t.FunctionExpression | t.ArrowFunctionExpression,
     path: NodePath | null,
     hasInlineAnnotation: boolean,
-    hasInlineBodyAnnotation: boolean,
+    hasFlattenAnnotation: boolean,
 ): IndexedFunction {
     let body: t.BlockStatement;
     if (t.isBlockStatement(fn.body)) {
@@ -229,7 +230,7 @@ function buildFunctionEntry(
         params: fn.params,
         body,
         hasInlineAnnotation,
-        hasInlineBodyAnnotation,
+        hasFlattenAnnotation,
         isSimpleReturn,
         returnExpression,
         moduleVarRefs: new Set(),

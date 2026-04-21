@@ -27,14 +27,14 @@ const generate = unwrapDefault(_generate);
  * so adding or renaming a directive is a one-line change.
  */
 /**
- * Authored-form patterns. The `inline` regex excludes the `-body` suffix so
- * `@inline-body` doesn't also register as `@inline`. `\b` at the tail stops
- * `@inline` from matching the `@inlined` breadcrumb compilecat writes back
- * into the output.
+ * Authored-form patterns. `\b` at the tail of `@inline` stops it from
+ * matching the `@applied-inline` breadcrumb compilecat writes back into the
+ * output. `@flatten` takes `__attribute__((flatten))`'s name — it means
+ * "treat every resolvable call inside this scope as `@inline`."
  */
 const DIRECTIVE_PATTERNS = {
-    inline: /@inline(?!-body)\b/,
-    'inline-body': /@inline-body\b/,
+    inline: /@inline\b/,
+    flatten: /@flatten\b/,
     sroa: /@sroa\b/,
     unroll: /@unroll\b/,
     optimize: /@optimize\b/,
@@ -45,18 +45,18 @@ const DIRECTIVE_PATTERNS = {
  * might want a function heavily optimized without wanting V8 to inline it
  * at every callsite.
  */
-const OPTIMIZE_DIRECTIVES = ['inline-body', 'sroa', 'unroll'];
+const OPTIMIZE_DIRECTIVES = ['flatten', 'sroa', 'unroll'];
 /**
  * True iff `value` (the text inside a `/* ... *​/` block comment) matches
- * the inline-specific directives — `@inline` or `@inline-body`. Used
- * by the post-inline sweep to strip consumed inline markers without touching
+ * the inline-specific directives — `@inline` or `@flatten`. Used by the
+ * post-inline sweep to strip consumed inline markers without touching
  * `@sroa`, `@unroll`, or `@optimize`, which later passes still need to read.
  *
- * Matches directives authored in the source, not the `@inlined` breadcrumb
+ * Matches directives authored in the source, not the `@applied-inline` breadcrumb
  * compilecat writes back into the output.
  */
 function commentIsInlineDirective(value) {
-    return DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS['inline-body'].test(value);
+    return DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS.flatten.test(value);
 }
 /**
  * Fast pre-check for whole-file skip: does the source contain any of our
@@ -66,7 +66,7 @@ function commentIsInlineDirective(value) {
  * (so fewer wasted parses) at the cost of needing to update this regex when
  * we add a directive.
  */
-const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline(?:-body)?|sroa|unroll|optimize)\b/;
+const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
 
 /**
  * discover — builds a FileIndex for a single source file.
@@ -84,7 +84,7 @@ const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline(?:-body)?|sroa|unroll|optimize)\b/;
 // Directive patterns live in `directives.ts` — imported here rather than
 // duplicated so adding or renaming a directive is a one-line change.
 const INLINE_PATTERN = DIRECTIVE_PATTERNS.inline;
-const INLINE_BODY_PATTERN = DIRECTIVE_PATTERNS['inline-body'];
+const FLATTEN_PATTERN = DIRECTIVE_PATTERNS.flatten;
 const SROA_PATTERN = DIRECTIVE_PATTERNS.sroa;
 const UNROLL_PATTERN = DIRECTIVE_PATTERNS.unroll;
 const OPTIMIZE_PATTERN = DIRECTIVE_PATTERNS.optimize;
@@ -99,8 +99,8 @@ function hasBlockAnnotation(node, pattern) {
 function hasInlineAnnotation(node) {
     return hasBlockAnnotation(node, INLINE_PATTERN);
 }
-function hasInlineBodyAnnotation(node) {
-    return hasBlockAnnotation(node, INLINE_BODY_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
+function hasFlattenAnnotation(node) {
+    return hasBlockAnnotation(node, FLATTEN_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
 }
 function hasSroaAnnotation(node) {
     return hasBlockAnnotation(node, SROA_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
@@ -143,9 +143,9 @@ function indexFile(absolutePath, ast) {
  * Collect a top-level statement. The `inherited*` flags let a block comment
  * above an export declaration flow down to the exported function.
  */
-function collectStatement(stmt, sourceFile, functions, moduleVars, imports, namespaceReexports, inheritedInline, inheritedInlineBody) {
+function collectStatement(stmt, sourceFile, functions, moduleVars, imports, namespaceReexports, inheritedInline, inheritedFlatten) {
     const localInline = inheritedInline || hasInlineAnnotation(stmt);
-    const localInlineBody = inheritedInlineBody || hasInlineBodyAnnotation(stmt);
+    const localFlatten = inheritedFlatten || hasFlattenAnnotation(stmt);
     if (t.isImportDeclaration(stmt)) {
         recordImports(stmt, imports);
         return;
@@ -159,19 +159,19 @@ function collectStatement(stmt, sourceFile, functions, moduleVars, imports, name
             }
         }
         if (stmt.declaration) {
-            collectStatement(stmt.declaration, sourceFile, functions, moduleVars, imports, namespaceReexports, localInline, localInlineBody);
+            collectStatement(stmt.declaration, sourceFile, functions, moduleVars, imports, namespaceReexports, localInline, localFlatten);
         }
         return;
     }
     if (t.isExportDefaultDeclaration(stmt)) {
         const decl = stmt.declaration;
         if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
-            functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localInlineBody));
+            functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localFlatten));
         }
         return;
     }
     if (t.isFunctionDeclaration(stmt) && stmt.id) {
-        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localInlineBody));
+        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localFlatten));
         return;
     }
     if (t.isVariableDeclaration(stmt)) {
@@ -180,7 +180,7 @@ function collectStatement(stmt, sourceFile, functions, moduleVars, imports, name
                 continue;
             const name = decl.id.name;
             if (decl.init && (t.isArrowFunctionExpression(decl.init) || t.isFunctionExpression(decl.init))) {
-                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localInlineBody));
+                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localFlatten));
             }
             else {
                 moduleVars.set(name, { name, declaration: stmt, isExported: false });
@@ -189,7 +189,7 @@ function collectStatement(stmt, sourceFile, functions, moduleVars, imports, name
         return;
     }
 }
-function buildFunctionEntry(name, sourceFile, fn, path, hasInlineAnnotation, hasInlineBodyAnnotation) {
+function buildFunctionEntry(name, sourceFile, fn, path, hasInlineAnnotation, hasFlattenAnnotation) {
     let body;
     if (t.isBlockStatement(fn.body)) {
         body = fn.body;
@@ -207,7 +207,7 @@ function buildFunctionEntry(name, sourceFile, fn, path, hasInlineAnnotation, has
         params: fn.params,
         body,
         hasInlineAnnotation,
-        hasInlineBodyAnnotation,
+        hasFlattenAnnotation,
         isSimpleReturn,
         returnExpression,
         moduleVarRefs: new Set(),
@@ -1046,7 +1046,7 @@ function applyInline(ast, absolutePath, options) {
     const externalPools = new Map();
     const requiredModuleVars = new Map();
     const requiredImports = new Map();
-    // Fixpoint: an `@inline-body` zone can expose chained calls only revealed
+    // Fixpoint: an `@flatten` zone can expose chained calls only revealed
     // after the first pass. Each pass is O(AST) so we cap at a small N.
     const MAX_PASSES = 8;
     let overallChanged = false;
@@ -1075,9 +1075,9 @@ function applyInline(ast, absolutePath, options) {
     // callsites may not be annotated). Cross-file donors are never removed
     // from their own file — we only operate on the consumer AST.
     removeInlinedDeclarations(ast, localPool);
-    // `@inline` / `@inline-body` markers are directives consumed by this
+    // `@inline` / `@flatten` markers are directives consumed by this
     // transform. Once we've inlined, leaving them in the output is noise
-    // (often alongside `@inlined` breadcrumbs). Babel can also park a
+    // (often alongside `@applied-inline` breadcrumbs). Babel can also park a
     // block comment authored between two statements as a *trailing* comment
     // on the preceding one, so per-callsite stripping by itself isn't enough.
     stripInlineMarkersGlobally(ast);
@@ -1249,14 +1249,14 @@ function inlineDependenciesBottomUp(pool) {
         const localOnly = new Map();
         const localImports = new Map();
         // Fresh zones state per wrapper — the wrapper's synthetic
-        // `__inline_wrapper__` function has no `@inline-body` comment, so
+        // `__inline_wrapper__` function has no `@flatten` comment, so
         // there's nothing meaningful to cache between pool entries.
         inlineCallsitesInAst(wrapper, '__wrapper__.ts', null, pool, new Map(), localOnly, localImports, undefined, defaultFileReader, false, init(), 
         // Breadcrumbs at this stage would record callsite args against
         // the enclosing function's *params* (e.g. `proximity(o, a)` where
         // o/a are select's params). Those disappear once select gets
         // inlined at its real callsite, leaving a misleading breadcrumb.
-        // Only the final outer pass tags breadcrumbs so every `@inlined`
+        // Only the final outer pass tags breadcrumbs so every `@applied-inline`
         // sig reflects a call that actually appeared in the source.
         false);
     }
@@ -1284,19 +1284,19 @@ function walkCalls(node, cb) {
 // ============================================================================
 /**
  * A callsite is opted-in when either the original `@inline` marker is present
- * or any ancestor carries an `@inline-body` comment. The ancestor walk is
+ * or any ancestor carries an `@flatten` comment. The ancestor walk is
  * delegated to `Zones.isInZone`, which caches results per node so repeated
  * queries in the same function body are O(1) after the first resolution.
  */
 function isCallOptedIn(path, zones) {
-    return callSiteHasInlineAnnotation(path) || isInZone(zones, path, 'inline-body');
+    return callSiteHasInlineAnnotation(path) || isInZone(zones, path, 'flatten');
 }
 /**
  * Resolve a CallExpression to an Inlineable, or null if it should not be
  * inlined. Non-null result means the callsite is eligible:
  *   - a decl-annotated local callee (no callsite annotation needed), or
  *   - any other callee the callsite has opted into via `/* @inline *​/` or
- *     by sitting inside an `@inline-body`-annotated function.
+ *     by sitting inside an `@flatten`-annotated function.
  */
 function resolveCallee(path, consumerFile, consumerIndex, localPool, externalPools, cache, reader, allowLibrary, zones) {
     const callee = path.node.callee;
@@ -1314,7 +1314,7 @@ function resolveCallee(path, consumerFile, consumerIndex, localPool, externalPoo
             return resolveImportBinding(path, consumerFile, binding, binding.importedName, externalPools, cache, reader, allowLibrary, zones);
         }
         // Local function without decl-annotation — needs callsite opt-in
-        // (either `/* @inline */` at the call, or caller is `@inline-body`).
+        // (either `/* @inline */` at the call, or caller is `@flatten`).
         if (!isCallOptedIn(path, zones))
             return null;
         const localFn = consumerIndex.functions.get(name);
@@ -1395,7 +1395,7 @@ function resolveImportBinding(path, consumerFile, binding, importedName, externa
         };
     }
     // Not decl-annotated in the donor — needs callsite opt-in (direct
-    // `/* @inline */` or an enclosing `@inline-body` function).
+    // `/* @inline */` or an enclosing `@flatten` function).
     if (!isCallOptedIn(path, zones))
         return null;
     const fn = entry.index.functions.get(importedName);
@@ -1505,7 +1505,7 @@ function isSimpleReturnBody(body) {
 /**
  * Strip any `@inline` block comment from `node.leadingComments`. Called
  * before we splice in a replacement so the original marker doesn't float
- * onto whatever we emit. We tag the replacement with `@inlined <sig>`.
+ * onto whatever we emit. We tag the replacement with `@applied-inline <sig>`.
  */
 function stripInlineLeading(node) {
     const n = node;
@@ -1521,7 +1521,7 @@ function isInlineMarkerComment(value) {
     return commentIsInlineDirective(value);
 }
 /**
- * Final sweep: drop every `@inline` / `@inline-body` block comment from every
+ * Final sweep: drop every `@inline` / `@flatten` block comment from every
  * comment slot in the consumer AST. Covers the cases where Babel attached the
  * marker as trailing on a preceding sibling, inner on a parent block, or
  * leading on a node we didn't touch directly.
@@ -1563,9 +1563,14 @@ function breadcrumbFor(callPath) {
     }).code;
     return src.replace(/\s+/g, ' ').trim();
 }
-/** Add a leading ` @inlined <sig> ` block comment to `node`. */
+/**
+ * Add a leading ` @applied-inline <sig> ` block comment to `node`. The
+ * `@applied-*` prefix marks compilecat-emitted breadcrumbs — never user-
+ * authored — so they're trivially distinguishable from consumable directives
+ * when reading the output.
+ */
 function tagInlined(node, sig) {
-    t.addComment(node, 'leading', ` @inlined ${sig} `);
+    t.addComment(node, 'leading', ` @applied-inline ${sig} `);
 }
 // ============================================================================
 // Callsite splicing
@@ -1598,7 +1603,7 @@ function inlineSimpleReturn(callPath, entry, tagBreadcrumbs) {
     const renamedRet = wrapperBody.body[0].argument;
     // Strip the original `@inline` marker from the callsite and any enclosing
     // statement before replacement, then tag the substituted expression with
-    // `@inlined <sig>` as a breadcrumb.
+    // `@applied-inline <sig>` as a breadcrumb.
     stripInlineLeading(callPath.node);
     const parentStmt = callPath.parentPath;
     if (parentStmt?.isStatement())
@@ -2482,11 +2487,27 @@ function rewriteDeclarations(safe) {
             // `const` → `let` because we may write to the scalars later.
             declStmt.kind = 'let';
             declStmt.declarations = newDeclarators;
+            tagAppliedSroa(declStmt, c.name, c.initExprs);
         }
         else {
             declStmt.declarations.splice(idx, 1, ...newDeclarators);
+            // Multi-decl — tag the first new declarator so the breadcrumb sits
+            // adjacent to the scalars without being mistaken for a directive
+            // on the sibling declarations.
+            tagAppliedSroa(newDeclarators[0], c.name, c.initExprs);
         }
     }
+}
+/**
+ * Add a leading ` @applied-sroa <name> [<init0>, <init1>, ...] ` block comment,
+ * preserving the original initializer expressions so the breadcrumb reflects
+ * real values (e.g. `[0, 0, 0, 1]` for an identity quat) rather than indices.
+ * The `@applied-*` prefix marks compilecat-emitted breadcrumbs — never user-
+ * authored — so they're trivially distinguishable from consumable directives.
+ */
+function tagAppliedSroa(node, name, initExprs) {
+    const parts = initExprs.map((e) => e ? generate(e, { concise: true, comments: false }).code : 'undefined');
+    t.addComment(node, 'leading', ` @applied-sroa ${name} [${parts.join(', ')}] `);
 }
 function rewriteAccesses(ast, safe) {
     const byScope = new Map();
@@ -2609,6 +2630,7 @@ function unrollForStatement(path) {
     // and the next pass would try to unroll it again (the replacement isn't a
     // loop, but the warning path would fire).
     stripUnrollComments(path.node);
+    tagAppliedUnroll(unrolled[0], path.node, values.length);
     path.replaceWithMultiple(unrolled);
     return true;
 }
@@ -2719,6 +2741,7 @@ function unrollForOfStatement(path) {
         }
     }
     stripUnrollComments(node);
+    tagAppliedUnroll(unrolled[0], node, elements.length);
     path.replaceWithMultiple(unrolled);
     return true;
 }
@@ -2817,6 +2840,24 @@ function cloneAndSubstitute(stmt, varName, replacement) {
         },
     });
     return wrapper.program.body[0];
+}
+/**
+ * Add a leading ` @applied-unroll <loop header> (×N) ` block comment to the
+ * first of the unrolled statements. Stringifies the loop header by generating
+ * the original node with an empty body and trimming at the closing `)` so the
+ * breadcrumb shows the human-readable shape (`for (let i = 0; i < 4; i++)`,
+ * `for (const x of [a, b, c])`) without the full body text.
+ */
+function tagAppliedUnroll(node, loop, iterations) {
+    const clone = t.cloneNode(loop, true, true);
+    clone.body = t.blockStatement([]);
+    clone.leadingComments = null;
+    clone.trailingComments = null;
+    clone.innerComments = null;
+    const full = generate(clone, { concise: true, comments: false }).code;
+    const closeIdx = full.lastIndexOf(')');
+    const header = closeIdx >= 0 ? full.slice(0, closeIdx + 1) : full;
+    t.addComment(node, 'leading', ` @applied-unroll ${header} (×${iterations}) `);
 }
 function stripUnrollComments(node) {
     if (!node.leadingComments)

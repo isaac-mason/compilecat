@@ -178,7 +178,7 @@ describe('plugin-alt/transforms/inline — regression guards', () => {
 
 	it('breadcrumbs reflect real callsite args, not nested param names', () => {
 		// When `select` calls `proximity(o, a)` internally and `select` itself
-		// is inlined at a consumer callsite, the `@inlined` breadcrumb must
+		// is inlined at a consumer callsite, the `@applied-inline` breadcrumb must
 		// record the consumer's call (`select(X, Y, Z)`) — NOT the synthetic
 		// inner `proximity(o, a)` that never existed in the final source.
 		const input = `
@@ -198,11 +198,11 @@ describe('plugin-alt/transforms/inline — regression guards', () => {
 		`;
 		const out = run(input, /*withComments=*/ true);
 		// We want the outer breadcrumb with the real callsite:
-		expect(out).toMatch(/@inlined select\(origin, left, right\)/);
+		expect(out).toMatch(/@applied-inline select\(origin, left, right\)/);
 		// And we explicitly do NOT want `proximity(o, a)` or `proximity(o, b)`
 		// appearing — those were pre-inline artifacts.
-		expect(out).not.toMatch(/@inlined proximity\(o,\s*a\)/);
-		expect(out).not.toMatch(/@inlined proximity\(o,\s*b\)/);
+		expect(out).not.toMatch(/@applied-inline proximity\(o,\s*a\)/);
+		expect(out).not.toMatch(/@applied-inline proximity\(o,\s*b\)/);
 	});
 
 	it('sweeps residual @inline markers from the final AST, including trailing-on-prev', () => {
@@ -221,9 +221,9 @@ describe('plugin-alt/transforms/inline — regression guards', () => {
 			}
 		`;
 		const out = run(input, /*withComments=*/ true);
-		// No raw @inline / @inline-body markers should survive. Only the
-		// `@inlined <sig>` breadcrumb format is allowed.
+		// No raw @inline / @flatten markers should survive. Only the
+		// `@applied-inline <sig>` breadcrumb format is allowed.
 		expect(out).not.toMatch(/\/\*\s*@inline\s*\*\//);
-		expect(out).not.toMatch(/\/\*\s*@inline-body\s*\*\//);
+		expect(out).not.toMatch(/\/\*\s*@flatten\s*\*\//);
 	});
 });

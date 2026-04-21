@@ -2,7 +2,7 @@ import { type NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { DIRECTIVE_PATTERNS } from '../analyses/directives';
 import { hasUnrollAnnotation } from '../analyses/discover';
-import { traverse } from '../util/babel';
+import { generate, traverse } from '../util/babel';
 
 /**
  * Loop unrolling.
@@ -105,6 +105,7 @@ function unrollForStatement(path: NodePath<t.ForStatement>): boolean {
     // and the next pass would try to unroll it again (the replacement isn't a
     // loop, but the warning path would fire).
     stripUnrollComments(path.node);
+    tagAppliedUnroll(unrolled[0], path.node, values.length);
     path.replaceWithMultiple(unrolled);
     return true;
 }
@@ -216,6 +217,7 @@ function unrollForOfStatement(path: NodePath<t.ForOfStatement>): boolean {
     }
 
     stripUnrollComments(node);
+    tagAppliedUnroll(unrolled[0], node, elements.length);
     path.replaceWithMultiple(unrolled);
     return true;
 }
@@ -321,6 +323,29 @@ function cloneAndSubstitute(
     });
 
     return wrapper.program.body[0];
+}
+
+/**
+ * Add a leading ` @applied-unroll <loop header> (×N) ` block comment to the
+ * first of the unrolled statements. Stringifies the loop header by generating
+ * the original node with an empty body and trimming at the closing `)` so the
+ * breadcrumb shows the human-readable shape (`for (let i = 0; i < 4; i++)`,
+ * `for (const x of [a, b, c])`) without the full body text.
+ */
+function tagAppliedUnroll(
+    node: t.Node,
+    loop: t.ForStatement | t.ForOfStatement,
+    iterations: number,
+): void {
+    const clone = t.cloneNode(loop, true, true);
+    clone.body = t.blockStatement([]);
+    clone.leadingComments = null;
+    clone.trailingComments = null;
+    clone.innerComments = null;
+    const full = generate(clone, { concise: true, comments: false }).code;
+    const closeIdx = full.lastIndexOf(')');
+    const header = closeIdx >= 0 ? full.slice(0, closeIdx + 1) : full;
+    t.addComment(node, 'leading', ` @applied-unroll ${header} (×${iterations}) `);
 }
 
 function stripUnrollComments(node: t.Node): void {

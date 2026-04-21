@@ -1,7 +1,7 @@
 import { type NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { hasSroaAnnotation } from '../analyses/discover';
-import { traverse } from '../util/babel';
+import { generate, traverse } from '../util/babel';
 
 /**
  * Scalar Replacement of Aggregates (SROA).
@@ -239,10 +239,29 @@ function rewriteDeclarations(safe: Candidate[]): void {
             // `const` → `let` because we may write to the scalars later.
             declStmt.kind = 'let';
             declStmt.declarations = newDeclarators;
+            tagAppliedSroa(declStmt, c.name, c.initExprs);
         } else {
             declStmt.declarations.splice(idx, 1, ...newDeclarators);
+            // Multi-decl — tag the first new declarator so the breadcrumb sits
+            // adjacent to the scalars without being mistaken for a directive
+            // on the sibling declarations.
+            tagAppliedSroa(newDeclarators[0], c.name, c.initExprs);
         }
     }
+}
+
+/**
+ * Add a leading ` @applied-sroa <name> [<init0>, <init1>, ...] ` block comment,
+ * preserving the original initializer expressions so the breadcrumb reflects
+ * real values (e.g. `[0, 0, 0, 1]` for an identity quat) rather than indices.
+ * The `@applied-*` prefix marks compilecat-emitted breadcrumbs — never user-
+ * authored — so they're trivially distinguishable from consumable directives.
+ */
+function tagAppliedSroa(node: t.Node, name: string, initExprs: (t.Expression | undefined)[]): void {
+    const parts = initExprs.map((e) =>
+        e ? generate(e, { concise: true, comments: false }).code : 'undefined',
+    );
+    t.addComment(node, 'leading', ` @applied-sroa ${name} [${parts.join(', ')}] `);
 }
 
 function rewriteAccesses(ast: t.File, safe: Candidate[]): void {
