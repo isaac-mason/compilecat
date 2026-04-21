@@ -11,7 +11,9 @@
 
 # compilecat
 
-A JavaScript/TypeScript compiler plugin for hot-path optimizations — function inlining, scalar-replacement of aggregates (SROA), and loop unrolling — driven by opt-in `/* @cc-... */` annotations.
+> ⚠️ This is highly experimental! It's not clear yet if this tool is even a good idea! Browse to your heart's content but expect no stability right now.
+
+A JavaScript/TypeScript compiler plugin for hot-path optimizations — function inlining, scalar-replacement of aggregates (SROA), and loop unrolling — driven by opt-in annotations.
 
 Built with Babel, packaged with [unplugin](https://unplugin.unjs.io/) to work with rollup, vite, webpack, esbuild, and rolldown.
 
