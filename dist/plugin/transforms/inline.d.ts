@@ -7,10 +7,12 @@ import { type FileReader } from '../analyses/resolve';
  * Alt-native inliner.
  *
  * Layers (bottom → top):
- *   1. Single-file decl-annotated `@cc-inline` — bodies pre-inlined bottom-up
+ *   1. Single-file decl-annotated `@inline` — bodies pre-inlined bottom-up
  *      within the file, then substituted at four canonical callsite forms.
- *      Non-simple args hoisted once to `_arg_<param>_<suffix>` temps.
- *   2. Callsite-annotated calls (`/* @cc-inline *​/ foo()`) — opt-in inlining of
+ *      Non-simple args hoisted once to `_arg_<param>` temps, suffixed with
+ *      `_2`, `_3`, ... only when the base name collides with an existing
+ *      binding in the callsite's scope.
+ *   2. Callsite-annotated calls (`/* @inline *​/ foo()`) — opt-in inlining of
  *      a non-decl-annotated callee; applies to local functions and imports.
  *   3. Cross-file imports — relative imports resolve through FileCache +
  *      FileReader; imported function bodies are cloned and substituted just
@@ -18,7 +20,7 @@ import { type FileReader } from '../analyses/resolve';
  *      the consumer as needed.
  *   4. Library inlining — bare specifiers (`lodash`, `@scope/pkg`) walk up
  *      `node_modules`, honoring package.json exports / main / module. Only
- *      permitted with a callsite `@cc-inline` annotation, to keep library reach
+ *      permitted with a callsite `@inline` annotation, to keep library reach
  *      explicit at the call site.
  */
 export type Options = {
@@ -32,7 +34,7 @@ export type Options = {
     fileCache?: FileCache;
     /** File reader for cross-file inlining. Defaults to `defaultFileReader`. */
     fileReader?: FileReader;
-    /** Permit `node_modules` inlining via callsite `@cc-inline`. Default false. */
+    /** Permit `node_modules` inlining via callsite `@inline`. Default false. */
     allowLibraryInline?: boolean;
 };
 export declare function applyInline(ast: t.File, absolutePath: string, options: Options): boolean;

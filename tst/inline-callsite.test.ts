@@ -14,7 +14,7 @@ describe('plugin-alt/transforms/inline — callsite annotations (single-file)', 
 	it('inlines a non-annotated local function when the callsite opts in', () => {
 		const input = `
 			function add(a, b) { return a + b; }
-			const r = /* @cc-inline */ add(3, 4);
+			const r = /* @inline */ add(3, 4);
 			const s = add(5, 6);
 		`;
 		const out = run(input);
@@ -27,7 +27,7 @@ describe('plugin-alt/transforms/inline — callsite annotations (single-file)', 
 	it('inlines via callsite annotation on the parent ExpressionStatement', () => {
 		const input = `
 			function effect(v) { sink(v); }
-			/* @cc-inline */ effect(42);
+			/* @inline */ effect(42);
 		`;
 		const out = run(input);
 		expect(out).toContain('sink(42)');
@@ -37,7 +37,7 @@ describe('plugin-alt/transforms/inline — callsite annotations (single-file)', 
 	it('leaves other calls of the same function intact', () => {
 		const input = `
 			function square(x) { return x * x; }
-			const a = /* @cc-inline */ square(2);
+			const a = /* @inline */ square(2);
 			const b = square(3);
 		`;
 		const out = run(input);
@@ -47,7 +47,7 @@ describe('plugin-alt/transforms/inline — callsite annotations (single-file)', 
 
 	it('does nothing when the annotated callee cannot be resolved', () => {
 		const input = `
-			const r = /* @cc-inline */ unknownFunc(1, 2);
+			const r = /* @inline */ unknownFunc(1, 2);
 		`;
 		const out = run(input);
 		expect(out).toContain('unknownFunc(1, 2)');

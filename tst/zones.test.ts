@@ -40,9 +40,9 @@ describe('plugin-alt/analyses/zones', () => {
 		expect(Zones.isInZone(state, returnPath, 'inline')).toBe(false);
 	});
 
-	it('@cc-inline on enclosing function activates inline zone', () => {
+	it('@inline on enclosing function activates inline zone', () => {
 		const file = parseFile(`
-			/* @cc-inline */
+			/* @inline */
 			function f(x) { return x + 1; }
 		`);
 		const state = Zones.init();
@@ -51,9 +51,9 @@ describe('plugin-alt/analyses/zones', () => {
 		expect(Zones.isInZone(state, returnPath, 'sroa')).toBe(false);
 	});
 
-	it('@cc-sroa and @cc-inline combined on the same function', () => {
+	it('@sroa and @inline combined on the same function', () => {
 		const file = parseFile(`
-			/* @cc-inline @cc-sroa */
+			/* @inline @sroa */
 			function f(x) {
 				const tmp = [0, 0, 0];
 				return tmp[0] + x;
@@ -68,7 +68,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('annotation on outer function inherits to inner nodes', () => {
 		const file = parseFile(`
-			/* @cc-sroa */
+			/* @sroa */
 			function outer() {
 				function inner() {
 					const x = 1;
@@ -90,7 +90,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('annotation on a VariableDeclaration covers its RHS', () => {
 		const file = parseFile(`
-			/* @cc-sroa */
+			/* @sroa */
 			const scratch = [0, 0, 0];
 		`);
 		const state = Zones.init();
@@ -100,7 +100,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('line-comment annotations are ignored (must be block comments)', () => {
 		const file = parseFile(`
-			// @cc-inline
+			// @inline
 			function f() { return 1; }
 		`);
 		const state = Zones.init();
@@ -110,7 +110,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('sibling functions do not share zone membership', () => {
 		const file = parseFile(`
-			/* @cc-inline */
+			/* @inline */
 			function a() { return 1; }
 			function b() { return 2; }
 		`);
@@ -131,7 +131,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('caches: repeated queries return the same set reference', () => {
 		const file = parseFile(`
-			/* @cc-sroa */
+			/* @sroa */
 			function f() { const x = 1; return x; }
 		`);
 		const state = Zones.init();
@@ -143,7 +143,7 @@ describe('plugin-alt/analyses/zones', () => {
 
 	it('invalidateAll drops the cache', () => {
 		const file = parseFile(`
-			/* @cc-sroa */
+			/* @sroa */
 			function f() { const x = 1; return x; }
 		`);
 		const state = Zones.init();
@@ -156,10 +156,10 @@ describe('plugin-alt/analyses/zones', () => {
 		expect([...b]).toEqual([...a]);
 	});
 
-	it('@cc-unroll on a loop activates the unroll zone for its body', () => {
+	it('@unroll on a loop activates the unroll zone for its body', () => {
 		const file = parseFile(`
 			function f(arr) {
-				/* @cc-unroll */
+				/* @unroll */
 				for (let i = 0; i < 3; i++) { arr[i] = 0; }
 			}
 		`);

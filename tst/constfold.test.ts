@@ -18,7 +18,7 @@ function normalize(s: string): string {
 describe('plugin-alt/transforms/constfold', () => {
 	it('folds literal arithmetic', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				return 1 + 2 * 3;
 			}
@@ -33,7 +33,7 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('folds literal division and subtraction', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				return 10 - 4 / 2;
 			}
@@ -48,7 +48,7 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('treats unary-negated literal as numeric', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				return -5 + 2;
 			}
@@ -63,18 +63,18 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('skips division by zero', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				return 1 / 0;
 			}
 		`;
 		// untouched: we don't want to synthesize Infinity literals
-		expect(normalize(run(input))).toBe(normalize(input.replace('/* @cc-sroa */', '')));
+		expect(normalize(run(input))).toBe(normalize(input.replace('/* @sroa */', '')));
 	});
 
 	it('folds x + 0 → x', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(x) {
 				return x + 0;
 			}
@@ -89,7 +89,7 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('folds 0 + x → x', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(x) {
 				return 0 + x;
 			}
@@ -104,7 +104,7 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('folds x * 1 → x', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(x) {
 				return x * 1;
 			}
@@ -119,7 +119,7 @@ describe('plugin-alt/transforms/constfold', () => {
 
 	it('folds x / 1 → x', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(x) {
 				return x / 1;
 			}
@@ -135,7 +135,7 @@ describe('plugin-alt/transforms/constfold', () => {
 	it('does not drop side effects on identity folds', () => {
 		// x*1 must NOT fold when x may be impure: sideEffect() must still run
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				return sideEffect() * 1;
 			}
@@ -165,7 +165,7 @@ describe('plugin-alt/transforms/constfold', () => {
 	it('folds nested combinations to fixpoint via exit traversal', () => {
 		// inner fold (3+4 → 7) must finish before outer (x*7 doesn't fold further)
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(x) {
 				return x + (3 + 4);
 			}

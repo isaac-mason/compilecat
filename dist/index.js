@@ -19,58 +19,60 @@ const traverse = unwrapDefault(_traverse);
 const generate = unwrapDefault(_generate);
 
 /**
- * Single source of truth for plugin-alt's `@cc-*` annotation vocabulary.
+ * Single source of truth for compilecat's `@*` annotation vocabulary.
  *
- * Every zone name, its canonical regex, and the `@cc-optimize` umbrella
+ * Every zone name, its canonical regex, and the `@optimize` umbrella
  * membership live here. Other modules (zones.ts, discover.ts, the inline /
  * sroa / unroll transforms, the unplugin skip-gate) import from this file
  * so adding or renaming a directive is a one-line change.
  */
 /**
  * Authored-form patterns. The `inline` regex excludes the `-body` suffix so
- * `@cc-inline-body` doesn't also register as `@cc-inline`.
+ * `@inline-body` doesn't also register as `@inline`. `\b` at the tail stops
+ * `@inline` from matching the `@inlined` breadcrumb compilecat writes back
+ * into the output.
  */
 const DIRECTIVE_PATTERNS = {
-    inline: /@cc-inline(?!-body)\b/,
-    'inline-body': /@cc-inline-body\b/,
-    sroa: /@cc-sroa\b/,
-    unroll: /@cc-unroll\b/,
-    optimize: /@cc-optimize\b/,
+    inline: /@inline(?!-body)\b/,
+    'inline-body': /@inline-body\b/,
+    sroa: /@sroa\b/,
+    unroll: /@unroll\b/,
+    optimize: /@optimize\b/,
 };
 /**
- * Zones implied by `@cc-optimize`. Deliberately narrow: decl-visibility
- * (`@cc-inline`) is a separate axis from body-level aggressiveness — you
+ * Zones implied by `@optimize`. Deliberately narrow: decl-visibility
+ * (`@inline`) is a separate axis from body-level aggressiveness — you
  * might want a function heavily optimized without wanting V8 to inline it
  * at every callsite.
  */
 const OPTIMIZE_DIRECTIVES = ['inline-body', 'sroa', 'unroll'];
 /**
  * True iff `value` (the text inside a `/* ... *​/` block comment) matches
- * the inline-specific directives — `@cc-inline` or `@cc-inline-body`. Used
+ * the inline-specific directives — `@inline` or `@inline-body`. Used
  * by the post-inline sweep to strip consumed inline markers without touching
- * `@cc-sroa`, `@cc-unroll`, or `@cc-optimize`, which later passes still need
- * to read.
+ * `@sroa`, `@unroll`, or `@optimize`, which later passes still need to read.
  *
  * Matches directives authored in the source, not the `@inlined` breadcrumb
- * plugin-alt writes back into the output.
+ * compilecat writes back into the output.
  */
 function commentIsInlineDirective(value) {
     return DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS['inline-body'].test(value);
 }
 /**
- * Fast pre-check for whole-file skip: does the source contain any `@cc-*`
- * marker at all? Cheaper than parsing the file just to learn there's nothing
- * to do. Deliberately doesn't enumerate the known directive names — a typo'd
- * `@cc-foo` still passes the gate, then the parser finds no match and is a
- * harmless no-op. Saves us updating this regex when we add a directive.
+ * Fast pre-check for whole-file skip: does the source contain any of our
+ * directive markers? Cheaper than parsing the file just to learn there's
+ * nothing to do. Enumerates the known directive names — a typo'd `@inlien`
+ * won't pass the gate, which is the usual tradeoff: fewer false positives
+ * (so fewer wasted parses) at the cost of needing to update this regex when
+ * we add a directive.
  */
-const ANY_DIRECTIVE_IN_SOURCE = /@cc-/;
+const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline(?:-body)?|sroa|unroll|optimize)\b/;
 
 /**
  * discover — builds a FileIndex for a single source file.
  *
  * Surfaces the structural facts the inliner needs:
- *   - `@cc-inline`-annotated top-level functions (with their params/body)
+ *   - `@inline`-annotated top-level functions (with their params/body)
  *   - module-scope variables (scratch buffers, constants)
  *   - imports (named / default / namespace)
  *   - namespace re-exports (`export * as X from './Y'`)
@@ -107,15 +109,15 @@ function hasUnrollAnnotation(node) {
     return hasBlockAnnotation(node, UNROLL_PATTERN) || hasBlockAnnotation(node, OPTIMIZE_PATTERN);
 }
 /**
- * Callsite `@cc-inline` detection — handles both
- *   `/* @cc-inline *​/ foo();`       (comment on the enclosing statement)
- *   `const x = /* @cc-inline *​/ foo();`  (comment on the call expression itself)
+ * Callsite `@inline` detection — handles both
+ *   `/* @inline *​/ foo();`       (comment on the enclosing statement)
+ *   `const x = /* @inline *​/ foo();`  (comment on the call expression itself)
  */
 function callSiteHasInlineAnnotation(path) {
     if (hasInlineAnnotation(path.node))
         return true;
     const parent = path.parentPath;
-    if (parent && parent.isExpressionStatement()) {
+    if (parent?.isExpressionStatement()) {
         if (hasInlineAnnotation(parent.node))
             return true;
     }
@@ -131,11 +133,7 @@ function indexFile(absolutePath, ast) {
     }
     // Second pass: free-reference analysis. Needs the full top-level name set
     // to distinguish "reads a module var" from "reads a local".
-    const topLevelNames = new Set([
-        ...functions.keys(),
-        ...moduleVars.keys(),
-        ...imports.keys(),
-    ]);
+    const topLevelNames = new Set([...functions.keys(), ...moduleVars.keys(), ...imports.keys()]);
     for (const fn of functions.values()) {
         analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast);
     }
@@ -167,9 +165,7 @@ function collectStatement(stmt, sourceFile, functions, moduleVars, imports, name
     }
     if (t.isExportDefaultDeclaration(stmt)) {
         const decl = stmt.declaration;
-        if (t.isFunctionDeclaration(decl) ||
-            t.isFunctionExpression(decl) ||
-            t.isArrowFunctionExpression(decl)) {
+        if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
             functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localInlineBody));
         }
         return;
@@ -203,11 +199,7 @@ function buildFunctionEntry(name, sourceFile, fn, path, hasInlineAnnotation, has
         body = t.blockStatement([t.returnStatement(fn.body)]);
     }
     const { isSimpleReturn, returnExpression } = classifyBody(body);
-    const kind = t.isFunctionDeclaration(fn)
-        ? 'declaration'
-        : t.isArrowFunctionExpression(fn)
-            ? 'arrow'
-            : 'expression';
+    const kind = t.isFunctionDeclaration(fn) ? 'declaration' : t.isArrowFunctionExpression(fn) ? 'arrow' : 'expression';
     return {
         name,
         sourceFile,
@@ -281,8 +273,7 @@ function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast)
         VariableDeclarator(path) {
             if (t.isIdentifier(path.node.id) &&
                 path.node.id.name === fn.name &&
-                (t.isArrowFunctionExpression(path.node.init) ||
-                    t.isFunctionExpression(path.node.init))) {
+                (t.isArrowFunctionExpression(path.node.init) || t.isFunctionExpression(path.node.init))) {
                 rootPath = path.get('init');
                 path.stop();
             }
@@ -291,9 +282,7 @@ function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast)
             if (fn.name !== 'default')
                 return;
             const decl = path.node.declaration;
-            if (t.isFunctionDeclaration(decl) ||
-                t.isFunctionExpression(decl) ||
-                t.isArrowFunctionExpression(decl)) {
+            if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
                 rootPath = path.get('declaration');
                 path.stop();
             }
@@ -497,7 +486,7 @@ function resolveLibraryImport(fromFile, specifier) {
 /**
  * Unified resolver. Tries relative first, then library only if permitted.
  * `allowLibrary` gates node_modules inlining — pass `true` only when the
- * callsite has an explicit `@cc-inline` annotation.
+ * callsite has an explicit `@inline` annotation.
  *
  * `reader`, if given, is used for relative-import existence checks so virtual
  * filesystems work. Library resolution always goes to disk.
@@ -663,10 +652,10 @@ function isPureObjectProperty(state, p) {
 
 /**
  * Read direct-on-node zone annotations from block-comment leading comments.
- * An `@cc-optimize` marker expands here into every implied zone — doing the
+ * An `@optimize` marker expands here into every implied zone — doing the
  * expansion at collection time keeps `isInZone` a plain WeakMap lookup.
  *
- * Line comments (`// @cc-inline`) are intentionally ignored — keeps
+ * Line comments (`// @inline`) are intentionally ignored — keeps
  * annotations visually deliberate.
  */
 function directZonesOn(node) {
@@ -1052,12 +1041,12 @@ function applyInline(ast, absolutePath, options) {
     const localPool = buildLocalPool(index);
     inlineDependenciesBottomUp(localPool);
     // External pools are lazy — one per donor file we've touched. Inside each
-    // pool the donor file's own `@cc-inline` functions have been pre-inlined
+    // pool the donor file's own `@inline` functions have been pre-inlined
     // bottom-up so nested call chains resolve before substitution.
     const externalPools = new Map();
     const requiredModuleVars = new Map();
     const requiredImports = new Map();
-    // Fixpoint: an `@cc-inline-body` zone can expose chained calls only revealed
+    // Fixpoint: an `@inline-body` zone can expose chained calls only revealed
     // after the first pass. Each pass is O(AST) so we cap at a small N.
     const MAX_PASSES = 8;
     let overallChanged = false;
@@ -1086,7 +1075,7 @@ function applyInline(ast, absolutePath, options) {
     // callsites may not be annotated). Cross-file donors are never removed
     // from their own file — we only operate on the consumer AST.
     removeInlinedDeclarations(ast, localPool);
-    // `@cc-inline` / `@cc-inline-body` markers are directives consumed by this
+    // `@inline` / `@inline-body` markers are directives consumed by this
     // transform. Once we've inlined, leaving them in the output is noise
     // (often alongside `@inlined` breadcrumbs). Babel can also park a
     // block comment authored between two statements as a *trailing* comment
@@ -1260,7 +1249,7 @@ function inlineDependenciesBottomUp(pool) {
         const localOnly = new Map();
         const localImports = new Map();
         // Fresh zones state per wrapper — the wrapper's synthetic
-        // `__inline_wrapper__` function has no `@cc-inline-body` comment, so
+        // `__inline_wrapper__` function has no `@inline-body` comment, so
         // there's nothing meaningful to cache between pool entries.
         inlineCallsitesInAst(wrapper, '__wrapper__.ts', null, pool, new Map(), localOnly, localImports, undefined, defaultFileReader, false, init(), 
         // Breadcrumbs at this stage would record callsite args against
@@ -1294,8 +1283,8 @@ function walkCalls(node, cb) {
 // Callee resolution
 // ============================================================================
 /**
- * A callsite is opted-in when either the original `@cc-inline` marker is present
- * or any ancestor carries an `@cc-inline-body` comment. The ancestor walk is
+ * A callsite is opted-in when either the original `@inline` marker is present
+ * or any ancestor carries an `@inline-body` comment. The ancestor walk is
  * delegated to `Zones.isInZone`, which caches results per node so repeated
  * queries in the same function body are O(1) after the first resolution.
  */
@@ -1306,8 +1295,8 @@ function isCallOptedIn(path, zones) {
  * Resolve a CallExpression to an Inlineable, or null if it should not be
  * inlined. Non-null result means the callsite is eligible:
  *   - a decl-annotated local callee (no callsite annotation needed), or
- *   - any other callee the callsite has opted into via `/* @cc-inline *​/` or
- *     by sitting inside an `@cc-inline-body`-annotated function.
+ *   - any other callee the callsite has opted into via `/* @inline *​/` or
+ *     by sitting inside an `@inline-body`-annotated function.
  */
 function resolveCallee(path, consumerFile, consumerIndex, localPool, externalPools, cache, reader, allowLibrary, zones) {
     const callee = path.node.callee;
@@ -1325,7 +1314,7 @@ function resolveCallee(path, consumerFile, consumerIndex, localPool, externalPoo
             return resolveImportBinding(path, consumerFile, binding, binding.importedName, externalPools, cache, reader, allowLibrary, zones);
         }
         // Local function without decl-annotation — needs callsite opt-in
-        // (either `/* @cc-inline */` at the call, or caller is `@cc-inline-body`).
+        // (either `/* @inline */` at the call, or caller is `@inline-body`).
         if (!isCallOptedIn(path, zones))
             return null;
         const localFn = consumerIndex.functions.get(name);
@@ -1406,7 +1395,7 @@ function resolveImportBinding(path, consumerFile, binding, importedName, externa
         };
     }
     // Not decl-annotated in the donor — needs callsite opt-in (direct
-    // `/* @cc-inline */` or an enclosing `@cc-inline-body` function).
+    // `/* @inline */` or an enclosing `@inline-body` function).
     if (!isCallOptedIn(path, zones))
         return null;
     const fn = entry.index.functions.get(importedName);
@@ -1422,7 +1411,7 @@ function ensureExternalPool(donorPath, externalPools, cache, reader) {
     if (!donorIndex)
         return null;
     // Build the donor's own local pool and pre-inline bottom-up, exactly like
-    // we do for the consumer file. This way `/* @cc-inline */ a()` inside donor's
+    // we do for the consumer file. This way `/* @inline */ a()` inside donor's
     // `b()` body has already been substituted before we clone b into the
     // consumer.
     const donorPool = new Map();
@@ -1444,23 +1433,21 @@ function ensureExternalPool(donorPath, externalPools, cache, reader) {
 // ============================================================================
 function inlineCallsitesInAst(ast, consumerFile, consumerIndex, localPool, externalPools, requiredModuleVars, requiredImports, cache, reader, allowLibrary, zones, tagBreadcrumbs = true) {
     let changed = false;
-    let suffixCounter = 0;
     traverse(ast, {
         CallExpression(path) {
             const entry = resolveCallee(path, consumerFile, consumerIndex, localPool, externalPools, cache, reader, allowLibrary, zones);
             if (!entry)
                 return;
-            const suffix = String(suffixCounter++);
             const callsite = recognizeCallsite(path);
             if (callsite) {
-                if (inlineOneCall(path, entry, callsite, suffix, tagBreadcrumbs)) {
+                if (inlineOneCall(path, entry, callsite, tagBreadcrumbs)) {
                     trackDonorRefs(entry, consumerFile, externalPools, requiredModuleVars, requiredImports);
                     changed = true;
                 }
                 return;
             }
             if (isSimpleReturnBody(entry.body)) {
-                if (inlineSimpleReturn(path, entry, suffix, tagBreadcrumbs)) {
+                if (inlineSimpleReturn(path, entry, tagBreadcrumbs)) {
                     trackDonorRefs(entry, consumerFile, externalPools, requiredModuleVars, requiredImports);
                     changed = true;
                 }
@@ -1471,7 +1458,7 @@ function inlineCallsitesInAst(ast, consumerFile, consumerIndex, localPool, exter
             // Only safe when every prelude statement is a pure const/let decl —
             // then we can hoist the prelude above the enclosing statement and
             // replace the call with the return expression.
-            if (inlineExpressionPosition(path, entry, suffix, tagBreadcrumbs)) {
+            if (inlineExpressionPosition(path, entry, tagBreadcrumbs)) {
                 trackDonorRefs(entry, consumerFile, externalPools, requiredModuleVars, requiredImports);
                 changed = true;
             }
@@ -1516,7 +1503,7 @@ function isSimpleReturnBody(body) {
         body.body[0].argument !== undefined);
 }
 /**
- * Strip any `@cc-inline` block comment from `node.leadingComments`. Called
+ * Strip any `@inline` block comment from `node.leadingComments`. Called
  * before we splice in a replacement so the original marker doesn't float
  * onto whatever we emit. We tag the replacement with `@inlined <sig>`.
  */
@@ -1529,12 +1516,12 @@ function stripInlineLeading(node) {
         kept.length > 0 ? kept : null;
 }
 function isInlineMarkerComment(value) {
-    // Only strip inline-specific markers. `@cc-sroa`, `@cc-unroll`, and
-    // `@cc-optimize` are consumed by later passes and must survive this sweep.
+    // Only strip inline-specific markers. `@sroa`, `@unroll`, and
+    // `@optimize` are consumed by later passes and must survive this sweep.
     return commentIsInlineDirective(value);
 }
 /**
- * Final sweep: drop every `@cc-inline` / `@cc-inline-body` block comment from every
+ * Final sweep: drop every `@inline` / `@inline-body` block comment from every
  * comment slot in the consumer AST. Covers the cases where Babel attached the
  * marker as trailing on a preceding sibling, inner on a parent block, or
  * leading on a node we didn't touch directly.
@@ -1583,7 +1570,7 @@ function tagInlined(node, sig) {
 // ============================================================================
 // Callsite splicing
 // ============================================================================
-function inlineSimpleReturn(callPath, entry, suffix, tagBreadcrumbs) {
+function inlineSimpleReturn(callPath, entry, tagBreadcrumbs) {
     const args = callPath.node.arguments;
     for (const a of args)
         if (t.isSpreadElement(a) || t.isArgumentPlaceholder(a))
@@ -1606,10 +1593,10 @@ function inlineSimpleReturn(callPath, entry, suffix, tagBreadcrumbs) {
     }
     const clonedRet = t.cloneNode(ret, true, false);
     const wrapperBody = t.blockStatement([t.returnStatement(clonedRet)]);
+    renameLocalsInBody(wrapperBody, createFreshNamer(callPath), new Set(paramNamesArr));
     applyParamSubstitution(wrapperBody, substitution);
-    renameLocalsInBody(wrapperBody, suffix, new Set(paramNamesArr));
     const renamedRet = wrapperBody.body[0].argument;
-    // Strip the original `@cc-inline` marker from the callsite and any enclosing
+    // Strip the original `@inline` marker from the callsite and any enclosing
     // statement before replacement, then tag the substituted expression with
     // `@inlined <sig>` as a breadcrumb.
     stripInlineLeading(callPath.node);
@@ -1672,7 +1659,7 @@ function recognizeCallsite(path) {
     }
     return null;
 }
-function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
+function inlineOneCall(callPath, entry, callsite, tagBreadcrumbs) {
     const args = callPath.node.arguments;
     for (const a of args) {
         if (t.isSpreadElement(a) || t.isArgumentPlaceholder(a))
@@ -1683,6 +1670,7 @@ function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
     const mutatedParams = findMutatedParams(entry.body, paramSet);
     const substitution = new Map();
     const argHoists = [];
+    const namer = createFreshNamer(callPath);
     for (let i = 0; i < paramNamesArr.length; i++) {
         const pname = paramNamesArr[i];
         if (!pname)
@@ -1692,7 +1680,7 @@ function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
             // The callee writes to this param (e.g. `rad *= 0.5;`). Hoist the
             // arg into a `let` temp and rename every reference — reads and
             // writes — to the temp.
-            const tempName = `_arg_${pname}_${suffix}`;
+            const tempName = namer(`_arg_${pname}`);
             argHoists.push(t.variableDeclaration('let', [
                 t.variableDeclarator(t.identifier(tempName), t.cloneNode(arg, true, false)),
             ]));
@@ -1702,7 +1690,7 @@ function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
             substitution.set(pname, arg);
         }
         else {
-            const tempName = `_arg_${pname}_${suffix}`;
+            const tempName = namer(`_arg_${pname}`);
             argHoists.push(t.variableDeclaration('const', [
                 t.variableDeclarator(t.identifier(tempName), t.cloneNode(arg, true, false)),
             ]));
@@ -1710,8 +1698,13 @@ function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
         }
     }
     const clonedBody = t.cloneNode(entry.body, true, false);
+    // Rename body-locals BEFORE substituting params. Substitution can inject
+    // caller identifiers whose names happen to match a body-local (e.g. a
+    // callee with `const tmp = ...` called as `f(tmp, ...)`); if we renamed
+    // after, the rename pass couldn't tell the substituted `tmp` apart from
+    // the body's own `tmp`, and would alias them into the same fresh name.
+    renameLocalsInBody(clonedBody, namer, paramSet);
     applyParamSubstitution(clonedBody, substitution);
-    renameLocalsInBody(clonedBody, suffix, paramSet);
     let clonedReturn = null;
     if (clonedBody.body.length > 0 &&
         t.isReturnStatement(clonedBody.body[clonedBody.body.length - 1])) {
@@ -1792,7 +1785,7 @@ function inlineOneCall(callPath, entry, callsite, suffix, tagBreadcrumbs) {
  * reordered relative to sibling expressions in the original statement, so we
  * bail.
  */
-function inlineExpressionPosition(callPath, entry, suffix, tagBreadcrumbs) {
+function inlineExpressionPosition(callPath, entry, tagBreadcrumbs) {
     const args = callPath.node.arguments;
     for (const a of args) {
         if (t.isSpreadElement(a) || t.isArgumentPlaceholder(a))
@@ -1829,13 +1822,14 @@ function inlineExpressionPosition(callPath, entry, suffix, tagBreadcrumbs) {
     const bodyParamUses = countParamReferencesInBody(entry.body, paramSet);
     const substitution = new Map();
     const argHoists = [];
+    const namer = createFreshNamer(callPath);
     for (let i = 0; i < paramNamesArr.length; i++) {
         const pname = paramNamesArr[i];
         if (!pname)
             continue;
         const arg = args[i] ?? t.identifier('undefined');
         if (mutatedParams.has(pname)) {
-            const tempName = `_arg_${pname}_${suffix}`;
+            const tempName = namer(`_arg_${pname}`);
             argHoists.push(t.variableDeclaration('let', [
                 t.variableDeclarator(t.identifier(tempName), t.cloneNode(arg, true, false)),
             ]));
@@ -1847,7 +1841,7 @@ function inlineExpressionPosition(callPath, entry, suffix, tagBreadcrumbs) {
         else {
             const count = bodyParamUses.get(pname) ?? 0;
             if (count > 1) {
-                const tempName = `_arg_${pname}_${suffix}`;
+                const tempName = namer(`_arg_${pname}`);
                 argHoists.push(t.variableDeclaration('const', [
                     t.variableDeclarator(t.identifier(tempName), t.cloneNode(arg, true, false)),
                 ]));
@@ -1859,8 +1853,8 @@ function inlineExpressionPosition(callPath, entry, suffix, tagBreadcrumbs) {
         }
     }
     const clonedBody = t.cloneNode(entry.body, true, false);
+    renameLocalsInBody(clonedBody, namer, paramSet);
     applyParamSubstitution(clonedBody, substitution);
-    renameLocalsInBody(clonedBody, suffix, paramSet);
     const clonedStmts = clonedBody.body;
     const retStmt = clonedStmts.pop();
     const retExpr = retStmt.argument;
@@ -1897,14 +1891,14 @@ function isPurePreludeStatement(stmt) {
     return true;
 }
 /**
- * "Pure enough to hoist above the host expression inside an `@cc-inline` zone."
+ * "Pure enough to hoist above the host expression inside an `@inline` zone."
  * More permissive than `isSimpleArg` — allows nested member chains and pure
  * arithmetic — but rejects anything that could trigger a call or observable
  * write: CallExpression, NewExpression, AssignmentExpression, UpdateExpression,
  * YieldExpression, AwaitExpression.
  *
  * Getters are assumed side-effect-free (consistent with the rest of plugin-alt's
- * @cc-inline-zone contract).
+ * @inline-zone contract).
  */
 function isPureInitExpression(expr) {
     if (t.isIdentifier(expr) || t.isThisExpression(expr) || t.isSuper(expr))
@@ -2085,9 +2079,49 @@ function findMutatedParams(body, paramSet) {
     });
     return mutated;
 }
-function renameLocalsInBody(body, suffix, paramSet) {
+/**
+ * Returns a name picker for the callsite's scope. First call for a given
+ * base name returns the name unchanged iff the base isn't already bound at
+ * the callsite; otherwise appends `_2`, `_3`, ... until we find one that's
+ * free (both in the scope and among names already handed out by this
+ * namer). The namer is scoped to one splice — each call to an inline
+ * function builds a fresh one.
+ *
+ * We crawl the enclosing function scope first so bindings introduced by
+ * earlier splices into the same scope are visible. That keeps a second
+ * inline of the same callee from stomping the first's locals.
+ */
+function createFreshNamer(callPath) {
+    const functionParent = callPath.getFunctionParent();
+    const enclosingScope = functionParent ? functionParent.scope : callPath.scope.getProgramParent();
+    enclosingScope.crawl();
+    const scope = callPath.scope;
+    const reserved = new Set();
+    return (base) => {
+        if (!scope.hasBinding(base) && !reserved.has(base)) {
+            reserved.add(base);
+            return base;
+        }
+        for (let i = 2;; i++) {
+            const candidate = `${base}_${i}`;
+            if (!scope.hasBinding(candidate) && !reserved.has(candidate)) {
+                reserved.add(candidate);
+                return candidate;
+            }
+        }
+    };
+}
+function renameLocalsInBody(body, namer, paramSet) {
     const locals = collectLocalBindings(body, paramSet);
     if (locals.size === 0)
+        return;
+    const renames = new Map();
+    for (const name of locals) {
+        const fresh = namer(name);
+        if (fresh !== name)
+            renames.set(name, fresh);
+    }
+    if (renames.size === 0)
         return;
     traverse(t.file(t.program([t.functionDeclaration(t.identifier('__rename_wrapper__'), [], body)])), {
         Identifier(path) {
@@ -2101,9 +2135,9 @@ function renameLocalsInBody(body, suffix, paramSet) {
                 !path.parentPath.node.computed) {
                 return;
             }
-            if (locals.has(path.node.name)) {
-                path.node.name = `${path.node.name}_${suffix}`;
-            }
+            const fresh = renames.get(path.node.name);
+            if (fresh)
+                path.node.name = fresh;
         },
     });
 }
@@ -2493,7 +2527,7 @@ function rewriteAccesses(ast, safe) {
 /**
  * Loop unrolling.
  *
- * Replaces an opt-in `/* @cc-unroll *​/` loop with a flat sequence of its body,
+ * Replaces an opt-in `/* @unroll *​/` loop with a flat sequence of its body,
  * one copy per iteration, with the loop variable substituted by its concrete
  * value. Works on:
  *
@@ -2506,7 +2540,7 @@ function rewriteAccesses(ast, safe) {
  * pointing at the source location — this is a soft-failure channel for
  * silent no-ops.
  *
- * Nested `@cc-unroll` directives are handled by running the pass to a fixpoint
+ * Nested `@unroll` directives are handled by running the pass to a fixpoint
  * (with a hard ceiling on total passes to guard against pathological input).
  */
 const MAX_UNROLL_ITERATIONS = 1024;
@@ -2570,7 +2604,7 @@ function unrollForStatement(path) {
             unrolled.push(cloneAndSubstitute(stmt, shape.varName, t.numericLiteral(value)));
         }
     }
-    // Strip @cc-unroll off the original before replaceWithMultiple — otherwise
+    // Strip @unroll off the original before replaceWithMultiple — otherwise
     // babel transfers the leading comment onto the first replacement statement
     // and the next pass would try to unroll it again (the replacement isn't a
     // loop, but the warning path would fire).
@@ -2795,7 +2829,7 @@ function stripUnrollComments(node) {
 function warn(node, reason) {
     const loc = node.loc?.start;
     const locStr = loc ? ` (line ${loc.line})` : '';
-    console.warn(`[compilecat] @cc-unroll: ${reason}${locStr}, skipping`);
+    console.warn(`[compilecat] @unroll: ${reason}${locStr}, skipping`);
 }
 
 function transform(code, absolutePath, options = {}) {
@@ -2833,7 +2867,7 @@ const unplugin = createUnplugin((options = {}) => {
         transform(code, id) {
             if (!/\.(js|ts|jsx|tsx)$/.test(id))
                 return null;
-            // Skip files with no `@cc-*` markers. Avoids unnecessary babel
+            // Skip files with no `@*` markers. Avoids unnecessary babel
             // codegen round-trips that can break downstream TS parsers.
             if (!ANY_DIRECTIVE_IN_SOURCE.test(code))
                 return null;

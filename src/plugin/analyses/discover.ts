@@ -1,4 +1,4 @@
-import { type NodePath } from '@babel/traverse';
+import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { traverse } from '../util/babel';
 import { DIRECTIVE_PATTERNS } from './directives';
@@ -7,7 +7,7 @@ import { DIRECTIVE_PATTERNS } from './directives';
  * discover — builds a FileIndex for a single source file.
  *
  * Surfaces the structural facts the inliner needs:
- *   - `@cc-inline`-annotated top-level functions (with their params/body)
+ *   - `@inline`-annotated top-level functions (with their params/body)
  *   - module-scope variables (scratch buffers, constants)
  *   - imports (named / default / namespace)
  *   - namespace re-exports (`export * as X from './Y'`)
@@ -49,14 +49,14 @@ export function hasUnrollAnnotation(node: t.Node | null | undefined): boolean {
 }
 
 /**
- * Callsite `@cc-inline` detection — handles both
- *   `/* @cc-inline *​/ foo();`       (comment on the enclosing statement)
- *   `const x = /* @cc-inline *​/ foo();`  (comment on the call expression itself)
+ * Callsite `@inline` detection — handles both
+ *   `/* @inline *​/ foo();`       (comment on the enclosing statement)
+ *   `const x = /* @inline *​/ foo();`  (comment on the call expression itself)
  */
 export function callSiteHasInlineAnnotation(path: NodePath<t.CallExpression>): boolean {
     if (hasInlineAnnotation(path.node)) return true;
     const parent = path.parentPath;
-    if (parent && parent.isExpressionStatement()) {
+    if (parent?.isExpressionStatement()) {
         if (hasInlineAnnotation(parent.node)) return true;
     }
     return false;
@@ -72,8 +72,8 @@ export type IndexedFunction = {
     body: t.BlockStatement;
     hasInlineAnnotation: boolean;
     /**
-     * `@cc-inline-body` — caller-side bulk directive. Any resolvable call
-     * inside this function's body is treated as if its callsite had `@cc-inline`.
+     * `@inline-body` — caller-side bulk directive. Any resolvable call
+     * inside this function's body is treated as if its callsite had `@inline`.
      */
     hasInlineBodyAnnotation: boolean;
     /** body is `{ return <expr>; }` with no other statements. */
@@ -121,25 +121,12 @@ export function indexFile(absolutePath: string, ast: t.File): FileIndex {
     const namespaceReexports = new Map<string, string>();
 
     for (const stmt of ast.program.body) {
-        collectStatement(
-            stmt,
-            absolutePath,
-            functions,
-            moduleVars,
-            imports,
-            namespaceReexports,
-            false,
-            false,
-        );
+        collectStatement(stmt, absolutePath, functions, moduleVars, imports, namespaceReexports, false, false);
     }
 
     // Second pass: free-reference analysis. Needs the full top-level name set
     // to distinguish "reads a module var" from "reads a local".
-    const topLevelNames = new Set<string>([
-        ...functions.keys(),
-        ...moduleVars.keys(),
-        ...imports.keys(),
-    ]);
+    const topLevelNames = new Set<string>([...functions.keys(), ...moduleVars.keys(), ...imports.keys()]);
     for (const fn of functions.values()) {
         analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast);
     }
@@ -192,23 +179,13 @@ function collectStatement(
     }
     if (t.isExportDefaultDeclaration(stmt)) {
         const decl = stmt.declaration;
-        if (
-            t.isFunctionDeclaration(decl) ||
-            t.isFunctionExpression(decl) ||
-            t.isArrowFunctionExpression(decl)
-        ) {
-            functions.set(
-                'default',
-                buildFunctionEntry('default', sourceFile, decl, null, localInline, localInlineBody),
-            );
+        if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
+            functions.set('default', buildFunctionEntry('default', sourceFile, decl, null, localInline, localInlineBody));
         }
         return;
     }
     if (t.isFunctionDeclaration(stmt) && stmt.id) {
-        functions.set(
-            stmt.id.name,
-            buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localInlineBody),
-        );
+        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, null, localInline, localInlineBody));
         return;
     }
     if (t.isVariableDeclaration(stmt)) {
@@ -216,10 +193,7 @@ function collectStatement(
             if (!t.isIdentifier(decl.id)) continue;
             const name = decl.id.name;
             if (decl.init && (t.isArrowFunctionExpression(decl.init) || t.isFunctionExpression(decl.init))) {
-                functions.set(
-                    name,
-                    buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localInlineBody),
-                );
+                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, null, localInline, localInlineBody));
             } else {
                 moduleVars.set(name, { name, declaration: stmt, isExported: false });
             }
@@ -246,11 +220,7 @@ function buildFunctionEntry(
 
     const { isSimpleReturn, returnExpression } = classifyBody(body);
 
-    const kind = t.isFunctionDeclaration(fn)
-        ? 'declaration'
-        : t.isArrowFunctionExpression(fn)
-          ? 'arrow'
-          : 'expression';
+    const kind = t.isFunctionDeclaration(fn) ? 'declaration' : t.isArrowFunctionExpression(fn) ? 'arrow' : 'expression';
 
     return {
         name,
@@ -334,8 +304,7 @@ function analyzeFreeRefs(
             if (
                 t.isIdentifier(path.node.id) &&
                 path.node.id.name === fn.name &&
-                (t.isArrowFunctionExpression(path.node.init) ||
-                    t.isFunctionExpression(path.node.init))
+                (t.isArrowFunctionExpression(path.node.init) || t.isFunctionExpression(path.node.init))
             ) {
                 rootPath = path.get('init') as unknown as NodePath<t.Function>;
                 path.stop();
@@ -344,11 +313,7 @@ function analyzeFreeRefs(
         ExportDefaultDeclaration(path) {
             if (fn.name !== 'default') return;
             const decl = path.node.declaration;
-            if (
-                t.isFunctionDeclaration(decl) ||
-                t.isFunctionExpression(decl) ||
-                t.isArrowFunctionExpression(decl)
-            ) {
+            if (t.isFunctionDeclaration(decl) || t.isFunctionExpression(decl) || t.isArrowFunctionExpression(decl)) {
                 rootPath = path.get('declaration') as unknown as NodePath<t.Function>;
                 path.stop();
             }

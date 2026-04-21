@@ -5,7 +5,7 @@ import * as t from '@babel/types';
  * deleted or duplicated without changing observable program behavior inside
  * an opt-in zone?"
  *
- * Inside opt-in zones (@cc-inline/@cc-sroa/@cc-unroll) we assume:
+ * Inside opt-in zones (@inline/@sroa/@unroll) we assume:
  *   - no effectful getters / setters on property access
  *   - no proxies intercepting reads
  *   - no Symbol.toPrimitive tricks on arithmetic

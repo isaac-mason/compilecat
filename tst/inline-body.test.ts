@@ -25,13 +25,13 @@ function runProject(files: Record<string, string>, entry: string): string {
 	return generate(ast, { retainLines: false, comments: false }).code.trim();
 }
 
-describe('plugin-alt/transforms/inline — @cc-inline-body', () => {
+describe('plugin-alt/transforms/inline — @inline-body', () => {
 	it('inlines unannotated local calls inside a zoned function', () => {
 		const code = `
 			function neg(x) { return -x; }
 			function add(a, b) { return a + b; }
 
-			/* @cc-inline-body */
+			/* @inline-body */
 			export function work(x, y) {
 				return add(neg(x), y);
 			}
@@ -64,7 +64,7 @@ describe('plugin-alt/transforms/inline — @cc-inline-body', () => {
 			function b(x) { return a(x) * 2; }
 			function c(x) { return b(x) - 3; }
 
-			/* @cc-inline-body */
+			/* @inline-body */
 			export function work(x) {
 				return c(x);
 			}
@@ -75,13 +75,13 @@ describe('plugin-alt/transforms/inline — @cc-inline-body', () => {
 		expect(out).toContain('x + 1');
 	});
 
-	it('is distinct from @cc-inline (does not cause cross-file callsite opt-in elsewhere)', () => {
-		// `@cc-inline-body` on `work` opts in every call *inside work*. It must
+	it('is distinct from @inline (does not cause cross-file callsite opt-in elsewhere)', () => {
+		// `@inline-body` on `work` opts in every call *inside work*. It must
 		// NOT retroactively opt in unannotated calls elsewhere in the file.
 		const code = `
 			function helper(x) { return x * 10; }
 
-			/* @cc-inline-body */
+			/* @inline-body */
 			export function work(x) {
 				return helper(x);
 			}
@@ -105,7 +105,7 @@ describe('plugin-alt/transforms/inline — @cc-inline-body', () => {
 			'/proj/main.ts': `
 				import { square } from './util';
 
-				/* @cc-inline-body */
+				/* @inline-body */
 				export function work(x) {
 					return square(x) + 1;
 				}
@@ -120,7 +120,7 @@ describe('plugin-alt/transforms/inline — @cc-inline-body', () => {
 		const code = `
 			function cube(out, x) { out[0] = x; out[1] = x * x; out[2] = x * x * x; }
 
-			/* @cc-inline-body */
+			/* @inline-body */
 			export function work(buf, v) {
 				cube(buf, v);
 			}

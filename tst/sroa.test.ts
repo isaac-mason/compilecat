@@ -10,7 +10,7 @@ function run(code: string): string {
 }
 
 describe('plugin-alt/transforms/sroa — opt-in gating', () => {
-	it('does not run without any @cc-sroa annotation', () => {
+	it('does not run without any @sroa annotation', () => {
 		const input = `
 			const v = [1, 2, 3];
 			const x = v[0];
@@ -20,9 +20,9 @@ describe('plugin-alt/transforms/sroa — opt-in gating', () => {
 		expect(out).not.toContain('v_0');
 	});
 
-	it('runs when the VariableDeclaration has @cc-sroa', () => {
+	it('runs when the VariableDeclaration has @sroa', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const x = v[0] + v[1] + v[2];
 		`;
@@ -31,9 +31,9 @@ describe('plugin-alt/transforms/sroa — opt-in gating', () => {
 		expect(out).not.toContain('[1, 2, 3]');
 	});
 
-	it('runs when the enclosing function has @cc-sroa', () => {
+	it('runs when the enclosing function has @sroa', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function test() {
 				const v = [1, 2, 3];
 				return v[0] + v[1] + v[2];
@@ -46,7 +46,7 @@ describe('plugin-alt/transforms/sroa — opt-in gating', () => {
 
 	it('runs on an annotated arrow function bound to const', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const test = () => {
 				const v = [1, 2, 3];
 				return v[0] + v[1] + v[2];
@@ -58,7 +58,7 @@ describe('plugin-alt/transforms/sroa — opt-in gating', () => {
 
 	it('does not cross into a sibling function without annotation', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function annotated() {
 				const a = [1, 2, 3];
 				return a[0] + a[1] + a[2];
@@ -78,7 +78,7 @@ describe('plugin-alt/transforms/sroa — opt-in gating', () => {
 describe('plugin-alt/transforms/sroa — decomposition', () => {
 	it('decomposes a vec3 literal', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const x = v[0];
 			const y = v[1];
@@ -93,7 +93,7 @@ describe('plugin-alt/transforms/sroa — decomposition', () => {
 
 	it('handles writes to components', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			let v = [0, 0, 0];
 			v[0] = 5;
 			v[1] = 10;
@@ -107,7 +107,7 @@ describe('plugin-alt/transforms/sroa — decomposition', () => {
 
 	it('handles compound assignments', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			let v = [1, 2, 3];
 			v[0] += 10;
 			v[1] *= 2;
@@ -119,7 +119,7 @@ describe('plugin-alt/transforms/sroa — decomposition', () => {
 
 	it('keeps variable expressions in the literal', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function test(x, y, z) {
 				const v = [x, y, z];
 				const sum = v[0] + v[1] + v[2];
@@ -136,7 +136,7 @@ describe('plugin-alt/transforms/sroa — decomposition', () => {
 describe('plugin-alt/transforms/sroa — escape analysis', () => {
 	it('skips when passed to a function', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			someFunction(v);
 			const x = v[0];
@@ -147,7 +147,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips when aliased via assignment', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const other = v;
 			console.log(other);
@@ -158,7 +158,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips when returned', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function foo() {
 				const v = [1, 2, 3];
 				return v;
@@ -170,7 +170,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips computed-index access with non-literal', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const i = 0;
 			const x = v[i];
@@ -181,7 +181,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips member-property access (e.g. .length)', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const len = v.length;
 		`;
@@ -191,7 +191,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips spread', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const copy = [...v];
 		`;
@@ -201,7 +201,7 @@ describe('plugin-alt/transforms/sroa — escape analysis', () => {
 
 	it('skips out-of-bounds index', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const v = [1, 2, 3];
 			const x = v[5];
 		`;
@@ -216,7 +216,7 @@ describe('plugin-alt/transforms/sroa — scope awareness', () => {
 			const rotation = [0, 0, 0];
 			externalFunction(rotation);
 
-			/* @cc-sroa */
+			/* @sroa */
 			function test() {
 				const rotation = [1, 2, 3];
 				return rotation[0] + rotation[1] + rotation[2];
@@ -229,9 +229,9 @@ describe('plugin-alt/transforms/sroa — scope awareness', () => {
 
 	it('replaces one candidate even when a sibling escapes', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			const safe = [1, 2, 3];
-			/* @cc-sroa */
+			/* @sroa */
 			const escaping = [4, 5, 6];
 			const x = safe[0] + safe[1] + safe[2];
 			externalFunction(escaping);
@@ -247,7 +247,7 @@ describe('plugin-alt/transforms/sroa — type annotation cross-check', () => {
 	it('respects a tuple type alias', () => {
 		const input = `
 			type Vec3 = [number, number, number];
-			/* @cc-sroa */
+			/* @sroa */
 			const v: Vec3 = [1, 2, 3];
 			const x = v[0] + v[1] + v[2];
 		`;

@@ -15,9 +15,9 @@ import { generate } from './util/babel';
  *     → inline (decl+callsite annotations, cross-file via FileCache,
  *               library opt-in)
  *     → simplifier fixpoint (constfold + copyprop + dce)
- *     → unroll (opt-in `@cc-unroll`) — runs before SROA so unrolled constant
+ *     → unroll (opt-in `@unroll`) — runs before SROA so unrolled constant
  *                                      indices become SROA candidates
- *     → SROA (opt-in `@cc-sroa`)
+ *     → SROA (opt-in `@sroa`)
  *     → simplifier fixpoint again to clean up scalars/literals introduced
  *       by unroll and SROA
  *     → regenerate
@@ -29,7 +29,7 @@ export type TransformOptions = {
     fileCache?: FileCache;
     /** Custom file reader for cross-file. Defaults to disk. */
     fileReader?: FileReader;
-    /** Permit library (node_modules) inlining via callsite `@cc-inline`. */
+    /** Permit library (node_modules) inlining via callsite `@inline`. */
     allowLibraryInline?: boolean;
 };
 

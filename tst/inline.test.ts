@@ -17,7 +17,7 @@ function normalize(s: string): string {
 describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 	it('inlines a simple-return function at a const init', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function add(a, b) { return a + b; }
 			const x = add(1, 2);
 		`;
@@ -29,7 +29,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('inlines at statement form (discards return when pure)', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function write(out, i, v) { out[i] = v; return out; }
 			write(arr, 0, 99);
 		`;
@@ -41,7 +41,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('inlines at assignment RHS', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function add(a, b) { return a + b; }
 			let y;
 			y = add(10, 20);
@@ -55,7 +55,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('inlines at return-statement arg', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function add(a, b) { return a + b; }
 			function caller(x) { return add(x, 1); }
 		`;
@@ -67,19 +67,20 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('hoists impure args once into _arg_ temps', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function square(a) { return a * a; }
 			const s = square(sideEffect());
 		`;
 		const out = run(input);
-		// sideEffect() should be called exactly once, hoisted to a const
-		expect(out).toContain('const _arg_a_');
+		// sideEffect() should be called exactly once, hoisted to a const.
+		// Base name `_arg_a` has no collision here, so no numeric suffix.
+		expect(out).toMatch(/const _arg_a(_\d+)?\s*=/);
 		expect(out.match(/sideEffect\(\)/g)?.length).toBe(1);
 	});
 
 	it('does not hoist pure args (identifier / member chain)', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function square(a) { return a * a; }
 			const s = square(obj.prop);
 		`;
@@ -88,9 +89,9 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 		expect(out).toContain('obj.prop * obj.prop');
 	});
 
-	it('renames locals with a per-call suffix', () => {
+	it('renames colliding locals only when they actually collide', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function f(x) {
 				const tmp = x + 1;
 				return tmp * 2;
@@ -99,15 +100,14 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 			const b = f(20);
 		`;
 		const out = run(input);
-		// each inlining gets its own tmp_N so they don't clash
-		expect(out).toContain('const tmp_');
-		// no references to the original 'tmp' name (which would be a collision)
-		expect(out).not.toMatch(/\btmp\s*=/);
+		// First splice keeps the bare name; second splice collides and gets _2.
+		expect(out).toMatch(/const tmp\s*=/);
+		expect(out).toMatch(/const tmp_2\s*=/);
 	});
 
 	it('removes inlined function declarations after inlining', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function add(a, b) { return a + b; }
 			const x = add(1, 2);
 		`;
@@ -117,7 +117,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('handles imperative bodies with writes + trailing return', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function add(a, b, out) {
 				out[0] = a[0] + b[0];
 				out[1] = a[1] + b[1];
@@ -135,9 +135,9 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('inlines callees in bottom-up order (nested inlineables)', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function square(a) { return a * a; }
-			/* @cc-inline */
+			/* @inline */
 			function sumOfSquares(x, y) {
 				return square(x) + square(y);
 			}
@@ -152,7 +152,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('skips functions with control-flow bodies', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function choose(a, b, cond) {
 				if (cond) return a;
 				return b;
@@ -167,7 +167,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('bails on recursive inlineable functions', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function fact(n) { return n * fact(n - 1); }
 			const x = fact(3);
 		`;
@@ -188,7 +188,7 @@ describe('plugin-alt/transforms/inline (v1: single-file)', () => {
 
 	it('inlines through an export', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			export function add(a, b) { return a + b; }
 			const x = add(1, 2);
 		`;

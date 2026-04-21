@@ -1,13 +1,13 @@
-import { type NodePath } from '@babel/traverse';
+import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 export declare function hasInlineAnnotation(node: t.Node | null | undefined): boolean;
 export declare function hasInlineBodyAnnotation(node: t.Node | null | undefined): boolean;
 export declare function hasSroaAnnotation(node: t.Node | null | undefined): boolean;
 export declare function hasUnrollAnnotation(node: t.Node | null | undefined): boolean;
 /**
- * Callsite `@cc-inline` detection — handles both
- *   `/* @cc-inline *​/ foo();`       (comment on the enclosing statement)
- *   `const x = /* @cc-inline *​/ foo();`  (comment on the call expression itself)
+ * Callsite `@inline` detection — handles both
+ *   `/* @inline *​/ foo();`       (comment on the enclosing statement)
+ *   `const x = /* @inline *​/ foo();`  (comment on the call expression itself)
  */
 export declare function callSiteHasInlineAnnotation(path: NodePath<t.CallExpression>): boolean;
 export type FunctionKind = 'declaration' | 'arrow' | 'expression';
@@ -19,8 +19,8 @@ export type IndexedFunction = {
     body: t.BlockStatement;
     hasInlineAnnotation: boolean;
     /**
-     * `@cc-inline-body` — caller-side bulk directive. Any resolvable call
-     * inside this function's body is treated as if its callsite had `@cc-inline`.
+     * `@inline-body` — caller-side bulk directive. Any resolvable call
+     * inside this function's body is treated as if its callsite had `@inline`.
      */
     hasInlineBodyAnnotation: boolean;
     /** body is `{ return <expr>; }` with no other statements. */

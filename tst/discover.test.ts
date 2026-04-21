@@ -8,9 +8,9 @@ function idx(code: string) {
 }
 
 describe('plugin-alt/analyses/discover', () => {
-	it('finds a decl-annotated @cc-inline function', () => {
+	it('finds a decl-annotated @inline function', () => {
 		const index = idx(`
-			/* @cc-inline */
+			/* @inline */
 			export function add(a, b) { return a + b; }
 		`);
 		const add = index.functions.get('add');
@@ -22,7 +22,7 @@ describe('plugin-alt/analyses/discover', () => {
 
 	it('detects simple-return vs imperative bodies', () => {
 		const index = idx(`
-			/* @cc-inline */
+			/* @inline */
 			export function add(a, b) {
 				const tmp = a + b;
 				return tmp;
@@ -35,7 +35,7 @@ describe('plugin-alt/analyses/discover', () => {
 	it('skips unannotated functions but still indexes them', () => {
 		const index = idx(`
 			function inner() { return 1; }
-			/* @cc-inline */
+			/* @inline */
 			function outer() { return inner(); }
 		`);
 		expect(index.functions.get('inner')?.hasInlineAnnotation).toBe(false);
@@ -45,7 +45,7 @@ describe('plugin-alt/analyses/discover', () => {
 	it('records function-to-function free refs', () => {
 		const index = idx(`
 			function inner() { return 1; }
-			/* @cc-inline */
+			/* @inline */
 			function outer() { return inner(); }
 		`);
 		expect(index.functions.get('outer')?.functionRefs.has('inner')).toBe(true);
@@ -54,7 +54,7 @@ describe('plugin-alt/analyses/discover', () => {
 	it('records module-var refs', () => {
 		const index = idx(`
 			const K = 42;
-			/* @cc-inline */
+			/* @inline */
 			function getK() { return K; }
 		`);
 		expect(index.functions.get('getK')?.moduleVarRefs.has('K')).toBe(true);
@@ -78,9 +78,9 @@ describe('plugin-alt/analyses/discover', () => {
 		expect(index.namespaceReexports.get('box3')).toBe('./box3');
 	});
 
-	it('propagates @cc-inline annotation through export declarations', () => {
+	it('propagates @inline annotation through export declarations', () => {
 		const index = idx(`
-			/* @cc-inline */
+			/* @inline */
 			export function add(a, b) { return a + b; }
 		`);
 		expect(index.functions.get('add')?.hasInlineAnnotation).toBe(true);
@@ -98,7 +98,7 @@ describe('plugin-alt/analyses/discover', () => {
 	it('does not capture locals that shadow top-level names', () => {
 		const index = idx(`
 			const scratch = [0, 0, 0];
-			/* @cc-inline */
+			/* @inline */
 			function f() {
 				const scratch = 1;
 				return scratch;

@@ -12,7 +12,7 @@ function run(code: string): string {
 describe('plugin-alt/transforms/unroll — basic for', () => {
 	it('unrolls `i < N`', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 4; i++) { arr[i] = i; }
 		`);
 		expect(out).toContain('arr[0] = 0');
@@ -24,7 +24,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 
 	it('unrolls `i <= N`', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i <= 2; i++) { arr[i] = i; }
 		`);
 		expect(out).toContain('arr[0] = 0');
@@ -35,7 +35,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 
 	it('unrolls with non-zero start', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 2; i < 5; i++) { arr[i] = i * 2; }
 		`);
 		expect(out).toContain('arr[2] = 2 * 2');
@@ -46,7 +46,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 
 	it('unrolls `i += step`', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 6; i += 2) { arr[i] = i; }
 		`);
 		expect(out).toContain('arr[0] = 0');
@@ -57,7 +57,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 
 	it('accepts ++i update syntax', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 3; ++i) { arr[i] = i; }
 		`);
 		expect(out).toContain('arr[0] = 0');
@@ -67,7 +67,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 
 	it('handles single-statement body without braces', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 3; i++) arr[i] = i;
 		`);
 		expect(out).toContain('arr[0] = 0');
@@ -78,7 +78,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 	it('removes a zero-iteration loop', () => {
 		const out = run(`
 			const before = 1;
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 5; i < 3; i++) { arr[i] = i; }
 			const after = 2;
 		`);
@@ -92,7 +92,7 @@ describe('plugin-alt/transforms/unroll — basic for', () => {
 describe('plugin-alt/transforms/unroll — substitution', () => {
 	it('substitutes in complex expressions', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 3; i++) { mat[i * 3 + 0] = row[i]; }
 		`);
 		expect(out).toContain('mat[0 * 3 + 0] = row[0]');
@@ -102,7 +102,7 @@ describe('plugin-alt/transforms/unroll — substitution', () => {
 
 	it('does not substitute shadowed param in nested function', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) {
 				const fn = (i: number) => { return i; };
 				arr[i] = fn(99);
@@ -114,7 +114,7 @@ describe('plugin-alt/transforms/unroll — substitution', () => {
 
 	it('does not substitute property keys with the same name', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) { obj.i = i; }
 		`);
 		expect(out).toContain('obj.i = 0');
@@ -125,9 +125,9 @@ describe('plugin-alt/transforms/unroll — substitution', () => {
 describe('plugin-alt/transforms/unroll — nested', () => {
 	it('unrolls nested loops in a single apply() call', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) {
-				/* @cc-unroll */
+				/* @unroll */
 				for (let j = 0; j < 2; j++) { mat[i * 2 + j] = i + j; }
 			}
 		`);
@@ -140,11 +140,11 @@ describe('plugin-alt/transforms/unroll — nested', () => {
 
 	it('unrolls triple-nested loops', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) {
-				/* @cc-unroll */
+				/* @unroll */
 				for (let j = 0; j < 2; j++) {
-					/* @cc-unroll */
+					/* @unroll */
 					for (let k = 0; k < 2; k++) { result[i * 4 + j * 2 + k] = i + j + k; }
 				}
 			}
@@ -159,7 +159,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 	it('skips when loop has break and warns', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 4; i++) {
 				if (i === 2) break;
 				arr[i] = i;
@@ -173,7 +173,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 	it('skips when loop has continue', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 4; i++) {
 				if (i === 2) continue;
 				arr[i] = i;
@@ -188,7 +188,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
 			function foo() {
-				/* @cc-unroll */
+				/* @unroll */
 				for (let i = 0; i < 4; i++) {
 					if (i === 2) return;
 					arr[i] = i;
@@ -202,7 +202,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 
 	it('does NOT flag break inside a nested loop', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 3; i++) {
 				for (let j = 0; j < 10; j++) { if (j === 5) break; }
 				arr[i] = i;
@@ -215,7 +215,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 
 	it('does NOT flag return inside a nested function', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) {
 				const fn = () => { return i; };
 				arr[i] = fn();
@@ -230,7 +230,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
 			const start = 0;
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = start; i < 4; i++) { arr[i] = i; }
 		`);
 		expect(out).toContain('for');
@@ -242,7 +242,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
 			const n = 4;
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < n; i++) { arr[i] = i; }
 		`);
 		expect(out).toContain('for');
@@ -253,7 +253,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 	it('skips `i--`', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 4; i < 10; i--) { arr[i] = i; }
 		`);
 		expect(out).toContain('for');
@@ -261,7 +261,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 		spy.mockRestore();
 	});
 
-	it('does not touch loops without @cc-unroll', () => {
+	it('does not touch loops without @unroll', () => {
 		const out = run(`
 			for (let i = 0; i < 4; i++) { arr[i] = i; }
 		`);
@@ -272,7 +272,7 @@ describe('plugin-alt/transforms/unroll — skip conditions', () => {
 describe('plugin-alt/transforms/unroll — iteration counts', () => {
 	it('i < N produces exactly N iterations', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 5; i++) { process(i); }
 		`);
 		expect(out.match(/process\(\d+\)/g)).toHaveLength(5);
@@ -283,7 +283,7 @@ describe('plugin-alt/transforms/unroll — iteration counts', () => {
 
 	it('i <= N produces exactly N+1 iterations', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i <= 4; i++) { process(i); }
 		`);
 		expect(out.match(/process\(\d+\)/g)).toHaveLength(5);
@@ -293,7 +293,7 @@ describe('plugin-alt/transforms/unroll — iteration counts', () => {
 
 	it('step correctly truncates non-divisible range', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 7; i += 3) { process(i); }
 		`);
 		expect(out.match(/process\(\d+\)/g)).toHaveLength(3);
@@ -307,7 +307,7 @@ describe('plugin-alt/transforms/unroll — iteration counts', () => {
 describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('unrolls inline array literal', () => {
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (const key of ["x", "y", "z"]) { process(key); }
 		`);
 		expect(out).toContain('process("x")');
@@ -319,7 +319,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('unrolls when iterable is a const binding', () => {
 		const out = run(`
 			const KEYS = ["foo", "bar"];
-			/* @cc-unroll */
+			/* @unroll */
 			for (const key of KEYS) { obj[key] = 1; }
 		`);
 		expect(out).toContain('obj["foo"] = 1');
@@ -329,7 +329,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('substitutes identifier iterable elements as-is', () => {
 		const out = run(`
 			const Y = "y_val";
-			/* @cc-unroll */
+			/* @unroll */
 			for (const v of [42, "hello", Y, true]) { process(v); }
 		`);
 		expect(out).toContain('process(42)');
@@ -341,7 +341,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('removes empty-array for-of', () => {
 		const out = run(`
 			const before = 1;
-			/* @cc-unroll */
+			/* @unroll */
 			for (const x of []) { process(x); }
 			const after = 2;
 		`);
@@ -354,7 +354,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('skips non-resolvable iterable', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (const key of getKeys()) { process(key); }
 		`);
 		expect(out).toContain('for');
@@ -366,7 +366,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
 			let keys = ["a", "b"];
-			/* @cc-unroll */
+			/* @unroll */
 			for (const key of keys) { process(key); }
 		`);
 		expect(out).toContain('for');
@@ -377,7 +377,7 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('skips destructuring left-hand side', () => {
 		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 		const out = run(`
-			/* @cc-unroll */
+			/* @unroll */
 			for (const [a, b] of [[1, 2], [3, 4]]) { process(a, b); }
 		`);
 		expect(out).toContain('for');
@@ -388,9 +388,9 @@ describe('plugin-alt/transforms/unroll — for-of', () => {
 	it('nested for-of × for works', () => {
 		const out = run(`
 			const AXES = ["x", "y", "z"];
-			/* @cc-unroll */
+			/* @unroll */
 			for (let i = 0; i < 2; i++) {
-				/* @cc-unroll */
+				/* @unroll */
 				for (const axis of AXES) { result[i][axis] = 0; }
 			}
 		`);

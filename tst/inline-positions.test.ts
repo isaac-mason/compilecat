@@ -13,7 +13,7 @@ function run(code: string): string {
 describe('plugin-alt/transforms/inline — control-flow positions', () => {
 	it('inlines a call inside an `if` condition', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function sq(x) { return x * x; }
 			export function work(v) {
 				if (sq(v) > 4) {
@@ -30,7 +30,7 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 
 	it('inlines a call inside a `while` condition', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function dec(x) { return x - 1; }
 			export function work(n) {
 				while (dec(n) > 0) {
@@ -47,7 +47,7 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 
 	it('inlines a call inside a `for` condition', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function limit(i) { return i + 1; }
 			export function work(n) {
 				for (let i = 0; i < limit(n); i++) {
@@ -62,9 +62,9 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 
 	it('inlines a call inside both branches of a ternary', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function a(x) { return x * 2; }
-			/* @cc-inline */
+			/* @inline */
 			function b(x) { return x * 3; }
 			export function work(cond, v) {
 				return cond ? a(v) : b(v);
@@ -80,7 +80,7 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 
 	it('inlines a call on the RHS of a short-circuit expression', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function doubled(x) { return x * 2; }
 			export function work(flag, v) {
 				return flag && doubled(v);
@@ -94,7 +94,7 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 
 	it('inlines a call that is an argument to another call', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function sq(x) { return x * x; }
 			export function work(a, b) {
 				return Math.max(sq(a), sq(b));
@@ -113,7 +113,7 @@ describe('plugin-alt/transforms/inline — control-flow positions', () => {
 		// isn't simple-return, and `inlineExpressionPosition` requires a return
 		// argument). Guards against silently emitting `undefined`.
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function touch(arr) {
 				arr[0] = 1;
 			}

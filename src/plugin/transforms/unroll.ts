@@ -7,7 +7,7 @@ import { traverse } from '../util/babel';
 /**
  * Loop unrolling.
  *
- * Replaces an opt-in `/* @cc-unroll *​/` loop with a flat sequence of its body,
+ * Replaces an opt-in `/* @unroll *​/` loop with a flat sequence of its body,
  * one copy per iteration, with the loop variable substituted by its concrete
  * value. Works on:
  *
@@ -20,7 +20,7 @@ import { traverse } from '../util/babel';
  * pointing at the source location — this is a soft-failure channel for
  * silent no-ops.
  *
- * Nested `@cc-unroll` directives are handled by running the pass to a fixpoint
+ * Nested `@unroll` directives are handled by running the pass to a fixpoint
  * (with a hard ceiling on total passes to guard against pathological input).
  */
 
@@ -100,7 +100,7 @@ function unrollForStatement(path: NodePath<t.ForStatement>): boolean {
         }
     }
 
-    // Strip @cc-unroll off the original before replaceWithMultiple — otherwise
+    // Strip @unroll off the original before replaceWithMultiple — otherwise
     // babel transfers the leading comment onto the first replacement statement
     // and the next pass would try to unroll it again (the replacement isn't a
     // loop, but the warning path would fire).
@@ -336,5 +336,5 @@ function stripUnrollComments(node: t.Node): void {
 function warn(node: t.Node, reason: string): void {
     const loc = node.loc?.start;
     const locStr = loc ? ` (line ${loc.line})` : '';
-    console.warn(`[compilecat] @cc-unroll: ${reason}${locStr}, skipping`);
+    console.warn(`[compilecat] @unroll: ${reason}${locStr}, skipping`);
 }

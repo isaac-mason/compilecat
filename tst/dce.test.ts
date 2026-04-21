@@ -21,9 +21,9 @@ function normalize(s: string): string {
 }
 
 describe('plugin-alt/transforms/dce', () => {
-	it('eliminates a dead binding inside an @cc-sroa zone', () => {
+	it('eliminates a dead binding inside an @sroa zone', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let dead = 0;
 				return 42;
@@ -39,7 +39,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('eliminates a dead binding along with its writes', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let dead = 0;
 				dead = 5;
@@ -57,7 +57,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('preserves side effects when dead binding has impure writes', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let dead = 0;
 				dead = sideEffect();
@@ -75,7 +75,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('preserves side effects in an impure initializer', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let dead = sideEffect();
 				return 42;
@@ -92,7 +92,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('leaves live bindings alone', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let x = 0;
 				x = 5;
@@ -129,7 +129,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('removes dead declarators alongside live ones in the same statement', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let live = 1, dead = 0;
 				return live;
@@ -146,7 +146,7 @@ describe('plugin-alt/transforms/dce', () => {
 
 	it('removes dead binding declared with const (zero references)', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				const dead = 42;
 				return 1;
@@ -160,9 +160,9 @@ describe('plugin-alt/transforms/dce', () => {
 		expect(normalize(runDce(input))).toBe(normalize(expected));
 	});
 
-	it('@cc-inline zone also enables DCE', () => {
+	it('@inline zone also enables DCE', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function helper() {
 				let dead = 0;
 				return 1;
@@ -179,7 +179,7 @@ describe('plugin-alt/transforms/dce', () => {
 	it('only clears declarators inside the annotated function', () => {
 		// annotation on helper should not leak DCE into unrelated other()
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function helper() {
 				let dead = 0;
 				return 1;

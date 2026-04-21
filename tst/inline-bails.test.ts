@@ -17,7 +17,7 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 		// sibling expression in the host. Must stay a call.
 		const input = `
 			function other() { return 1; }
-			/* @cc-inline */
+			/* @inline */
 			function f(v) {
 				const x = other();
 				return v + x;
@@ -34,7 +34,7 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 
 	it('bails on spread-args callsites', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function sum(a, b) { return a + b; }
 			export function work(xs) {
 				return sum(...xs);
@@ -47,7 +47,7 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 
 	it('bails on destructuring parameters', () => {
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function take({ x, y }) { return x + y; }
 			export function work(pt) {
 				return take(pt);
@@ -58,11 +58,12 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 		expect(workBody).toMatch(/\btake\(pt\)/);
 	});
 
-	it('same callee invoked twice in one statement gets distinct suffixes', () => {
+	it('same callee invoked twice in one statement gets distinct names', () => {
 		// Both calls need hoists (non-simple args), and the temp names must
-		// not collide. The suffix counter guarantees uniqueness.
+		// not collide. First splice uses the bare `t`; the second collides
+		// and gets `t_2`.
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function step(a, b) {
 				const t = a * b;
 				return t + 1;
@@ -74,10 +75,10 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 		const out = run(input);
 		const workBody = out.slice(out.indexOf('function work'));
 		expect(workBody).not.toMatch(/\bstep\(/);
-		// Two distinct `t_` temps survive.
-		const tMatches = workBody.match(/\bt_\d+/g) ?? [];
-		const uniqueT = new Set(tMatches);
-		expect(uniqueT.size).toBeGreaterThanOrEqual(2);
+		// Two distinct `t` locals survive: `t` and `t_2`.
+		const tDecls = workBody.match(/\bconst (t|t_\d+)\s*=/g) ?? [];
+		const uniqueDecls = new Set(tDecls);
+		expect(uniqueDecls.size).toBeGreaterThanOrEqual(2);
 	});
 
 	it('default-valued params: call that omits the arg receives `undefined` (no crash)', () => {
@@ -87,7 +88,7 @@ describe('plugin-alt/transforms/inline — safety bails and edge cases', () => {
 		// snapshot — if we later teach the inliner to honor defaults, this
 		// test will flip and we'll know to update the assertion.
 		const input = `
-			/* @cc-inline */
+			/* @inline */
 			function greet(name = "world") { return "hi " + name; }
 			export function work() {
 				return greet();

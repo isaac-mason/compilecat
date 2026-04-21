@@ -8,7 +8,7 @@ import * as t from '@babel/types';
  * that manipulate tuple-shaped data (vec3, quat, mat4) — downstream V8 can
  * keep the components in registers rather than as array slots.
  *
- * Opt-in via `/* @cc-sroa *​/` annotation on either:
+ * Opt-in via `/* @sroa *​/` annotation on either:
  *   - the VariableDeclaration itself, or
  *   - an enclosing function / arrow-bound const.
  * File-level annotation is intentionally not supported — pick a scope.

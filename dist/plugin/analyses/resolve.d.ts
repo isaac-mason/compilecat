@@ -5,7 +5,7 @@
  *   - Same-project (relative + absolute paths): `./vec3`, `../util`, `/abs`.
  *     Always allowed. Probes extensions and index files.
  *   - Library (bare specifier): `lodash`, `@scope/pkg/sub`.
- *     Only consulted when the callsite explicitly opts in via `/* @cc-inline *​/`.
+ *     Only consulted when the callsite explicitly opts in via `/* @inline *​/`.
  *     Walks up `node_modules`, honors package.json `exports` / `main` / `module`.
  *
  * A `FileReader` abstraction lets tests inject virtual filesystems without
@@ -31,7 +31,7 @@ export declare function resolveLibraryImport(fromFile: string, specifier: string
 /**
  * Unified resolver. Tries relative first, then library only if permitted.
  * `allowLibrary` gates node_modules inlining — pass `true` only when the
- * callsite has an explicit `@cc-inline` annotation.
+ * callsite has an explicit `@inline` annotation.
  *
  * `reader`, if given, is used for relative-import existence checks so virtual
  * filesystems work. Library resolution always goes to disk.

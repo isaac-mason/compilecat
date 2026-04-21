@@ -17,7 +17,7 @@ function normalize(s: string): string {
 describe('plugin-alt/transforms/copyprop', () => {
 	it('propagates const x = y and removes x', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(y) {
 				const x = y;
 				return x + x;
@@ -33,7 +33,7 @@ describe('plugin-alt/transforms/copyprop', () => {
 
 	it('does nothing when y is re-assigned (not constant)', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f() {
 				let y = 1;
 				const x = y;
@@ -55,7 +55,7 @@ describe('plugin-alt/transforms/copyprop', () => {
 
 	it('does nothing when x is re-assigned', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(y) {
 				let x = y;
 				x = 5;
@@ -74,7 +74,7 @@ describe('plugin-alt/transforms/copyprop', () => {
 
 	it('skips when y is shadowed at the use site', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(y) {
 				const x = y;
 				{
@@ -84,7 +84,7 @@ describe('plugin-alt/transforms/copyprop', () => {
 			}
 		`;
 		// replacing x with y inside the inner block would read the inner y
-		const expected = input.replace('/* @cc-sroa */', '');
+		const expected = input.replace('/* @sroa */', '');
 		expect(normalize(run(input))).toBe(normalize(expected));
 	});
 
@@ -106,20 +106,20 @@ describe('plugin-alt/transforms/copyprop', () => {
 
 	it('skips for-of loop decls', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(arr) {
 				for (const x of arr) {
 					console.log(x);
 				}
 			}
 		`;
-		const expected = input.replace('/* @cc-sroa */', '');
+		const expected = input.replace('/* @sroa */', '');
 		expect(normalize(run(input))).toBe(normalize(expected));
 	});
 
 	it('propagates param alias: const a = param; use a → use param', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(param) {
 				const a = param;
 				return a * a;
@@ -135,7 +135,7 @@ describe('plugin-alt/transforms/copyprop', () => {
 
 	it('handles chained const aliases', () => {
 		const input = `
-			/* @cc-sroa */
+			/* @sroa */
 			function f(y) {
 				const a = y;
 				const b = a;

@@ -10,13 +10,13 @@ import { DIRECTIVE_PATTERNS, type DirectiveKind, OPTIMIZE_DIRECTIVES } from './d
  * A node belongs to a zone iff the node itself or any ancestor up to Program
  * carries the matching block comment in its leadingComments.
  *
- * This module exists because the "does this path sit inside an `@cc-sroa`
+ * This module exists because the "does this path sit inside an `@sroa`
  * (etc.) scope?" query gets asked many times during a single pass. A
  * hand-rolled ancestor walk does the lookup per call; here we memoize per
  * node so the walk amortizes to O(1) per query after the first hit on each
  * ancestor path.
  *
- * `@cc-optimize` is an umbrella that implies every body-level zone but
+ * `@optimize` is an umbrella that implies every body-level zone but
  * deliberately NOT `inline` — decl-visibility is a separate axis from
  * body-level aggressiveness. See directives.ts for the implied set.
  */
@@ -25,10 +25,10 @@ export type ZoneKind = DirectiveKind;
 
 /**
  * Read direct-on-node zone annotations from block-comment leading comments.
- * An `@cc-optimize` marker expands here into every implied zone — doing the
+ * An `@optimize` marker expands here into every implied zone — doing the
  * expansion at collection time keeps `isInZone` a plain WeakMap lookup.
  *
- * Line comments (`// @cc-inline`) are intentionally ignored — keeps
+ * Line comments (`// @inline`) are intentionally ignored — keeps
  * annotations visually deliberate.
  */
 function directZonesOn(node: t.Node): ZoneKind[] {

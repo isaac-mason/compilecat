@@ -52,7 +52,7 @@ describe('plugin-alt/transforms/inline — library imports', () => {
 			'project/src/main.ts',
 			`
 				import { triple } from 'mylib';
-				const r = /* @cc-inline */ triple(7);
+				const r = /* @inline */ triple(7);
 			`,
 		);
 		const consumerCode = fs.readFileSync(consumer, 'utf-8');
@@ -88,7 +88,7 @@ describe('plugin-alt/transforms/inline — library imports', () => {
 			'project3/src/main.ts',
 			`
 				import { triple } from 'mylib';
-				const r = /* @cc-inline */ triple(7);
+				const r = /* @inline */ triple(7);
 			`,
 		);
 		const consumerCode = fs.readFileSync(consumer, 'utf-8');
@@ -100,7 +100,7 @@ describe('plugin-alt/transforms/inline — library imports', () => {
 		write('project4/node_modules/mylib/package.json', JSON.stringify({ main: './index.js' }));
 		write(
 			'project4/node_modules/mylib/index.js',
-			`/* @cc-inline */ export function double(x) { return x * 2; }`,
+			`/* @inline */ export function double(x) { return x * 2; }`,
 		);
 		const consumer = write(
 			'project4/src/main.ts',
