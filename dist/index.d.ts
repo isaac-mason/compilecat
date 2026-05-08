@@ -1,6 +1,7 @@
-export { unplugin, type Options } from './plugin/plugin';
-export { unplugin as inlineFunctionsPlugin } from './plugin/plugin';
-export { unplugin as default } from './plugin/plugin';
-export { transform, type TransformOptions, type TransformResult, } from './plugin/transform';
-export { createFileCache, type FileCache } from './plugin/analyses/fileindex';
-export { defaultFileReader, type FileReader } from './plugin/analyses/resolve';
+export { unplugin, type Options } from './plugin';
+export { unplugin as default } from './plugin';
+export { transform, type TransformOptions, type TransformResult } from './compiler/pipeline';
+export { createFileCache, type FileCache } from './compiler/file-index';
+export type { FileReader } from './compiler/resolve';
+export { inlineFunctions, type InlineResult } from './compiler/inline-functions';
+export { simplifyAll, simplifyFunction, type SimplifyStats } from './compiler/simplifier';

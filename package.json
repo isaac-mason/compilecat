@@ -38,7 +38,8 @@
 	"files": [
 		"dist",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"NOTICE"
 	],
 	"scripts": {
 		"build": "rm -rf ./dist && rollup --config rollup.config.ts",

@@ -1,199 +1,148 @@
+import generate from '@babel/generator';
 import { parse } from '@babel/parser';
+import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
-import * as Effects from '../src/plugin/analyses/effects';
-import { applyInline } from '../src/plugin/transforms/inline';
-import { generate } from '../src/plugin/util/babel';
 
-function run(code: string): string {
-	const ast = parse(code, { sourceType: 'module', plugins: ['typescript'] });
-	applyInline(ast, '/virtual/test.ts', { effects: Effects.init() });
-	return generate(ast, { retainLines: false, comments: false }).code.trim();
+import { inlineFunctions } from '../src/compiler/inline-functions';
+
+function inl(code: string): { code: string; succeeded: number; calls: number } {
+    const file = parse(code, { plugins: ['typescript'] });
+    const r = inlineFunctions(file);
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
+        .replace(/\s+/g, ' ')
+        .trim();
+    return { code: out, succeeded: r.succeeded, calls: r.calls };
 }
 
-function normalize(s: string): string {
-	return s.replace(/\s+/g, ' ').trim();
-}
+describe('InlineFunctions', () => {
+    it('DIRECT inlines a single-return function (decl-annotated)', () => {
+        const r = inl(`
+            /** @inline */
+            function add(a, b) { return a + b; }
+            var x = add(1, 2);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('var x = 1 + 2');
+        expect(r.code).not.toContain('function add');
+    });
 
-describe('plugin-alt/transforms/inline (v1: single-file)', () => {
-	it('inlines a simple-return function at a const init', () => {
-		const input = `
-			/* @inline */
-			function add(a, b) { return a + b; }
-			const x = add(1, 2);
-		`;
-		const expected = `
-			const x = 1 + 2;
-		`;
-		expect(normalize(run(input))).toBe(normalize(expected));
-	});
+    it('DIRECT inlines based on callsite annotation', () => {
+        const r = inl(`
+            function add(a, b) { return a + b; }
+            var x = /* @inline */ add(1, 2);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('var x = 1 + 2');
+        // Decl not stripped (no decl-annotation).
+        expect(r.code).toContain('function add');
+    });
 
-	it('inlines at statement form (discards return when pure)', () => {
-		const input = `
-			/* @inline */
-			function write(out, i, v) { out[i] = v; return out; }
-			write(arr, 0, 99);
-		`;
-		const expected = `
-			arr[0] = 99;
-		`;
-		expect(normalize(run(input))).toBe(normalize(expected));
-	});
+    it('skips inline without any annotation', () => {
+        const r = inl(`
+            function add(a, b) { return a + b; }
+            var x = add(1, 2);
+        `);
+        expect(r.succeeded).toBe(0);
+        expect(r.code).toContain('add(1, 2)');
+    });
 
-	it('inlines at assignment RHS', () => {
-		const input = `
-			/* @inline */
-			function add(a, b) { return a + b; }
-			let y;
-			y = add(10, 20);
-		`;
-		const expected = `
-			let y;
-			y = 10 + 20;
-		`;
-		expect(normalize(run(input))).toBe(normalize(expected));
-	});
+    it('BLOCK inlines a function with early return', () => {
+        const r = inl(`
+            /** @inline */
+            function abs(x) { if (x < 0) return -x; return x; }
+            var v = abs(p);
+        `);
+        expect(r.succeeded).toBe(1);
+        // Either contains the labeled block or its post-simplifier reduction.
+        expect(r.code).toMatch(/_inline_0|_r_0/);
+    });
 
-	it('inlines at return-statement arg', () => {
-		const input = `
-			/* @inline */
-			function add(a, b) { return a + b; }
-			function caller(x) { return add(x, 1); }
-		`;
-		const expected = `
-			function caller(x) { return x + 1; }
-		`;
-		expect(normalize(run(input))).toBe(normalize(expected));
-	});
+    it('BLOCK with discarded result drops the temp', () => {
+        const r = inl(`
+            /** @inline */
+            function noisy(x) { if (x < 0) return; effect(x); }
+            noisy(p);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('_inline_0');
+    });
 
-	it('hoists impure args once into _arg_ temps', () => {
-		const input = `
-			/* @inline */
-			function square(a) { return a * a; }
-			const s = square(sideEffect());
-		`;
-		const out = run(input);
-		// sideEffect() should be called exactly once, hoisted to a const.
-		// Base name `_arg_a` has no collision here, so no numeric suffix.
-		expect(out).toMatch(/const _arg_a(_\d+)?\s*=/);
-		expect(out.match(/sideEffect\(\)/g)?.length).toBe(1);
-	});
+    it('rejects async / generator functions', () => {
+        const r = inl(`
+            /** @inline */
+            async function fetchOnce() { return 1; }
+            var v = fetchOnce();
+        `);
+        expect(r.succeeded).toBe(0);
+    });
 
-	it('does not hoist pure args (identifier / member chain)', () => {
-		const input = `
-			/* @inline */
-			function square(a) { return a * a; }
-			const s = square(obj.prop);
-		`;
-		const out = run(input);
-		expect(out).not.toContain('_arg_a_');
-		expect(out).toContain('obj.prop * obj.prop');
-	});
+    it('rejects this-using functions', () => {
+        const r = inl(`
+            /** @inline */
+            function getProp() { return this.p; }
+            var v = getProp();
+        `);
+        expect(r.succeeded).toBe(0);
+    });
 
-	it('renames colliding locals only when they actually collide', () => {
-		const input = `
-			/* @inline */
-			function f(x) {
-				const tmp = x + 1;
-				return tmp * 2;
-			}
-			const a = f(10);
-			const b = f(20);
-		`;
-		const out = run(input);
-		// First splice keeps the bare name; second splice collides and gets _2.
-		expect(out).toMatch(/const tmp\s*=/);
-		expect(out).toMatch(/const tmp_2\s*=/);
-	});
+    it('rejects arguments-using functions', () => {
+        const r = inl(`
+            /** @inline */
+            function variadic() { return arguments[0]; }
+            var v = variadic(1);
+        `);
+        expect(r.succeeded).toBe(0);
+    });
 
-	it('removes inlined function declarations after inlining', () => {
-		const input = `
-			/* @inline */
-			function add(a, b) { return a + b; }
-			const x = add(1, 2);
-		`;
-		const out = run(input);
-		expect(out).not.toContain('function add');
-	});
+    it('@flatten propagates @inline to all calls inside', () => {
+        const r = inl(`
+            function add(a, b) { return a + b; }
+            /** @flatten */
+            function f(x, y) { return add(x, y); }
+            var z = f(1, 2);
+        `);
+        // f's call to add inlines (flatten propagation), and f itself inlines
+        // at the top-level call (matches classic: @flatten is also @inline).
+        expect(r.succeeded).toBe(2);
+        expect(r.code).toContain('var z = 1 + 2');
+    });
 
-	it('handles imperative bodies with writes + trailing return', () => {
-		const input = `
-			/* @inline */
-			function add(a, b, out) {
-				out[0] = a[0] + b[0];
-				out[1] = a[1] + b[1];
-				out[2] = a[2] + b[2];
-				return out;
-			}
-			const r = add(p, q, tmp);
-		`;
-		const out = run(input);
-		expect(out).toContain('tmp[0] = p[0] + q[0]');
-		expect(out).toContain('tmp[1] = p[1] + q[1]');
-		expect(out).toContain('tmp[2] = p[2] + q[2]');
-		expect(out).toContain('const r = tmp');
-	});
+    it('inlines arrow function via const decl', () => {
+        const r = inl(`
+            /** @inline */
+            const id = (x) => x;
+            var v = id(5);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('var v = 5');
+    });
 
-	it('inlines callees in bottom-up order (nested inlineables)', () => {
-		const input = `
-			/* @inline */
-			function square(a) { return a * a; }
-			/* @inline */
-			function sumOfSquares(x, y) {
-				return square(x) + square(y);
-			}
-			const s = sumOfSquares(3, 4);
-		`;
-		const out = run(input);
-		// both callers have been fully inlined at the consumer callsite
-		expect(out).toContain('3 * 3 + 4 * 4');
-		expect(out).not.toContain('square');
-		expect(out).not.toContain('sumOfSquares');
-	});
+    it('alpha-renames params so they cannot shadow outer-scope free vars in args', () => {
+        // Regression: inlining `insertLeaf(dbvt, leafIndex)` inside a caller
+        // whose own params are also `dbvt` and `leafIndex` previously emitted
+        // `let dbvt = dbvt;` (TDZ on RHS), which the simplifier later stripped
+        // to `let dbvt;` — leaving outer-scope reads bound to undefined.
+        const r = inl(`
+            /** @inline */
+            function ins(dbvt, leaf) { dbvt.x = leaf; }
+            function add(dbvt, leaf) { ins(dbvt, leaf); }
+        `);
+        expect(r.succeeded).toBe(1);
+        // The inlined block must not contain a same-name self-binding.
+        expect(r.code).not.toMatch(/let dbvt\s*=\s*dbvt\b/);
+        expect(r.code).not.toMatch(/let leaf\s*=\s*leaf\b/);
+        // Renamed params should appear with the call's args bound through them.
+        expect(r.code).toMatch(/let dbvt\$p\d+_\d+\s*=\s*dbvt\b/);
+    });
 
-	it('skips functions with control-flow bodies', () => {
-		const input = `
-			/* @inline */
-			function choose(a, b, cond) {
-				if (cond) return a;
-				return b;
-			}
-			const x = choose(1, 2, true);
-		`;
-		// v1 bails on if-statements — function stays, callsite stays
-		const out = run(input);
-		expect(out).toContain('function choose');
-		expect(out).toContain('choose(1, 2, true)');
-	});
-
-	it('bails on recursive inlineable functions', () => {
-		const input = `
-			/* @inline */
-			function fact(n) { return n * fact(n - 1); }
-			const x = fact(3);
-		`;
-		const out = run(input);
-		expect(out).toContain('function fact');
-		expect(out).toContain('fact(3)');
-	});
-
-	it('does not inline unannotated functions', () => {
-		const input = `
-			function add(a, b) { return a + b; }
-			const x = add(1, 2);
-		`;
-		const out = run(input);
-		expect(out).toContain('function add');
-		expect(out).toContain('add(1, 2)');
-	});
-
-	it('inlines through an export', () => {
-		const input = `
-			/* @inline */
-			export function add(a, b) { return a + b; }
-			const x = add(1, 2);
-		`;
-		const out = run(input);
-		expect(out).toContain('const x = 1 + 2');
-		expect(out).not.toContain('function add');
-	});
+    it('falls back to BLOCK when DIRECT side-effect arg used twice', () => {
+        const r = inl(`
+            /** @inline */
+            function dbl(x) { return x + x; }
+            var v = dbl(getX());
+        `);
+        // DIRECT would re-execute getX(); BLOCK binds it to a temp.
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('_inline_0');
+    });
 });

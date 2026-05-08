@@ -1,0 +1,6 @@
+export type DirectiveKind = 'inline' | 'flatten' | 'sroa' | 'unroll' | 'optimize';
+export declare const DIRECTIVE_PATTERNS: Record<DirectiveKind, RegExp>;
+export declare const OPTIMIZE_DIRECTIVES: readonly DirectiveKind[];
+export declare const ANY_DIRECTIVE_IN_SOURCE: RegExp;
+export declare function commentIsInlineDirective(value: string): boolean;
+export declare function commentIsFlattenDirective(value: string): boolean;

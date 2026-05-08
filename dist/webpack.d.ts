@@ -1,2 +1,2 @@
-declare const _default: (options?: import("./index").Options | undefined) => WebpackPluginInstance;
+declare const _default: (options?: import("./plugin").Options | undefined) => WebpackPluginInstance;
 export default _default;

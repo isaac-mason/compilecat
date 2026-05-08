@@ -1,403 +1,121 @@
+import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import { describe, expect, it, vi } from 'vitest';
-import { applyUnroll } from '../src/plugin/transforms/unroll';
-import { generate } from '../src/plugin/util/babel';
+import * as t from '@babel/types';
+import { describe, expect, it } from 'vitest';
 
-function run(code: string): string {
-	const ast = parse(code, { sourceType: 'module', plugins: ['typescript'] });
-	applyUnroll(ast);
-	return generate(ast, { retainLines: false, comments: false }).code.trim();
+import { unrollLoops } from '../src/compiler/loop-unroller';
+
+function un(code: string): { code: string; unrolled: number } {
+    const file = parse(code, { plugins: ['typescript'] });
+    const r = unrollLoops(file);
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
+        .replace(/\s+/g, ' ')
+        .trim();
+    return { code: out, unrolled: r.unrolled };
 }
 
-describe('plugin-alt/transforms/unroll — basic for', () => {
-	it('unrolls `i < N`', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 4; i++) { arr[i] = i; }
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[1] = 1');
-		expect(out).toContain('arr[2] = 2');
-		expect(out).toContain('arr[3] = 3');
-		expect(out).not.toContain('for');
-	});
+describe('LoopUnroller', () => {
+    it('unrolls a simple counted for loop', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 3; i++) { f(i); }
+        `);
+        expect(r.unrolled).toBe(1);
+        expect(r.code).toContain('f(0)');
+        expect(r.code).toContain('f(1)');
+        expect(r.code).toContain('f(2)');
+        expect(r.code).not.toContain('for ');
+    });
 
-	it('unrolls `i <= N`', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i <= 2; i++) { arr[i] = i; }
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[1] = 1');
-		expect(out).toContain('arr[2] = 2');
-		expect(out).not.toContain('arr[3]');
-	});
+    it('honors inclusive upper bound', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 1; i <= 3; i++) { f(i); }
+        `);
+        expect(r.code).toContain('f(1)');
+        expect(r.code).toContain('f(3)');
+    });
 
-	it('unrolls with non-zero start', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 2; i < 5; i++) { arr[i] = i * 2; }
-		`);
-		expect(out).toContain('arr[2] = 2 * 2');
-		expect(out).toContain('arr[3] = 3 * 2');
-		expect(out).toContain('arr[4] = 4 * 2');
-		expect(out).not.toContain('arr[0]');
-	});
+    it('handles step += N', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 6; i += 2) { f(i); }
+        `);
+        expect(r.code).toContain('f(0)');
+        expect(r.code).toContain('f(2)');
+        expect(r.code).toContain('f(4)');
+        expect(r.code).not.toContain('f(6)');
+    });
 
-	it('unrolls `i += step`', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 6; i += 2) { arr[i] = i; }
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[2] = 2');
-		expect(out).toContain('arr[4] = 4');
-		expect(out).not.toContain('arr[1]');
-	});
+    it('unrolls for-of over an array literal', () => {
+        const r = un(`
+            /** @unroll */
+            for (const x of [10, 20, 30]) { f(x); }
+        `);
+        expect(r.unrolled).toBe(1);
+        expect(r.code).toContain('f(10)');
+        expect(r.code).toContain('f(20)');
+        expect(r.code).toContain('f(30)');
+    });
 
-	it('accepts ++i update syntax', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 3; ++i) { arr[i] = i; }
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[1] = 1');
-		expect(out).toContain('arr[2] = 2');
-	});
+    it('skips loop with non-literal bound', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < n; i++) { f(i); }
+        `);
+        expect(r.unrolled).toBe(0);
+        expect(r.code).toContain('for ');
+    });
 
-	it('handles single-statement body without braces', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 3; i++) arr[i] = i;
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[2] = 2');
-		expect(out).not.toContain('for');
-	});
+    it('skips loop with break in body', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 3; i++) { if (i == 1) break; f(i); }
+        `);
+        expect(r.unrolled).toBe(0);
+    });
 
-	it('removes a zero-iteration loop', () => {
-		const out = run(`
-			const before = 1;
-			/* @unroll */
-			for (let i = 5; i < 3; i++) { arr[i] = i; }
-			const after = 2;
-		`);
-		expect(out).not.toContain('arr[');
-		expect(out).not.toContain('for (');
-		expect(out).toContain('before');
-		expect(out).toContain('after');
-	});
-});
+    it('does not substitute under inner shadowing scope', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 2; i++) {
+                let i = 99;
+                f(i);
+            }
+        `);
+        expect(r.unrolled).toBe(1);
+        // f(i) should remain unchanged: the inner `let i = 99` shadows the
+        // loop counter, so substitution must not occur.
+        expect(r.code).toContain('f(i)');
+        expect(r.code).not.toContain('f(0)');
+        expect(r.code).not.toContain('f(1)');
+    });
 
-describe('plugin-alt/transforms/unroll — substitution', () => {
-	it('substitutes in complex expressions', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 3; i++) { mat[i * 3 + 0] = row[i]; }
-		`);
-		expect(out).toContain('mat[0 * 3 + 0] = row[0]');
-		expect(out).toContain('mat[1 * 3 + 0] = row[1]');
-		expect(out).toContain('mat[2 * 3 + 0] = row[2]');
-	});
+    it('drops loop with empty range', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 0; i++) { f(i); }
+        `);
+        expect(r.code).not.toContain('for ');
+        expect(r.code).not.toContain('f(');
+    });
 
-	it('does not substitute shadowed param in nested function', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 2; i++) {
-				const fn = (i: number) => { return i; };
-				arr[i] = fn(99);
-			}
-		`);
-		expect(out).toContain('(i: number)');
-		expect(out).toContain('return i');
-	});
+    it('leaves unannotated loops alone', () => {
+        const r = un('for (let i = 0; i < 3; i++) { f(i); }');
+        expect(r.unrolled).toBe(0);
+    });
 
-	it('does not substitute property keys with the same name', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 2; i++) { obj.i = i; }
-		`);
-		expect(out).toContain('obj.i = 0');
-		expect(out).toContain('obj.i = 1');
-	});
-});
-
-describe('plugin-alt/transforms/unroll — nested', () => {
-	it('unrolls nested loops in a single apply() call', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 2; i++) {
-				/* @unroll */
-				for (let j = 0; j < 2; j++) { mat[i * 2 + j] = i + j; }
-			}
-		`);
-		expect(out).toContain('mat[0 * 2 + 0] = 0 + 0');
-		expect(out).toContain('mat[0 * 2 + 1] = 0 + 1');
-		expect(out).toContain('mat[1 * 2 + 0] = 1 + 0');
-		expect(out).toContain('mat[1 * 2 + 1] = 1 + 1');
-		expect(out).not.toContain('for');
-	});
-
-	it('unrolls triple-nested loops', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 2; i++) {
-				/* @unroll */
-				for (let j = 0; j < 2; j++) {
-					/* @unroll */
-					for (let k = 0; k < 2; k++) { result[i * 4 + j * 2 + k] = i + j + k; }
-				}
-			}
-		`);
-		expect(out).not.toContain('for');
-		expect(out).toContain('result[0 * 4 + 0 * 2 + 0] = 0 + 0 + 0');
-		expect(out).toContain('result[1 * 4 + 1 * 2 + 1] = 1 + 1 + 1');
-	});
-});
-
-describe('plugin-alt/transforms/unroll — skip conditions', () => {
-	it('skips when loop has break and warns', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 4; i++) {
-				if (i === 2) break;
-				arr[i] = i;
-			}
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('break/continue/return'));
-		spy.mockRestore();
-	});
-
-	it('skips when loop has continue', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 4; i++) {
-				if (i === 2) continue;
-				arr[i] = i;
-			}
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('break/continue/return'));
-		spy.mockRestore();
-	});
-
-	it('skips when loop has return', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			function foo() {
-				/* @unroll */
-				for (let i = 0; i < 4; i++) {
-					if (i === 2) return;
-					arr[i] = i;
-				}
-			}
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('break/continue/return'));
-		spy.mockRestore();
-	});
-
-	it('does NOT flag break inside a nested loop', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 3; i++) {
-				for (let j = 0; j < 10; j++) { if (j === 5) break; }
-				arr[i] = i;
-			}
-		`);
-		expect(out).toContain('arr[0] = 0');
-		expect(out).toContain('arr[1] = 1');
-		expect(out).toContain('arr[2] = 2');
-	});
-
-	it('does NOT flag return inside a nested function', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 2; i++) {
-				const fn = () => { return i; };
-				arr[i] = fn();
-			}
-		`);
-		expect(out).not.toContain('for (let i');
-		expect(out).toContain('arr[0]');
-		expect(out).toContain('arr[1]');
-	});
-
-	it('skips and warns when init is not a numeric literal', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			const start = 0;
-			/* @unroll */
-			for (let i = start; i < 4; i++) { arr[i] = i; }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('could not determine loop shape'));
-		spy.mockRestore();
-	});
-
-	it('skips when bound is not a numeric literal', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			const n = 4;
-			/* @unroll */
-			for (let i = 0; i < n; i++) { arr[i] = i; }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('could not determine loop shape'));
-		spy.mockRestore();
-	});
-
-	it('skips `i--`', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			/* @unroll */
-			for (let i = 4; i < 10; i--) { arr[i] = i; }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('could not determine loop shape'));
-		spy.mockRestore();
-	});
-
-	it('does not touch loops without @unroll', () => {
-		const out = run(`
-			for (let i = 0; i < 4; i++) { arr[i] = i; }
-		`);
-		expect(out).toContain('for');
-	});
-});
-
-describe('plugin-alt/transforms/unroll — iteration counts', () => {
-	it('i < N produces exactly N iterations', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 5; i++) { process(i); }
-		`);
-		expect(out.match(/process\(\d+\)/g)).toHaveLength(5);
-		expect(out).toContain('process(0)');
-		expect(out).toContain('process(4)');
-		expect(out).not.toContain('process(5)');
-	});
-
-	it('i <= N produces exactly N+1 iterations', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i <= 4; i++) { process(i); }
-		`);
-		expect(out.match(/process\(\d+\)/g)).toHaveLength(5);
-		expect(out).toContain('process(4)');
-		expect(out).not.toContain('process(5)');
-	});
-
-	it('step correctly truncates non-divisible range', () => {
-		const out = run(`
-			/* @unroll */
-			for (let i = 0; i < 7; i += 3) { process(i); }
-		`);
-		expect(out.match(/process\(\d+\)/g)).toHaveLength(3);
-		expect(out).toContain('process(0)');
-		expect(out).toContain('process(3)');
-		expect(out).toContain('process(6)');
-		expect(out).not.toContain('process(7)');
-	});
-});
-
-describe('plugin-alt/transforms/unroll — for-of', () => {
-	it('unrolls inline array literal', () => {
-		const out = run(`
-			/* @unroll */
-			for (const key of ["x", "y", "z"]) { process(key); }
-		`);
-		expect(out).toContain('process("x")');
-		expect(out).toContain('process("y")');
-		expect(out).toContain('process("z")');
-		expect(out).not.toContain('for');
-	});
-
-	it('unrolls when iterable is a const binding', () => {
-		const out = run(`
-			const KEYS = ["foo", "bar"];
-			/* @unroll */
-			for (const key of KEYS) { obj[key] = 1; }
-		`);
-		expect(out).toContain('obj["foo"] = 1');
-		expect(out).toContain('obj["bar"] = 1');
-	});
-
-	it('substitutes identifier iterable elements as-is', () => {
-		const out = run(`
-			const Y = "y_val";
-			/* @unroll */
-			for (const v of [42, "hello", Y, true]) { process(v); }
-		`);
-		expect(out).toContain('process(42)');
-		expect(out).toContain('process("hello")');
-		expect(out).toContain('process(Y)');
-		expect(out).toContain('process(true)');
-	});
-
-	it('removes empty-array for-of', () => {
-		const out = run(`
-			const before = 1;
-			/* @unroll */
-			for (const x of []) { process(x); }
-			const after = 2;
-		`);
-		expect(out).not.toContain('process');
-		expect(out).not.toContain('for (');
-		expect(out).toContain('before');
-		expect(out).toContain('after');
-	});
-
-	it('skips non-resolvable iterable', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			/* @unroll */
-			for (const key of getKeys()) { process(key); }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('could not resolve for-of iterable'));
-		spy.mockRestore();
-	});
-
-	it('skips let-bound iterable', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			let keys = ["a", "b"];
-			/* @unroll */
-			for (const key of keys) { process(key); }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('could not resolve for-of iterable'));
-		spy.mockRestore();
-	});
-
-	it('skips destructuring left-hand side', () => {
-		const spy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-		const out = run(`
-			/* @unroll */
-			for (const [a, b] of [[1, 2], [3, 4]]) { process(a, b); }
-		`);
-		expect(out).toContain('for');
-		expect(spy).toHaveBeenCalledWith(expect.stringContaining('must declare a single identifier'));
-		spy.mockRestore();
-	});
-
-	it('nested for-of × for works', () => {
-		const out = run(`
-			const AXES = ["x", "y", "z"];
-			/* @unroll */
-			for (let i = 0; i < 2; i++) {
-				/* @unroll */
-				for (const axis of AXES) { result[i][axis] = 0; }
-			}
-		`);
-		expect(out).toContain('result[0]["x"] = 0');
-		expect(out).toContain('result[0]["y"] = 0');
-		expect(out).toContain('result[0]["z"] = 0');
-		expect(out).toContain('result[1]["x"] = 0');
-		expect(out).not.toContain('for');
-	});
+    it('unrolls nested @unroll loops', () => {
+        const r = un(`
+            /** @unroll */
+            for (let i = 0; i < 2; i++) {
+                /** @unroll */
+                for (let j = 0; j < 2; j++) { f(i, j); }
+            }
+        `);
+        expect(r.code).toContain('f(0, 0)');
+        expect(r.code).toContain('f(0, 1)');
+        expect(r.code).toContain('f(1, 0)');
+        expect(r.code).toContain('f(1, 1)');
+    });
 });

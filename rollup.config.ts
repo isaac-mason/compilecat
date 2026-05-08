@@ -32,9 +32,9 @@ export default entries.map((entry) => ({
 	output: [
 		{
 			file: `dist/${entry}.js`,
-			format: 'es',
+			format: 'es' as const,
 			sourcemap: true,
-			exports: 'named',
+			exports: 'named' as const,
 		},
 	],
 	plugins: [

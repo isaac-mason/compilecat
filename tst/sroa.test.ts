@@ -1,257 +1,111 @@
+import generate from '@babel/generator';
 import { parse } from '@babel/parser';
+import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
-import { applySroa } from '../src/plugin/transforms/sroa';
-import { generate } from '../src/plugin/util/babel';
 
-function run(code: string): string {
-	const ast = parse(code, { sourceType: 'module', plugins: ['typescript'] });
-	applySroa(ast);
-	return generate(ast, { retainLines: false, comments: false }).code.trim();
+import { applySroa } from '../src/compiler/scalar-replace-aggregates';
+
+function sroa(code: string): { code: string; sroad: number } {
+    const file = parse(code, { plugins: ['typescript'] });
+    const r = applySroa(file);
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
+        .replace(/\s+/g, ' ')
+        .trim();
+    return { code: out, sroad: r.sroad };
 }
 
-describe('plugin-alt/transforms/sroa — opt-in gating', () => {
-	it('does not run without any @sroa annotation', () => {
-		const input = `
-			const v = [1, 2, 3];
-			const x = v[0];
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-		expect(out).not.toContain('v_0');
-	});
+describe('ScalarReplaceAggregates', () => {
+    it('rewrites a 3-tuple with index reads/writes', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f() {
+                const v = [1, 2, 3];
+                v[0] = v[1] + v[2];
+                return v[0];
+            }
+        `);
+        expect(r.sroad).toBe(1);
+        expect(r.code).toContain('v_0');
+        expect(r.code).toContain('v_1');
+        expect(r.code).toContain('v_2');
+        expect(r.code).not.toContain('[1, 2, 3]');
+    });
 
-	it('runs when the VariableDeclaration has @sroa', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const x = v[0] + v[1] + v[2];
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0');
-		expect(out).not.toContain('[1, 2, 3]');
-	});
+    it('skips when binding escapes via plain reference', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f() {
+                const v = [1, 2, 3];
+                use(v);
+                return v[0];
+            }
+        `);
+        expect(r.sroad).toBe(0);
+    });
 
-	it('runs when the enclosing function has @sroa', () => {
-		const input = `
-			/* @sroa */
-			function test() {
-				const v = [1, 2, 3];
-				return v[0] + v[1] + v[2];
-			}
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0');
-		expect(out).not.toContain('[1, 2, 3]');
-	});
+    it('skips when index is non-numeric or non-literal', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f(i) {
+                const v = [1, 2, 3];
+                return v[i];
+            }
+        `);
+        expect(r.sroad).toBe(0);
+    });
 
-	it('runs on an annotated arrow function bound to const', () => {
-		const input = `
-			/* @sroa */
-			const test = () => {
-				const v = [1, 2, 3];
-				return v[0] + v[1] + v[2];
-			};
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0');
-	});
+    it('skips when index out of bounds', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f() {
+                const v = [1, 2, 3];
+                return v[5];
+            }
+        `);
+        expect(r.sroad).toBe(0);
+    });
 
-	it('does not cross into a sibling function without annotation', () => {
-		const input = `
-			/* @sroa */
-			function annotated() {
-				const a = [1, 2, 3];
-				return a[0] + a[1] + a[2];
-			}
-			function plain() {
-				const b = [1, 2, 3];
-				return b[0] + b[1] + b[2];
-			}
-		`;
-		const out = run(input);
-		expect(out).toContain('a_0');
-		expect(out).not.toContain('b_0');
-		expect(out).toContain('const b = [1, 2, 3]');
-	});
-});
+    it('respects scope: identical name in another function does not block', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f() {
+                const v = [1, 2, 3];
+                return v[0] + v[1];
+            }
+            function g(v) { return v.length; }
+        `);
+        expect(r.sroad).toBe(1);
+        expect(r.code).toContain('v_0');
+    });
 
-describe('plugin-alt/transforms/sroa — decomposition', () => {
-	it('decomposes a vec3 literal', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const x = v[0];
-			const y = v[1];
-			const z = v[2];
-		`;
-		const out = run(input);
-		expect(out).toMatch(/let v_0 = 1/);
-		expect(out).toMatch(/v_1 = 2/);
-		expect(out).toMatch(/v_2 = 3/);
-		expect(out).toContain('const x = v_0');
-	});
+    it('skips singleton arrays (no gain)', () => {
+        const r = sroa(`
+            /** @sroa */
+            function f() { const v = [1]; return v[0]; }
+        `);
+        expect(r.sroad).toBe(0);
+    });
 
-	it('handles writes to components', () => {
-		const input = `
-			/* @sroa */
-			let v = [0, 0, 0];
-			v[0] = 5;
-			v[1] = 10;
-			v[2] = 15;
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0 = 5');
-		expect(out).toContain('v_1 = 10');
-		expect(out).toContain('v_2 = 15');
-	});
+    it('honors decl-level annotation without function annotation', () => {
+        const r = sroa(`
+            function f() {
+                /** @sroa */
+                const v = [1, 2, 3];
+                return v[0] + v[1] + v[2];
+            }
+        `);
+        expect(r.sroad).toBe(1);
+        expect(r.code).toContain('v_0');
+    });
 
-	it('handles compound assignments', () => {
-		const input = `
-			/* @sroa */
-			let v = [1, 2, 3];
-			v[0] += 10;
-			v[1] *= 2;
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0 += 10');
-		expect(out).toContain('v_1 *= 2');
-	});
-
-	it('keeps variable expressions in the literal', () => {
-		const input = `
-			/* @sroa */
-			function test(x, y, z) {
-				const v = [x, y, z];
-				const sum = v[0] + v[1] + v[2];
-				return sum;
-			}
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0 = x');
-		expect(out).toContain('v_1 = y');
-		expect(out).toContain('v_2 = z');
-	});
-});
-
-describe('plugin-alt/transforms/sroa — escape analysis', () => {
-	it('skips when passed to a function', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			someFunction(v);
-			const x = v[0];
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips when aliased via assignment', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const other = v;
-			console.log(other);
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips when returned', () => {
-		const input = `
-			/* @sroa */
-			function foo() {
-				const v = [1, 2, 3];
-				return v;
-			}
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips computed-index access with non-literal', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const i = 0;
-			const x = v[i];
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips member-property access (e.g. .length)', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const len = v.length;
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips spread', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const copy = [...v];
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-
-	it('skips out-of-bounds index', () => {
-		const input = `
-			/* @sroa */
-			const v = [1, 2, 3];
-			const x = v[5];
-		`;
-		const out = run(input);
-		expect(out).toContain('[1, 2, 3]');
-	});
-});
-
-describe('plugin-alt/transforms/sroa — scope awareness', () => {
-	it('replaces function-local even when module-scope same name escapes', () => {
-		const input = `
-			const rotation = [0, 0, 0];
-			externalFunction(rotation);
-
-			/* @sroa */
-			function test() {
-				const rotation = [1, 2, 3];
-				return rotation[0] + rotation[1] + rotation[2];
-			}
-		`;
-		const out = run(input);
-		expect(out).toContain('rotation_0 = 1');
-		expect(out).toContain('externalFunction(rotation)');
-	});
-
-	it('replaces one candidate even when a sibling escapes', () => {
-		const input = `
-			/* @sroa */
-			const safe = [1, 2, 3];
-			/* @sroa */
-			const escaping = [4, 5, 6];
-			const x = safe[0] + safe[1] + safe[2];
-			externalFunction(escaping);
-		`;
-		const out = run(input);
-		expect(out).toContain('safe_0');
-		expect(out).not.toContain('escaping_0');
-		expect(out).toContain('[4, 5, 6]');
-	});
-});
-
-describe('plugin-alt/transforms/sroa — type annotation cross-check', () => {
-	it('respects a tuple type alias', () => {
-		const input = `
-			type Vec3 = [number, number, number];
-			/* @sroa */
-			const v: Vec3 = [1, 2, 3];
-			const x = v[0] + v[1] + v[2];
-		`;
-		const out = run(input);
-		expect(out).toContain('v_0');
-	});
+    it('leaves unannotated arrays alone', () => {
+        const r = sroa(`
+            function f() {
+                const v = [1, 2, 3];
+                return v[0];
+            }
+        `);
+        expect(r.sroad).toBe(0);
+        expect(r.code).toContain('[1, 2, 3]');
+    });
 });

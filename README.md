@@ -146,10 +146,21 @@ function step(out: Vec3, v: Vec3, dt: number) {
 Each matched file runs through:
 
 ```
-parse → inline → simplify (constfold + copyprop + dce) → unroll → sroa → simplify → regenerate
+parse
+  → inline (function inlining, DIRECT + BLOCK)
+  → unroll
+  → sroa
+  → simplify (fixpoint: peephole-fold-constants, peephole-remove-dead-code,
+              flow-sensitive-inline-variables, dead-assignments-elimination,
+              peephole-minimize-conditions)
+  → inline-variables
+  → remove-unused-code
+  → regenerate
 ```
 
-The simplifier is a fixpoint and runs twice — once after inlining, once after unroll + SROA — to clean up the constants and scalars each pass exposes.
+Optimization passes under `src/compiler/` are functional ports of the
+corresponding `jscomp/*.java` files from Google Closure Compiler. See
+[`NOTICE`](./NOTICE).
 
 ## Plugin options
 
@@ -157,7 +168,7 @@ The simplifier is a fixpoint and runs twice — once after inlining, once after 
 compilecat({
     debug?: boolean,          // log each transformed file. default false
     crossFile?: boolean,      // resolve @inline across relative imports. default true
-    libraryInline?: boolean,  // permit callsite-annotated inlines from node_modules. default true
+    libraryInline?: boolean,  // permit callsite-annotated inlines from node_modules. default false
     fileReader?: FileReader,  // override cross-file reader (default: node:fs)
 })
 ```
@@ -165,17 +176,25 @@ compilecat({
 ## Programmatic API
 
 ```ts
-import { transform, createFileCache } from 'compilecat';
+import { transform } from 'compilecat';
 
-const fileCache = createFileCache();
-
-const { code, map } = transform(source, absolutePath, {
+const { code, map, stats } = transform(source, {
+    filename: absolutePath,
     sourceMaps: true,
-    fileCache,
     allowLibraryInline: true,
 });
 ```
 
+For multi-file builds where cross-file `@inline` resolution is needed, share
+a `FileCache` across calls (re-exported from the package as `createFileCache`).
+
 ## Acknowledgements
 
 Heavily inspired by [unplugin-inline-functions](https://github.com/krispya/unplugin-inline-functions).
+
+## Attribution
+
+The optimization passes under `src/compiler/` are ports of corresponding files
+from the [Google Closure Compiler](https://github.com/google/closure-compiler),
+licensed under the Apache License, Version 2.0. See [`NOTICE`](./NOTICE) for
+required attribution. Compilecat itself is MIT-licensed (see [`LICENSE`](./LICENSE)).
