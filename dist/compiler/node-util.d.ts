@@ -114,5 +114,23 @@ export declare function precedence(node: t.Node): number;
 export declare function areNodesEqual(a: t.Node, b: t.Node): boolean;
 /** Read `parent[key]` without losing exhaustiveness on the concrete type. */
 export declare function getSlot(parent: t.Node, key: string): t.Node | (t.Node | null)[] | null | undefined;
+/**
+ * Strip TypeScript-only AST nodes from a tree, in place. The inliner clones a
+ * callee body and splices it into the consumer; if the callee was TS, the
+ * cloned body carries `: T` annotations on local declarations, `expr as T`
+ * wrappers, etc. Those have no business showing up in the consumer's scope
+ * — the consumer authored bare JS-shaped calls, not a typed re-declaration —
+ * and downstream TS transforms sometimes fail to strip them when they appear
+ * inside an inlined-block label (depends on context). Conservatively clear
+ * everything TS-only here so the inlined block is shaped like JS regardless
+ * of the donor file.
+ *
+ * Scope: annotation slots on identifiers / params / declarators / functions,
+ * and the three type-assertion expression wrappers (`as`, `<T>x`, `x!`).
+ * Doesn't touch TS-only top-level decls (type aliases, interfaces, enums) —
+ * those don't appear inside an inlined function body in practice and are
+ * stripped by the downstream TS transform on the consumer's authored shape.
+ */
+export declare function stripTypeScriptOnly(node: t.Node): void;
 /** Write `parent[key]` (or `parent[key][index]` if `index` provided). */
 export declare function setSlot(parent: t.Node, key: string, index: number | undefined, value: t.Node | null): void;

@@ -35,7 +35,7 @@ import * as t from '@babel/types';
 import { mayHaveSideEffects } from './ast-analyzer';
 import { generate } from './babel-interop';
 import { mutateForBlockInline } from './function-to-block-mutator';
-import { getSlot, setSlot } from './node-util';
+import { getSlot, setSlot, stripTypeScriptOnly } from './node-util';
 
 export type InliningMode = 'DIRECT' | 'BLOCK' | 'NO';
 
@@ -156,6 +156,9 @@ export function inlineDirect(
     } else {
         valueExpr = t.cloneNode(fn.body as t.Expression, true);
     }
+    // Strip TS-only annotations from the value expression — same reasoning as
+    // the BLOCK path: don't carry donor-side type markers into the consumer.
+    stripTypeScriptOnly(valueExpr);
 
     // Build name → expression substitution map.
     const subs = new Map<string, t.Expression>();
@@ -276,8 +279,11 @@ export function inlineBlock(
         ? `_compilecat_inline_label_${id}`
         : `_compilecat_inline_label_${cn}_${id}`;
 
-    // Clone body and args.
+    // Clone body and args. Strip TS-only annotations from the cloned body so
+    // the inlined block doesn't carry `: T` markers from the (TS) donor into
+    // the consumer's authored shape. See `stripTypeScriptOnly` for rationale.
     const clonedBody = t.cloneNode(fn.body, true);
+    stripTypeScriptOnly(clonedBody);
     const clonedArgs: t.Expression[] = [];
     for (let i = 0; i < callee.paramNames.length; i++) {
         const a = args[i];

@@ -757,6 +757,86 @@ function areNodesEqual(a, b) {
 function getSlot(parent, key) {
     return parent[key];
 }
+/**
+ * Strip TypeScript-only AST nodes from a tree, in place. The inliner clones a
+ * callee body and splices it into the consumer; if the callee was TS, the
+ * cloned body carries `: T` annotations on local declarations, `expr as T`
+ * wrappers, etc. Those have no business showing up in the consumer's scope
+ * — the consumer authored bare JS-shaped calls, not a typed re-declaration —
+ * and downstream TS transforms sometimes fail to strip them when they appear
+ * inside an inlined-block label (depends on context). Conservatively clear
+ * everything TS-only here so the inlined block is shaped like JS regardless
+ * of the donor file.
+ *
+ * Scope: annotation slots on identifiers / params / declarators / functions,
+ * and the three type-assertion expression wrappers (`as`, `<T>x`, `x!`).
+ * Doesn't touch TS-only top-level decls (type aliases, interfaces, enums) —
+ * those don't appear inside an inlined function body in practice and are
+ * stripped by the downstream TS transform on the consumer's authored shape.
+ */
+function stripTypeScriptOnly(node) {
+    const visit = (n) => {
+        if (n === null || n === undefined)
+            return;
+        if (typeof n.type !== 'string')
+            return;
+        // Unwrap type-assertion expression wrappers by replacing the slot
+        // that holds them with the inner expression. We can't replace `n`
+        // in-place from this scope, so the caller handles wrappers via the
+        // parent-slot walk below — this is the leaf case for everything
+        // else.
+        const slot = n;
+        // Identifiers, RestElements, AssignmentPatterns, ObjectPatterns,
+        // ArrayPatterns all carry `typeAnnotation`. Same key for params
+        // and declarator ids. Clearing is safe even if absent.
+        if ('typeAnnotation' in slot)
+            slot.typeAnnotation = null;
+        // Function-like nodes carry `returnType` + `typeParameters`.
+        if ('returnType' in slot)
+            slot.returnType = null;
+        if ('typeParameters' in slot)
+            slot.typeParameters = null;
+        // `decorators` carries type info on parameter decorators — rare in
+        // function bodies, leave as-is to avoid stripping user runtime
+        // decorators.
+        // Walk children, replacing type-assertion expression wrappers as we
+        // descend so the parent's slot ends up pointing at the inner expr.
+        for (const key of Object.keys(slot)) {
+            const v = slot[key];
+            if (Array.isArray(v)) {
+                for (let i = 0; i < v.length; i++) {
+                    const child = v[i];
+                    if (child !== null && child !== undefined && typeof child.type === 'string') {
+                        const unwrapped = unwrapTypeAssertion(child);
+                        if (unwrapped !== child)
+                            v[i] = unwrapped;
+                        visit(v[i]);
+                    }
+                }
+            }
+            else if (v !== null && v !== undefined && typeof v.type === 'string') {
+                const unwrapped = unwrapTypeAssertion(v);
+                if (unwrapped !== v)
+                    slot[key] = unwrapped;
+                visit(slot[key]);
+            }
+        }
+    };
+    visit(node);
+}
+function unwrapTypeAssertion(n) {
+    // `expr as T`, `<T>expr`, `expr!` — all three preserve runtime semantics
+    // and the wrapper is purely a type-system marker, so unwrap to the inner.
+    let cur = n;
+    while (t.isTSAsExpression(cur) ||
+        t.isTSTypeAssertion(cur) ||
+        t.isTSNonNullExpression(cur) ||
+        t.isTSSatisfiesExpression(cur) ||
+        t.isTSInstantiationExpression(cur)) {
+        cur = cur.expression;
+    }
+    return cur;
+}
 /** Write `parent[key]` (or `parent[key][index]` if `index` provided). */
 function setSlot(parent, key, index, value) {
     const obj = parent;
@@ -1576,6 +1656,9 @@ function inlineDirect(callee, site) {
     else {
         valueExpr = t.cloneNode(fn.body, true);
     }
+    // Strip TS-only annotations from the value expression — same reasoning as
+    // the BLOCK path: don't carry donor-side type markers into the consumer.
+    stripTypeScriptOnly(valueExpr);
     // Build name → expression substitution map.
     const subs = new Map();
     for (let i = 0; i < callee.paramNames.length; i++) {
@@ -1659,8 +1742,11 @@ function inlineBlock(callee, site, options) {
     const label = cn === null
         ? `_compilecat_inline_label_${id}`
         : `_compilecat_inline_label_${cn}_${id}`;
-    // Clone body and args.
+    // Clone body and args. Strip TS-only annotations from the cloned body so
+    // the inlined block doesn't carry `: T` markers from the (TS) donor into
+    // the consumer's authored shape. See `stripTypeScriptOnly` for rationale.
     const clonedBody = t.cloneNode(fn.body, true);
+    stripTypeScriptOnly(clonedBody);
     const clonedArgs = [];
     for (let i = 0; i < callee.paramNames.length; i++) {
         const a = args[i];
@@ -3437,6 +3523,21 @@ function makeDeclaredNamesUnique(file) {
                 // scope itself, but be defensive.
                 if (binding.scope !== path.scope)
                     continue;
+                // Skip function parameters. Closure's ContextualRenamer exists
+                // to make hoist-friendly names for later block-flatten / let→
+                // var lowering — those passes never cross function boundaries,
+                // so the param contract is already isolated. Renaming params
+                // here pollutes the output with `__N` suffixes on names the
+                // user authored, and (more importantly) belongs to the
+                // inliner's `InlineRenamer`-equivalent — which renames a
+                // callee's params at the call site as part of inlining, not
+                // here.
+                if (binding.kind === 'param') {
+                    // Reserve the param's name so synthetic `name__N` later
+                    // can't shadow it accidentally.
+                    reserveName(nameUsage, baseName);
+                    continue;
+                }
                 const newName = pickReplacement(nameUsage, baseName);
                 if (newName === null) {
                     // First occurrence anywhere — keep the name, just count it.

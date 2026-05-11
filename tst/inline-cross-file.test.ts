@@ -157,6 +157,42 @@ describe('InlineFunctions — cross-file', () => {
         expect(out).not.toMatch(/\bmat4\.create\b/);
     });
 
+    // Regression for the crashcat build break: a `@inline` callee whose body
+    // declares a typed local (`let jv: number;`) was being copied verbatim
+    // into the consumer with the TS type annotation intact. The downstream
+    // TypeScript transform sometimes failed to strip the leaked annotation
+    // (depending on context), causing acorn to choke on `let jv: number;`.
+    // The contract this test pins: when a TS callee is inlined, its local
+    // declarations must come out shaped like JS (no `: T` annotation) so the
+    // consumer never has to discover them. Annotations on the callee's
+    // *original* declaration (which still exists when the call isn't a
+    // single-use stripped declaration) are out of scope here.
+    it('does not leak TS type annotations from inlined callee body', () => {
+        const files = {
+            '/proj/util.ts': `
+                /* @inline */
+                export function compute(a: number, b: number): number {
+                    let jv: number;
+                    if (a > b) {
+                        jv = a - b;
+                    } else {
+                        jv = b - a;
+                    }
+                    return jv;
+                }
+            `,
+            '/proj/main.ts': `
+                import { compute } from './util';
+                export function run(x: number, y: number): number {
+                    return compute(x, y);
+                }
+            `,
+        };
+        const out = runProject(files, '/proj/main.ts');
+        // The inlined-into-run() copy of `let jv` must come out as bare JS.
+        expect(out).not.toMatch(/let\s+jv[\w$]*\s*:\s*number/);
+    });
+
     it('inlines a default-exported function via `import foo from "./donor"`', () => {
         const files = {
             '/proj/util.ts': `

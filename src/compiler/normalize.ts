@@ -118,6 +118,22 @@ export function makeDeclaredNamesUnique(file: t.File): NormalizeResult {
                 // scope itself, but be defensive.
                 if (binding.scope !== path.scope) continue;
 
+                // Skip function parameters. Closure's ContextualRenamer exists
+                // to make hoist-friendly names for later block-flatten / let→
+                // var lowering — those passes never cross function boundaries,
+                // so the param contract is already isolated. Renaming params
+                // here pollutes the output with `__N` suffixes on names the
+                // user authored, and (more importantly) belongs to the
+                // inliner's `InlineRenamer`-equivalent — which renames a
+                // callee's params at the call site as part of inlining, not
+                // here.
+                if (binding.kind === 'param') {
+                    // Reserve the param's name so synthetic `name__N` later
+                    // can't shadow it accidentally.
+                    reserveName(nameUsage, baseName);
+                    continue;
+                }
+
                 const newName = pickReplacement(nameUsage, baseName);
                 if (newName === null) {
                     // First occurrence anywhere — keep the name, just count it.

@@ -375,6 +375,85 @@ export function getSlot(parent: t.Node, key: string): t.Node | (t.Node | null)[]
     return (parent as unknown as SlotMap)[key];
 }
 
+/**
+ * Strip TypeScript-only AST nodes from a tree, in place. The inliner clones a
+ * callee body and splices it into the consumer; if the callee was TS, the
+ * cloned body carries `: T` annotations on local declarations, `expr as T`
+ * wrappers, etc. Those have no business showing up in the consumer's scope
+ * — the consumer authored bare JS-shaped calls, not a typed re-declaration —
+ * and downstream TS transforms sometimes fail to strip them when they appear
+ * inside an inlined-block label (depends on context). Conservatively clear
+ * everything TS-only here so the inlined block is shaped like JS regardless
+ * of the donor file.
+ *
+ * Scope: annotation slots on identifiers / params / declarators / functions,
+ * and the three type-assertion expression wrappers (`as`, `<T>x`, `x!`).
+ * Doesn't touch TS-only top-level decls (type aliases, interfaces, enums) —
+ * those don't appear inside an inlined function body in practice and are
+ * stripped by the downstream TS transform on the consumer's authored shape.
+ */
+export function stripTypeScriptOnly(node: t.Node): void {
+    const visit = (n: t.Node | null | undefined): void => {
+        if (n === null || n === undefined) return;
+        if (typeof (n as { type?: unknown }).type !== 'string') return;
+
+        // Unwrap type-assertion expression wrappers by replacing the slot
+        // that holds them with the inner expression. We can't replace `n`
+        // in-place from this scope, so the caller handles wrappers via the
+        // parent-slot walk below — this is the leaf case for everything
+        // else.
+        const slot = n as unknown as Record<string, unknown>;
+
+        // Identifiers, RestElements, AssignmentPatterns, ObjectPatterns,
+        // ArrayPatterns all carry `typeAnnotation`. Same key for params
+        // and declarator ids. Clearing is safe even if absent.
+        if ('typeAnnotation' in slot) slot.typeAnnotation = null;
+        // Function-like nodes carry `returnType` + `typeParameters`.
+        if ('returnType' in slot) slot.returnType = null;
+        if ('typeParameters' in slot) slot.typeParameters = null;
+        // `decorators` carries type info on parameter decorators — rare in
+        // function bodies, leave as-is to avoid stripping user runtime
+        // decorators.
+
+        // Walk children, replacing type-assertion expression wrappers as we
+        // descend so the parent's slot ends up pointing at the inner expr.
+        for (const key of Object.keys(slot)) {
+            const v = slot[key];
+            if (Array.isArray(v)) {
+                for (let i = 0; i < v.length; i++) {
+                    const child = v[i] as t.Node | null | undefined;
+                    if (child !== null && child !== undefined && typeof (child as { type?: unknown }).type === 'string') {
+                        const unwrapped = unwrapTypeAssertion(child as t.Node);
+                        if (unwrapped !== child) v[i] = unwrapped;
+                        visit(v[i] as t.Node);
+                    }
+                }
+            } else if (v !== null && v !== undefined && typeof (v as { type?: unknown }).type === 'string') {
+                const unwrapped = unwrapTypeAssertion(v as t.Node);
+                if (unwrapped !== v) slot[key] = unwrapped;
+                visit(slot[key] as t.Node);
+            }
+        }
+    };
+    visit(node);
+}
+
+function unwrapTypeAssertion(n: t.Node): t.Node {
+    // `expr as T`, `<T>expr`, `expr!` — all three preserve runtime semantics
+    // and the wrapper is purely a type-system marker, so unwrap to the inner.
+    let cur = n;
+    while (
+        t.isTSAsExpression(cur) ||
+        t.isTSTypeAssertion(cur) ||
+        t.isTSNonNullExpression(cur) ||
+        t.isTSSatisfiesExpression(cur) ||
+        t.isTSInstantiationExpression(cur)
+    ) {
+        cur = cur.expression;
+    }
+    return cur;
+}
+
 /** Write `parent[key]` (or `parent[key][index]` if `index` provided). */
 export function setSlot(
     parent: t.Node,
