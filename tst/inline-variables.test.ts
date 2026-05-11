@@ -29,9 +29,11 @@ describe('inlineVariables', () => {
         expect(stats.inlined).toBe(3);
     });
 
-    it('does not inline when reference count is greater than 1', () => {
-        const { out, stats } = run(`const x = 1; console.log(x); console.log(x);`);
-        expect(out).toContain('const x = 1');
+    it('does not inline multi-use of a non-immutable, non-alias init', () => {
+        // `obj.prop` is neither a primitive literal (no multi-use immutable
+        // inline) nor a bare identifier (no alias inline). Must stay put.
+        const { out, stats } = run(`const x = obj.prop; console.log(x); console.log(x);`);
+        expect(out).toContain('const x = obj.prop');
         expect(stats.inlined).toBe(0);
     });
 
@@ -185,6 +187,118 @@ describe('inlineVariables', () => {
         // After fixpoint a inlines into the test, then r inlines into use().
         expect(out).toContain("use(1 ? 'yes' : 'no')");
         expect(stats.inlined).toBe(2);
+    });
+
+    // ---- alias inlining (Closure InlineVariables VarIsAliasAnalysis path) ----
+
+    it('alias-inlines a multi-use let aliasing a well-defined local', () => {
+        // The post-inline shape we see in crashcat's contact-constraints loop.
+        // `linVelA__5` aliases `_linearVelocityA`, is never reassigned, and is
+        // used multiple times. The aliased local is also never reassigned and
+        // dominates all uses. → drop the alias, rewrite reads to the original.
+        const { out, stats } = run(`
+            function f(body) {
+              const _linearVelocityA = body.linearVelocity;
+              for (let i = 0; i < 3; i++) {
+                let linVelA__5 = _linearVelocityA;
+                linVelA__5[0] += 1;
+                linVelA__5[1] += 1;
+                linVelA__5[2] += 1;
+              }
+            }
+        `);
+        expect(out).not.toMatch(/let\s+linVelA__5\b/);
+        expect(out).toMatch(/_linearVelocityA\[0\]\s*\+=\s*1/);
+        expect(out).toMatch(/_linearVelocityA\[1\]\s*\+=\s*1/);
+        expect(out).toMatch(/_linearVelocityA\[2\]\s*\+=\s*1/);
+        expect(stats.inlined).toBeGreaterThanOrEqual(1);
+    });
+
+    it('alias-inlines a chain of aliases', () => {
+        // Mirrors compilecat's pipeline after inlining: param→alias→alias.
+        const { out, stats } = run(`
+            function f(originalA) {
+              const a = originalA;
+              const b = a;
+              use(b);
+              use(b);
+            }
+        `);
+        expect(out).not.toMatch(/\bconst\s+a\b/);
+        expect(out).not.toMatch(/\bconst\s+b\b/);
+        expect(out).toMatch(/use\(originalA\)/);
+        expect(stats.inlined).toBeGreaterThanOrEqual(2);
+    });
+
+    it('does not alias-inline when the aliased var is reassigned', () => {
+        const { out } = run(`
+            function f() {
+              let y = 1;
+              y = 2;
+              const x = y;
+              use(x);
+              use(x);
+            }
+        `);
+        expect(out).toContain('const x = y');
+    });
+
+    it('does not alias-inline when the alias itself is reassigned', () => {
+        const { out } = run(`
+            function f(y) {
+              let x = y;
+              x = 5;
+              use(x);
+              use(x);
+            }
+        `);
+        expect(out).toContain('let x = y');
+    });
+
+    it('does not alias-inline when the aliased binding is missing in a ref scope', () => {
+        // x is closure-captured into an inner function that shadows the
+        // aliased name. Closure handles this via scope chain; we must too.
+        const { out } = run(`
+            function f(y) {
+              const x = y;
+              function inner(y) { use(x); }
+              inner(1);
+              use(x);
+            }
+        `);
+        // The inner function shadows y, so replacing x→y in inner would be wrong.
+        // Either keep the const or be sure references resolve to the outer y.
+        // Conservative: keep the const.
+        expect(out).toContain('const x = y');
+    });
+
+    it('alias-inlines through an object-property RHS only if stable', () => {
+        // `body.linearVelocity` is a member read; if body is never reassigned
+        // it is stable and we can alias-inline. v1 limits alias targets to
+        // bare identifiers, so this should NOT inline — documenting current
+        // behavior. (A later phase may extend to stable getProps.)
+        const { out } = run(`
+            function f(body) {
+              const v = body.linearVelocity;
+              v[0] += 1;
+              v[1] += 1;
+            }
+        `);
+        expect(out).toContain('const v = body.linearVelocity');
+    });
+
+    // ---- multi-use immutable inlining (Closure isImmutableValue path) ----
+
+    it('inlines a multi-use const literal at function scope', () => {
+        const { out, stats } = run(`
+            function f() {
+              const K = 42;
+              return use(K) + use(K) + use(K);
+            }
+        `);
+        expect(out).not.toMatch(/\bconst K\b/);
+        expect(out).toMatch(/use\(42\).*use\(42\).*use\(42\)/s);
+        expect(stats.inlined).toBeGreaterThanOrEqual(1);
     });
 
 });

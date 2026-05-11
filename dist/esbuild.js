@@ -2809,29 +2809,36 @@ function visitWithParents(root, fn) {
     visit$1(root, fn);
 }
 
-// Port of jscomp/InlineVariables.java (subset).
+// Port of jscomp/InlineVariables.java.
 //
-// Closure's InlineVariables is a 1000+ LOC pass driving ReferenceCollector
-// to find variables safe to inline. We port the subset that complements
-// flow-sensitive-inline-variables.ts (which handles intra-function flow):
+// Closure's InlineVariables drives ReferenceCollector to find variables safe
+// to inline. We reuse Babel's scope analysis (binding.referencePaths +
+// binding.constantViolations) in place of porting ReferenceCollector, since
+// the rest of compilecat is already on Babel scope (e.g. flow-sensitive
+// inline). The three paths from InlineVariables.StandardVarExpert that we
+// implement:
 //
-//   - `const|let x = <pure>;` declared once, read exactly once → replace
-//     the read with the init and drop the declarator.
-//   - Works at any scope (module, function, block) — handy at module level
-//     where flow-sensitive bails by design.
+//   1. Single-use inline (Closure: `analyzeWithInitialValue` →
+//      `numReadRefs == 1` + `canInline`). `const x = <pure>; ... x ...`
+//      with one read → replace the read with init, drop declarator.
 //
-// What's intentionally out of scope for v1:
-//   - Alias inlining (`const a = b; ...a...` where `b` is impure but `a`
-//     is a clean alias). Closure has a dedicated `VarExpert` for this; we
-//     skip it because most aliases evaporate via flow-sensitive inline.
-//   - Multi-use inlining of literals. Useful but requires a cost model
-//     (size impact) — `peephole-fold-constants` already covers many cases.
-//   - CONSTANTS_ONLY / LOCALS_ONLY / ALL mode toggles. We always operate
-//     in the equivalent of LOCALS_ONLY+module behavior.
+//   2. Multi-use immutable inline (Closure: `isWellDefined` +
+//      `initialValueAnalysis.isImmutableValue()`). `const K = 42;` used N
+//      times → clone the literal into each read site, drop declarator.
 //
-// We rely on Babel's scope analysis — `path.scope.getBinding(name)` —
-// instead of porting `ReferenceCollector`. Iterates to fixpoint because
-// inlining one variable can make another's reference count drop to 1.
+//   3. Alias inline (Closure: `VarIsAliasAnalysis` + `reanalyzeAfterAliasedVar`).
+//      `let x = y` where `y` is a bare identifier that is well-defined +
+//      assigned-once, and `x` is well-defined + assigned-once → replace
+//      reads of `x` with the identifier `y`, drop declarator.
+//      This is the post-inline-cleanup path: FunctionArgumentInjector
+//      produces `let param = argName` aliases when arguments aren't
+//      substituted directly; this pass collapses them.
+//
+// Mode is the equivalent of Closure's LOCALS_ONLY+module — we never inline
+// exported bindings, but we don't have a "constants only" toggle.
+//
+// Iterates to fixpoint: inlining one binding can make another's reference
+// count drop to 1, or unblock an alias chain (a → b → literal).
 function inlineVariables(ast) {
     let total = 0;
     while (true) {
@@ -2864,45 +2871,190 @@ function sweep$1(ast) {
             // Treat `let` as inlineable only if it's never reassigned.
             if (binding.constantViolations.length > 0)
                 return;
-            if (binding.references !== 1)
-                return;
             // Don't strip exported declarations.
             if (path.parentPath?.parent && t.isExportDeclaration(path.parentPath.parent))
                 return;
-            // Init must be pure — we're moving it to a new evaluation point.
-            if (mayHaveSideEffects(init))
+            const refCount = binding.references;
+            // Path 1: single-use inline (Closure analyzeWithInitialValue, numReadRefs==1).
+            if (refCount === 1) {
+                if (trySingleUseInline(path, init, binding))
+                    inlined++;
                 return;
-            // Free identifiers in init must reference bindings that are
-            // never written. Otherwise relocating the read may observe a
-            // different value.
-            const initPath = path.get('init');
-            if (!initPath.node)
-                return;
-            if (initFreeVarsAreUnstable(initPath, path.scope))
-                return;
-            const refPath = binding.referencePaths[0];
-            if (!refPath)
-                return;
-            // Don't inline across async/generator/yield boundaries — a
-            // suspended frame may observe a different world at resume.
-            if (crossesAsyncBoundary(path, refPath))
-                return;
-            // Don't inline into a loop body when the def sits outside it —
-            // would re-evaluate `init` once per iteration. Exception: a
-            // primitive literal is free to re-evaluate, so allow it.
-            if (!isPrimitiveLiteral(init) && useIsInsideLoopOutOfDef(path, refPath))
-                return;
-            // Don't inline a var hoisted from a conditional — the def may
-            // not have executed before the use.
-            if (defIsConditional(path, refPath))
-                return;
-            // Replace the read with a clone of init, then drop the declarator.
-            refPath.replaceWith(t.cloneNode(init, /* deep */ true, /* withoutLoc */ false));
-            path.remove();
-            inlined++;
+            }
+            // Path 2: multi-use immutable inline (Closure: well-defined + isImmutableValue).
+            // Path 3: alias inline (Closure: VarIsAliasAnalysis → safe alias rewrite).
+            if (refCount > 1) {
+                if (tryMultiUseImmutableInline(path, init, binding)) {
+                    inlined++;
+                    return;
+                }
+                if (tryAliasInline(path, init, binding)) {
+                    inlined++;
+                    return;
+                }
+            }
         },
     });
     return inlined;
+}
+// Path 1: single-use inline. `const x = pure; ...x...` (exactly one read)
+// → replace the read with init, drop declarator.
+function trySingleUseInline(path, init, binding) {
+    // Init must be pure — we're moving it to a new evaluation point.
+    if (mayHaveSideEffects(init))
+        return false;
+    const initPath = path.get('init');
+    if (!initPath.node)
+        return false;
+    if (initFreeVarsAreUnstable(initPath, path.scope))
+        return false;
+    const refPath = binding.referencePaths[0];
+    if (!refPath)
+        return false;
+    if (crossesAsyncBoundary(path, refPath))
+        return false;
+    if (!isPrimitiveLiteral(init) && useIsInsideLoopOutOfDef(path, refPath))
+        return false;
+    if (defIsConditional(path, refPath))
+        return false;
+    refPath.replaceWith(t.cloneNode(init, /* deep */ true, /* withoutLoc */ false));
+    path.remove();
+    return true;
+}
+// Path 2: multi-use immutable inline. `const K = 42; ...K...K...` → clone
+// the literal into each read site, drop declarator. Closure: this is the
+// `isImmutableValue` branch of `analyzeWithInitialValue`. Restricted to
+// primitive literals: re-evaluation is free (no allocation), the value is
+// its own identity, no scope sensitivity.
+function tryMultiUseImmutableInline(path, init, binding) {
+    if (!isPrimitiveLiteral(init))
+        return false;
+    // All reference paths must be plain reads (not lvalues, not declarations).
+    for (const ref of binding.referencePaths) {
+        if (!isPlainRead(ref))
+            return false;
+        if (crossesAsyncBoundary(path, ref))
+            return false;
+        if (defIsConditional(path, ref))
+            return false;
+    }
+    for (const ref of binding.referencePaths) {
+        ref.replaceWith(t.cloneNode(init, /* deep */ true, /* withoutLoc */ false));
+    }
+    path.remove();
+    return true;
+}
+// Path 3: alias inline. `let x = y; ...x...x...` where `y` is a bare
+// identifier whose binding is well-defined and assigned exactly once, and
+// `x` itself is never reassigned → rewrite all reads of `x` to `y`, drop
+// the declarator. Closure: VarIsAliasAnalysis + reanalyzeAfterAliasedVar
+// success path.
+//
+// The contact-constraints post-inline shape — `let linVelA__5 = _linearVelocityA;`
+// with N reads — is exactly this.
+function tryAliasInline(path, init, binding) {
+    // Aliased value must be a bare identifier.
+    if (!t.isIdentifier(init))
+        return false;
+    const aliasedName = init.name;
+    // Self-alias guard (Closure: `aliasedName.equals(v.getName()) ? null : ...`).
+    if (t.isIdentifier(path.node.id) && path.node.id.name === aliasedName)
+        return false;
+    // Resolve aliased binding in x's enclosing scope.
+    const aliasedBinding = path.scope.getBinding(aliasedName);
+    if (!aliasedBinding)
+        return false;
+    // Aliased var must be well-defined + assigned-once. Bindings that are
+    // never reassigned and whose declaration cannot be re-entered fit:
+    //   - const / let / var with init, no constantViolations
+    //   - function declaration (always hoisted+init'd)
+    //   - class declaration
+    //   - import binding
+    //   - parameter (assigned at call, no body reassignment)
+    if (!isWellDefinedAssignedOnce(aliasedBinding))
+        return false;
+    // Async-boundary check vs the alias decl, identifier crossing rule.
+    for (const ref of binding.referencePaths) {
+        if (!isPlainRead(ref))
+            return false;
+        if (crossesAsyncBoundary(path, ref))
+            return false;
+        // At each ref site, the aliased name must resolve to the SAME binding.
+        // If a nested function shadows `aliasedName`, rewriting would capture
+        // the shadow instead.
+        const refScopeBinding = ref.scope.getBinding(aliasedName);
+        if (refScopeBinding !== aliasedBinding)
+            return false;
+        // The alias decl itself must be reachable from the ref site without
+        // crossing a conditional that doesn't enclose the ref. Closure's
+        // BasicBlock check via initBlock.provablyExecutesBefore. We approximate
+        // with the existing defIsConditional helper.
+        if (defIsConditional(path, ref))
+            return false;
+    }
+    // Rewrite all reads.
+    for (const ref of binding.referencePaths) {
+        ref.replaceWith(t.identifier(aliasedName));
+    }
+    path.remove();
+    return true;
+}
+// True if a binding is "well-defined and assigned exactly once" (Closure:
+// isWellDefinedAssignedOnce). Approximation on top of Babel scope:
+//   - Param: yes, params are inited at call entry, no further writes count
+//     unless constantViolations records body assignments.
+//   - Function/class declaration: yes, hoisted+init'd at scope entry.
+//   - Import binding: yes, read-only at module load.
+//   - const/let/var: yes only if init is present at the decl AND no
+//     constantViolations.
+function isWellDefinedAssignedOnce(binding) {
+    if (binding.constantViolations.length > 0)
+        return false;
+    const kind = binding.kind;
+    if (kind === 'param')
+        return true;
+    if (kind === 'hoisted')
+        return true; // function declaration
+    if (kind === 'local' || kind === 'const' || kind === 'let' || kind === 'var') {
+        // Babel's `BindingPath.node` is the VariableDeclarator (or similar).
+        // Require it to have an init.
+        const decl = binding.path.node;
+        if (t.isVariableDeclarator(decl)) {
+            return decl.init !== null && decl.init !== undefined;
+        }
+        // class/function declarations also fall here in some shapes.
+        if (t.isFunctionDeclaration(decl) || t.isClassDeclaration(decl))
+            return true;
+        return false;
+    }
+    if (kind === 'module')
+        return true; // import
+    return false;
+}
+// A reference is a "plain read" if it's neither a declaration nor an
+// lvalue. Mirrors Closure's `isValidReference`.
+function isPlainRead(refPath) {
+    if (!t.isIdentifier(refPath.node))
+        return false;
+    const parent = refPath.parent;
+    if (!parent)
+        return false;
+    // declaration id position
+    if (t.isVariableDeclarator(parent) && parent.id === refPath.node)
+        return false;
+    // assignment LHS
+    if (t.isAssignmentExpression(parent) && parent.left === refPath.node)
+        return false;
+    // update expression target (++/--)
+    if (t.isUpdateExpression(parent))
+        return false;
+    // function/class declaration name
+    if ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent) || t.isClassDeclaration(parent) || t.isClassExpression(parent)) && parent.id === refPath.node)
+        return false;
+    // parameter binding
+    if (t.isFunction(parent) && Array.isArray(parent.params) && parent.params.includes(refPath.node))
+        return false;
+    return true;
 }
 // True if init reads any identifier that may change between def site and
 // use site. Property keys, member-access names, label names, etc. are
