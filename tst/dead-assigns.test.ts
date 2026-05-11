@@ -1,25 +1,35 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
+import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
+import { traverse } from '../src/compiler/babel-interop';
 import { buildControlFlowGraph } from '../src/compiler/control-flow-analysis';
 import { eliminateDeadAssignments } from '../src/compiler/dead-assignments-elimination';
 import { runLiveVariablesAnalysis } from '../src/compiler/live-variables-analysis';
 import { buildLocalVariableTable } from '../src/compiler/local-variable-table';
 
-function parseFn(code: string): t.FunctionDeclaration {
+function parseFn(code: string): { fn: t.FunctionDeclaration; path: NodePath<t.Function> } {
     const file = parse(code, { plugins: ['typescript'] });
     const stmt = file.program.body[0];
     if (!t.isFunctionDeclaration(stmt)) throw new Error('expected function declaration');
-    return stmt;
+    let path: NodePath<t.Function> | null = null;
+    traverse(file, {
+        FunctionDeclaration(p) {
+            if (path === null) path = p;
+            p.skip();
+        },
+    });
+    if (path === null) throw new Error('no function path');
+    return { fn: stmt, path };
 }
 
 function runDae(code: string): { code: string; removed: number; ran: boolean } {
-    const fn = parseFn(code);
+    const { fn, path } = parseFn(code);
     const cfg = buildControlFlowGraph({ root: fn.body });
     if (cfg === null) return { code: gen(fn), removed: 0, ran: false };
-    const table = buildLocalVariableTable(fn);
+    const table = buildLocalVariableTable(path);
     const live = runLiveVariablesAnalysis(cfg, table);
     const r = eliminateDeadAssignments(fn, cfg, live);
     return { code: gen(fn), removed: r.removed, ran: r.ran };
@@ -106,6 +116,20 @@ describe('DeadAssignmentsElimination', () => {
         // produced by `x++` is read.
         const r = runDae('function f() { var x = 0; use(x++); return 5; }');
         expect(r.code).toMatch(/x\+\+/);
+    });
+
+    it('does not delete an outer init when an inner block shadows the same name', () => {
+        // Regression: name-keyed analysis would conflate the outer `let x = a()`
+        // with the inner block-scoped `let x`, see the inner `x = c` as a
+        // killing redefinition, and (incorrectly) delete the outer init.
+        // Binding-keyed analysis treats them as distinct slots, so the outer
+        // `x` stays alive into `use(x)`.
+        const r = runDae(
+            'function f() { let x = a(); { let x = b(); x = c(); use(x); } use(x); }',
+        );
+        expect(r.code).toContain('a()');
+        expect(r.code).toContain('b()');
+        expect(r.code).toContain('c()');
     });
 
     it('drops the dead lhs of an assignment chain', () => {

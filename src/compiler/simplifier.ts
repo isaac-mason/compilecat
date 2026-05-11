@@ -7,15 +7,29 @@
 // AST mutates. This is wasteful in the limit but matches Closure's per-pass
 // invalidation model and keeps invariants clean. CFG construction bails on
 // try/with/generator/async — those functions short-circuit immediately.
+//
+// Deliberate deviation from Closure: we do NOT run OptimizeLetAndConstPeephole
+// here. Closure lowers function-body-top `let`/`const` to `var` as a late
+// keyword-homogenization step (better gzip on its standalone output). For
+// compilecat the output feeds a downstream bundler/minifier (Vite, Rollup,
+// esbuild) which performs the same lowering if it actually wants it, so doing
+// it here is a no-op for shipped bytes. Meanwhile it degrades the readability
+// of the intermediate compilecat output (which is what users debug), reintroduces
+// TDZ-less semantics on locals, and *amplifies* normalize's `__N` suffix
+// proliferation by hoisting block-scoped decls into the function scope where
+// they collide. We keep `let`/`const` as-authored.
 
+import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 
+import { traverse } from './babel-interop';
 import { buildControlFlowGraph } from './control-flow-analysis';
 import { eliminateDeadAssignments } from './dead-assignments-elimination';
 import { runFlowSensitiveInlineVariables } from './flow-sensitive-inline-variables';
 import { runLiveVariablesAnalysis } from './live-variables-analysis';
 import { buildLocalVariableTable } from './local-variable-table';
-import { getSlot } from './node-util';
+import { runMinimizeExitPoints } from './minimize-exit-points';
+import { isFileNormalized } from './normalize';
 import { runPeepholeFoldConstants } from './peephole-fold-constants';
 import { runPeepholeMinimizeConditions } from './peephole-minimize-conditions';
 import { runPeepholeRemoveDeadCode } from './peephole-remove-dead-code';
@@ -31,11 +45,21 @@ export type SimplifyStats = {
 
 const MAX_ITERATIONS = 16;
 
+export type SimplifyOptions = {
+    /** Mirrors Closure's `isASTNormalized()` flag. Threaded into the
+     *  PeepholeRemoveDeadCode block-merge step. Set when the caller has run
+     *  `makeDeclaredNamesUnique` on the file. */
+    normalized?: boolean;
+};
+
 /**
  * Simplify a single function in place. Caller is responsible for picking
  * which functions to simplify (zone gating happens in the pipeline layer).
  */
-export function simplifyFunction(fn: t.Function): SimplifyStats {
+export function simplifyFunction(
+    fnPath: NodePath<t.Function>,
+    options: SimplifyOptions = {},
+): SimplifyStats {
     const stats: SimplifyStats = {
         iterations: 0,
         folded: 0,
@@ -44,6 +68,8 @@ export function simplifyFunction(fn: t.Function): SimplifyStats {
         deadAssigns: 0,
         minimized: 0,
     };
+
+    const fn = fnPath.node;
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
         let changed = false;
@@ -54,13 +80,22 @@ export function simplifyFunction(fn: t.Function): SimplifyStats {
             stats.folded += fold.folded;
         }
 
+        // MinimizeExitPoints reshapes labeled-block / loop / function exits
+        // into implicit fall-through. Run before PeepholeMinimizeConditions so
+        // the resulting if/else gets collapsed to ternaries.
+        const exits = runMinimizeExitPoints(fn);
+        if (exits.minimized > 0) {
+            changed = true;
+            stats.minimized += exits.minimized;
+        }
+
         const min = runPeepholeMinimizeConditions(fn.body);
         if (min.minimized > 0) {
             changed = true;
             stats.minimized += min.minimized;
         }
 
-        const dead = runPeepholeRemoveDeadCode(fn.body);
+        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized: options.normalized });
         if (dead.removed > 0) {
             changed = true;
             stats.removed += dead.removed;
@@ -68,7 +103,7 @@ export function simplifyFunction(fn: t.Function): SimplifyStats {
 
         const cfg = buildControlFlowGraph({ root: fn.body });
         if (cfg !== null) {
-            const table = buildLocalVariableTable(fn);
+            const table = buildLocalVariableTable(fnPath);
 
             const inline = runFlowSensitiveInlineVariables(fn, cfg, table);
             if (inline.inlined > 0) {
@@ -79,7 +114,7 @@ export function simplifyFunction(fn: t.Function): SimplifyStats {
             // DAE needs a fresh CFG+table after inline, since inline mutates.
             if (inline.inlined > 0) {
                 const cfg2 = buildControlFlowGraph({ root: fn.body });
-                const table2 = buildLocalVariableTable(fn);
+                const table2 = buildLocalVariableTable(fnPath);
                 if (cfg2 !== null) {
                     const live = runLiveVariablesAnalysis(cfg2, table2);
                     const da = eliminateDeadAssignments(fn, cfg2, live);
@@ -111,6 +146,7 @@ export function simplifyFunction(fn: t.Function): SimplifyStats {
  * the already-cleaned inner shape.
  */
 export function simplifyAll(root: t.Node): SimplifyStats {
+    const normalized = isFileNormalized(root);
     const total: SimplifyStats = {
         iterations: 0,
         folded: 0,
@@ -120,31 +156,19 @@ export function simplifyAll(root: t.Node): SimplifyStats {
         minimized: 0,
     };
 
-    const visit = (n: t.Node | null | undefined): void => {
-        if (n == null) return;
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            const child = getSlot(n, k);
-            if (child === null || child === undefined) continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c) visit(c);
-                }
-            } else {
-                visit(child);
-            }
-        }
-        if (t.isFunction(n)) {
-            const s = simplifyFunction(n);
-            total.iterations += s.iterations;
-            total.folded += s.folded;
-            total.removed += s.removed;
-            total.inlined += s.inlined;
-            total.deadAssigns += s.deadAssigns;
-            total.minimized += s.minimized;
-        }
-    };
-
-    visit(root);
+    traverse(root, {
+        Function: {
+            exit(path) {
+                const s = simplifyFunction(path, { normalized });
+                total.iterations += s.iterations;
+                total.folded += s.folded;
+                total.removed += s.removed;
+                total.inlined += s.inlined;
+                total.deadAssigns += s.deadAssigns;
+                total.minimized += s.minimized;
+            },
+        },
+    });
 
     // Program-level cleanup: AST-only peepholes (no CFG) over the whole tree
     // for top-level statements outside any function.
@@ -162,7 +186,7 @@ export function simplifyAll(root: t.Node): SimplifyStats {
             topChanged = true;
             total.minimized += m.minimized;
         }
-        const d = runPeepholeRemoveDeadCode(root);
+        const d = runPeepholeRemoveDeadCode(root, { normalized });
         if (d.removed > 0) {
             topChanged = true;
             total.removed += d.removed;

@@ -1,0 +1,12 @@
+import * as t from '@babel/types';
+export declare const TRI_FALSE: -1;
+export declare const TRI_UNKNOWN: 0;
+export declare const TRI_TRUE: 1;
+export type Tri = -1 | 0 | 1;
+export declare function triOr(a: Tri, b: Tri): Tri;
+export declare function triAnd(a: Tri, b: Tri): Tri;
+export declare function triNot(a: Tri): Tri;
+export declare function triXor(a: Tri, b: Tri): Tri;
+export declare function triToBoolean(a: Tri, fallback: boolean): boolean;
+export declare function triForBoolean(b: boolean): Tri;
+export declare function getBooleanValue(n: t.Node): Tri;

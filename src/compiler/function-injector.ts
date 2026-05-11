@@ -9,9 +9,19 @@
 //
 // BLOCK is the general path: emit a labeled block that binds params, runs
 // the (cloned) body with returns rewritten via FunctionToBlockMutator, and
-// stores the value in a `_r_<n>` temp. The call expression is replaced by
-// `_r_<n>`; the labeled block is hoisted to a sibling statement before the
-// callsite's enclosing statement.
+// stores the value in a `_<callee>__result_<n>` temp. The call expression is
+// replaced by that temp; the labeled block is hoisted to a sibling statement
+// before the callsite's enclosing statement.
+//
+// Generated names follow Closure's `JSCompiler_inline_*` convention with a
+// `_compilecat_` prefix on the label (which is globally findable) and a
+// shorter callee-prefixed shape on the result temp (local to one function):
+//   - label:  `_compilecat_inline_label_<callee>_<n>` (callee elided if anon)
+//   - result: `_<callee>__result_<n>` (anon: `_result_<n>`)
+//   - param:  unchanged in the common case. Renamed to `<orig>__<callee>`
+//             (anon: `<orig>__<n>`) only when an arg expression references
+//             `<orig>` as an identifier (the `let x = x.method();` shadow
+//             class). Normalize bumps further with `__N` on actual collision.
 //
 // Limitations (v1):
 //   - No `this` rewriting — we reject method calls and `this` references.
@@ -30,7 +40,7 @@ import { getSlot, setSlot } from './node-util';
 export type InliningMode = 'DIRECT' | 'BLOCK' | 'NO';
 
 export type InjectorOptions = {
-    /** Used to allocate fresh `_r_<n>` and `_inline_<n>` names. */
+    /** Used to allocate fresh `_compilecat_inline_*` ids. */
     nextId: () => number;
 };
 
@@ -185,14 +195,14 @@ export function inlineDirect(
 //
 // Mirrors Closure's recognizeCallSite. Knowing the surrounding shape lets us
 // reuse an existing variable as the result temp instead of emitting a fresh
-// `_r_<n>`:
+// `_<callee>__result_<n>`:
 //
 //   statement   `foo();`              → no result needed; splice replaces stmt
 //   init        `let x = foo();`      → reuse `x`; drop the init, splice block
 //                                       after the (now-uninitialized) decl
 //   assign      `x = foo();`          → reuse `x`; splice replaces the
 //                                       assignment statement
-//   expression  anything else         → fresh `_r_<n>`; current behavior
+//   expression  anything else         → fresh `_<callee>__result_<n>`
 
 type CallsiteShape =
     | { kind: 'statement' }
@@ -261,7 +271,10 @@ export function inlineBlock(
     if (args.length > callee.paramNames.length) return false;
 
     const id = options.nextId();
-    const label = `_inline_${id}`;
+    const cn = calleeName(callee.fn);
+    const label = cn === null
+        ? `_compilecat_inline_label_${id}`
+        : `_compilecat_inline_label_${cn}_${id}`;
 
     // Clone body and args.
     const clonedBody = t.cloneNode(fn.body, true);
@@ -275,17 +288,32 @@ export function inlineBlock(
         );
     }
 
-    // Alpha-rename params to fresh names so they can never collide with outer-scope
-    // free vars referenced in args. Without this, inlining `insertLeaf(dbvt, ...)`
-    // inside `add(dbvt, ...)` emits `let dbvt = dbvt;` (TDZ + later DAE strips the
-    // init, leaving `let dbvt;` shadowing the outer dbvt with undefined).
+    // Conditional alpha-rename. Rename a param P only when some arg references
+    // P as an identifier — otherwise the prologue `let P = arg;` would emit
+    // `let P = …P…;` and the RHS read would resolve to the new inner binding
+    // (TDZ on let; pre-FunctionArgumentInjector this surfaced as `let dbvt =
+    // dbvt;` inlining `ins(dbvt, ...)` inside `add(dbvt, ...)`).
+    //
+    // When we do rename, use `<orig>__<callee>` (or `<orig>__<inlineId>` for
+    // anon callees) so the suffix carries meaning. Normalize handles any
+    // collision afterward via its standard `__N` retry — but the common case
+    // doesn't rename at all, leaving the original parameter names intact in
+    // the bundle.
+    const argFreeNames = new Set<string>();
+    for (const a of clonedArgs) collectIdentifierNames(a, argFreeNames);
+
     const freshParams: string[] = [];
     const renames = new Map<string, string>();
     for (let i = 0; i < callee.paramNames.length; i++) {
         const orig = callee.paramNames[i];
-        const fresh = `${orig}$p${id}_${i}`;
-        freshParams.push(fresh);
-        renames.set(orig, fresh);
+        if (argFreeNames.has(orig)) {
+            const suffix = cn === null ? String(id) : cn;
+            const fresh = `${orig}__${suffix}`;
+            freshParams.push(fresh);
+            renames.set(orig, fresh);
+        } else {
+            freshParams.push(orig);
+        }
     }
     if (renames.size > 0) renameInBody(clonedBody, renames);
 
@@ -301,11 +329,18 @@ export function inlineBlock(
     }
 
     // Decide resultName + needsResult per shape.
+    // Callee-prefixed shape (`_<callee>__result_<n>`) reads as "the value of
+    // X" in the bundle. Anonymous callee → `_result_<n>`. The result temp is
+    // local to one function; we don't need the `_compilecat_` global prefix
+    // that the label carries.
+    const fallbackResult = cn === null
+        ? `_result_${id}`
+        : `_${cn}__result_${id}`;
     let resultName: string;
     let needsResult: boolean;
     switch (shape.kind) {
         case 'statement':
-            resultName = `_r_${id}`; // unused
+            resultName = fallbackResult; // unused
             needsResult = false;
             break;
         case 'init':
@@ -314,7 +349,7 @@ export function inlineBlock(
             needsResult = true;
             break;
         case 'expression':
-            resultName = `_r_${id}`;
+            resultName = fallbackResult;
             needsResult = true;
             break;
     }
@@ -357,8 +392,9 @@ export function inlineBlock(
             return true;
         }
         case 'expression': {
-            // Hoist `let _r_<n>;` and the labeled block before the enclosing
-            // statement; replace the call with `_r_<n>`.
+            // Hoist `let _<callee>__result_<n>;` and the labeled
+            // block before the enclosing statement; replace the call with the
+            // result temp.
             const tempDecl = t.variableDeclaration('let', [
                 t.variableDeclarator(t.identifier(resultName)),
             ]);
@@ -387,6 +423,36 @@ function breadcrumbFor(call: t.CallExpression): string {
 
 function tagInlined(node: t.Node, sig: string): void {
     t.addComment(node, 'leading', ` @applied-inline ${sig} `);
+}
+
+// Collect identifier names that appear in `expr`. Conservative: returns every
+// identifier in a value-bearing position (skips non-computed member/object
+// property keys, which are syntactic labels rather than references). Used by
+// the conditional-rename check — false positives only cause an unnecessary
+// rename, never a missed one.
+function collectIdentifierNames(expr: t.Node, out: Set<string>): void {
+    const walk = (n: t.Node | null | undefined, parent: t.Node | null, key: string): void => {
+        if (!n || typeof n !== 'object' || !('type' in n)) return;
+
+        if (t.isIdentifier(n)) {
+            if (parent && t.isMemberExpression(parent) && key === 'property' && !parent.computed) return;
+            if (parent && t.isOptionalMemberExpression(parent) && key === 'property' && !parent.computed) return;
+            if (parent && (t.isObjectProperty(parent) || t.isObjectMethod(parent)) && key === 'key' && !parent.computed) return;
+            out.add(n.name);
+            return;
+        }
+
+        for (const k of Object.keys(n)) {
+            if (k === 'type' || k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments' || k === 'extra') continue;
+            const v = (n as unknown as Record<string, unknown>)[k];
+            if (Array.isArray(v)) {
+                for (const item of v) walk(item as t.Node, n, k);
+            } else if (v && typeof v === 'object' && 'type' in (v as object)) {
+                walk(v as t.Node, n, k);
+            }
+        }
+    };
+    walk(expr, null, '');
 }
 
 // True iff `name` appears as a free read in `body` (not shadowed by a nested
@@ -642,4 +708,14 @@ function substituteIdentifiers(
 
     visit(root, null, '', undefined);
     return rootReplacement ?? root;
+}
+
+// Best-effort callee name for embedding in generated label names. Returns
+// null for arrow / anonymous function expressions; the caller emits the
+// shorter `_compilecat_inline_label_<id>` shape in that case.
+function calleeName(fn: t.Function): string | null {
+    if ((t.isFunctionDeclaration(fn) || t.isFunctionExpression(fn)) && fn.id) {
+        return fn.id.name;
+    }
+    return null;
 }

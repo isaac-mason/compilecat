@@ -26,20 +26,34 @@
 import * as t from '@babel/types';
 
 import { mayHaveSideEffects } from './ast-analyzer';
-import { getSlot, setSlot } from './node-util';
+import { getSlot, setSlot, tryMergeBlock } from './node-util';
+import { getBooleanValue, TRI_UNKNOWN, triToBoolean } from './tri';
 
 export type RemoveResult = {
     /** Number of statements/expressions deleted or simplified. */
     removed: number;
 };
 
-export function runPeepholeRemoveDeadCode(root: t.Node): RemoveResult {
-    const ctx: Ctx = { removed: 0 };
+export type RemoveOptions = {
+    /** Mirrors Closure's `isASTNormalized()` flag passed through to
+     *  NodeUtil.tryMergeBlock as `ignoreBlockScopedDeclarations`. When true,
+     *  block-flatten is allowed even when the inner block has let/const/class/
+     *  function declarations — safe because Normalize has already uniquified
+     *  every declared name across the whole file. See
+     *  NodeUtil.java:2483-2508. */
+    normalized?: boolean;
+};
+
+export function runPeepholeRemoveDeadCode(
+    root: t.Node,
+    options: RemoveOptions = {},
+): RemoveResult {
+    const ctx: Ctx = { removed: 0, normalized: options.normalized === true };
     walk(root, null, '', undefined, ctx);
     return { removed: ctx.removed };
 }
 
-type Ctx = { removed: number };
+type Ctx = { removed: number; normalized: boolean };
 
 function walk(
     n: t.Node,
@@ -171,21 +185,33 @@ function foldSequence(n: t.SequenceExpression): t.Node | undefined {
 // Block cleanup
 
 function cleanBlockBody(n: t.BlockStatement | t.Program, ctx: Ctx): void {
-    // Flatten nested plain BlockStatement children (those without their own
-    // let/const/class declarations at the top level — those would change scope
-    // semantics if hoisted). Done first so terminator scanning sees the
-    // inner shape.
+    // Port of PeepholeRemoveDeadCode.tryOptimizeBlock's child-merge step
+    // (PeepholeRemoveDeadCode.java:937-946 → NodeUtil.tryMergeBlock,
+    // NodeUtil.java:2490). For each direct child that is itself a BLOCK,
+    // attempt the merge with `ignoreBlockScopedDeclarations = isASTNormalized`.
+    // Done first so the terminator scan that follows sees the post-merge shape.
     const body = n.body as t.Statement[];
     let flattened = 0;
     for (let i = 0; i < body.length; i++) {
         const s = body[i];
-        if (t.isBlockStatement(s) && !blockHasLexicalDecl(s)) {
-            body.splice(i, 1, ...s.body);
-            flattened++;
-            i += s.body.length - 1;
-        }
+        if (!t.isBlockStatement(s)) continue;
+        const inserted = tryMergeBlock(s, body, i, n, ctx.normalized);
+        if (inserted === 0) continue;
+        flattened++;
+        i += inserted - 1;
     }
     if (flattened > 0) ctx.removed += flattened;
+
+    // Port of PeepholeRemoveDeadCode.tryOptimizeConditionalAfterAssign
+    // (PRDC.java:1026-1102). For consecutive `<assign>; <conditional>`
+    // pairs where the condition is just the freshly-assigned name, replace
+    // the condition with a constant derived from the RHS. Pairs with
+    // PeepholeFoldConstants downstream to fully fold the conditional.
+    for (let i = 0; i < body.length - 1; i++) {
+        if (tryOptimizeConditionalAfterAssign(body[i], body[i + 1])) {
+            ctx.removed++;
+        }
+    }
 
     let write = 0;
     let removed = 0;
@@ -221,15 +247,6 @@ function cleanBlockBody(n: t.BlockStatement | t.Program, ctx: Ctx): void {
     }
 }
 
-function blockHasLexicalDecl(b: t.BlockStatement): boolean {
-    for (const s of b.body) {
-        if (t.isVariableDeclaration(s) && (s.kind === 'let' || s.kind === 'const')) return true;
-        if (t.isClassDeclaration(s)) return true;
-        if (t.isFunctionDeclaration(s)) return true;
-    }
-    return false;
-}
-
 function isTerminator(s: t.Statement): boolean {
     return (
         t.isReturnStatement(s) ||
@@ -263,5 +280,157 @@ function asBoolean(node: t.Node): boolean | null {
     if (t.isStringLiteral(node)) return node.value.length > 0;
     if (t.isNullLiteral(node)) return false;
     if (t.isIdentifier(node) && node.name === 'undefined') return false;
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Port of PeepholeRemoveDeadCode.tryOptimizeConditionalAfterAssign
+// (PRDC.java:1026-1102).
+//
+// Recognizes:
+//
+//     <assign>;
+//     if (<name>) ...           → if (<bool>) ...
+//     <name> ? a : b;           → <bool> ? a : b
+//     <name> && f();            → <bool> && f()
+//     <name> || f();            → <bool> || f()
+//     <name> ?? f();            → undefined ?? f()  // when rhs known nullish
+//                              or  0 ?? f()         // when rhs known non-nullish
+//
+// Where <assign> is either `name = RHS;` or `var/let/const name = RHS;`.
+//
+// Returns true when the condition was replaced.
+
+function tryOptimizeConditionalAfterAssign(
+    assignStmt: t.Statement,
+    conditionalStmt: t.Statement,
+): boolean {
+    const lhsName = simpleAssignmentLhsName(assignStmt);
+    if (lhsName === null) return false;
+    const rhs = simpleAssignmentRhs(assignStmt);
+    if (rhs === null) return false;
+
+    const cr = conditionalRoot(conditionalStmt);
+    if (cr === null) return false;
+    const condition = conditionalRootCondition(cr);
+    if (!t.isIdentifier(condition) || condition.name !== lhsName) return false;
+
+    // COALESCE (??): use known value type rather than truthiness.
+    if (t.isLogicalExpression(cr.root) && cr.root.operator === '??') {
+        const nullish = isKnownNullish(rhs);
+        if (nullish === true) {
+            cr.replaceCondition(t.unaryExpression('void', t.numericLiteral(0)));
+            return true;
+        }
+        if (nullish === false) {
+            cr.replaceCondition(t.numericLiteral(0));
+            return true;
+        }
+        return false;
+    }
+
+    // IF / HOOK / AND / OR — boolean coercion.
+    const tri = getBooleanValue(rhs);
+    if (tri === TRI_UNKNOWN) return false;
+    cr.replaceCondition(t.booleanLiteral(triToBoolean(tri, true)));
+    return true;
+}
+
+/** Returns the LHS name iff `n` is a simple assignment / single-init decl. */
+function simpleAssignmentLhsName(n: t.Statement): string | null {
+    if (t.isExpressionStatement(n) && t.isAssignmentExpression(n.expression)) {
+        const a = n.expression;
+        if (a.operator !== '=') return null;
+        if (!t.isIdentifier(a.left)) return null;
+        return a.left.name;
+    }
+    if (t.isVariableDeclaration(n) && n.declarations.length === 1) {
+        const d = n.declarations[0];
+        if (!t.isIdentifier(d.id)) return null;
+        if (d.init === null || d.init === undefined) return null;
+        return d.id.name;
+    }
+    return null;
+}
+
+function simpleAssignmentRhs(n: t.Statement): t.Expression | null {
+    if (t.isExpressionStatement(n) && t.isAssignmentExpression(n.expression)) {
+        return n.expression.right;
+    }
+    if (t.isVariableDeclaration(n) && n.declarations.length === 1) {
+        return n.declarations[0].init ?? null;
+    }
+    return null;
+}
+
+type ConditionalRoot = {
+    /** The IfStatement, ConditionalExpression, or LogicalExpression root. */
+    root: t.IfStatement | t.ConditionalExpression | t.LogicalExpression;
+    /** Replace the condition slot in-place. */
+    replaceCondition(replacement: t.Expression): void;
+};
+
+function conditionalRoot(s: t.Statement): ConditionalRoot | null {
+    if (t.isIfStatement(s)) {
+        const node = s;
+        return {
+            root: node,
+            replaceCondition(r) {
+                node.test = r;
+            },
+        };
+    }
+    if (t.isExpressionStatement(s)) {
+        const e = s.expression;
+        if (t.isConditionalExpression(e)) {
+            return {
+                root: e,
+                replaceCondition(r) {
+                    e.test = r;
+                },
+            };
+        }
+        if (
+            t.isLogicalExpression(e) &&
+            (e.operator === '&&' || e.operator === '||' || e.operator === '??')
+        ) {
+            return {
+                root: e,
+                replaceCondition(r) {
+                    e.left = r;
+                },
+            };
+        }
+    }
+    return null;
+}
+
+function conditionalRootCondition(cr: ConditionalRoot): t.Expression {
+    if (t.isIfStatement(cr.root)) return cr.root.test;
+    if (t.isConditionalExpression(cr.root)) return cr.root.test;
+    return cr.root.left;
+}
+
+/** Returns true if RHS is statically known to be nullish (null or undefined),
+ *  false if statically known to be non-nullish, null if unknown. Subset of
+ *  Closure's `NodeUtil.getKnownValueType` collapsed to the only distinction
+ *  the COALESCE branch needs. */
+function isKnownNullish(n: t.Node): boolean | null {
+    if (t.isNullLiteral(n)) return true;
+    if (t.isIdentifier(n) && n.name === 'undefined') return true;
+    if (t.isUnaryExpression(n) && n.operator === 'void') return true;
+    if (
+        t.isNumericLiteral(n) ||
+        t.isStringLiteral(n) ||
+        t.isBooleanLiteral(n) ||
+        t.isBigIntLiteral(n) ||
+        t.isObjectExpression(n) ||
+        t.isArrayExpression(n) ||
+        t.isFunction(n) ||
+        t.isRegExpLiteral(n) ||
+        t.isTemplateLiteral(n)
+    ) {
+        return false;
+    }
     return null;
 }

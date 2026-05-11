@@ -26,6 +26,11 @@
 
 import * as t from '@babel/types';
 
+import {
+    gatherCallArgumentsNeedingTemps,
+    gatherModifiedParameters,
+    injectArguments,
+} from './function-argument-injector';
 import { getSlot, setSlot } from './node-util';
 
 export type BlockMutateInput = {
@@ -44,7 +49,13 @@ export type BlockMutateInput = {
 };
 
 export type BlockMutateOutput = {
-    block: t.LabeledStatement;
+    /** Either a LabeledStatement (when interior returns force a `break LABEL;`
+     *  out of the inlined region) or a plain BlockStatement (when the only
+     *  return — if any — is the body's last statement and gets rewritten as a
+     *  fall-through assignment). Mirrors Closure's `replaceReturns` returning
+     *  a labelled wrapper only when `returnCount > 0` after handling the
+     *  trailing return. */
+    block: t.Statement;
     /** True when at least one return was rewritten — i.e. `_r` is initialized
      *  on at least one path. Caller may choose to declare `_r` only when this
      *  is true. */
@@ -54,29 +65,147 @@ export type BlockMutateOutput = {
 export function mutateForBlockInline(input: BlockMutateInput): BlockMutateOutput {
     const { body, params, args, label, resultName, needsResult } = input;
 
-    // 1. Build the parameter-binding prologue. We bind each param to its arg
-    //    via a `let` declaration. Closure does scalar substitution where safe;
-    //    we punt and always bind, leaving redundant binds for the simplifier
-    //    to clean up.
+    // 1. Decide which params need a `let X = arg;` temp vs. direct
+    //    substitution. Mirrors Closure's FunctionArgumentInjector. The common
+    //    case for compilecat's library inlines is a callee like
+    //    `function f(out) { out[0] = ...; ... }` invoked as `f(targetArr)` —
+    //    `out`'s arg is a simple Identifier, so it substitutes directly and
+    //    the prologue ends up empty.
+    const paramSet = new Set(params);
+    const modified = gatherModifiedParameters(body, paramSet);
+    const argsForClassify: t.Expression[] = params.map((_, i) => args[i] ?? undefinedExpr());
+    const { needsTemp } = gatherCallArgumentsNeedingTemps(body, params, argsForClassify, modified);
+
+    // 2. Substitute non-temp params directly into the body. Each substituted
+    //    arg gets cloned per use by injectArguments.
+    const replacements = new Map<string, t.Expression>();
+    for (let i = 0; i < params.length; i++) {
+        const name = params[i];
+        if (needsTemp.has(name)) continue;
+        replacements.set(name, argsForClassify[i]);
+    }
+    injectArguments(body, replacements);
+
+    // 3. Build the prologue for the params that DO need a temp.
     const prologue: t.Statement[] = [];
     for (let i = 0; i < params.length; i++) {
-        const arg = args[i] ?? t.identifier('undefined');
+        const name = params[i];
+        if (!needsTemp.has(name)) continue;
         prologue.push(
-            t.variableDeclaration('let', [t.variableDeclarator(t.identifier(params[i]), arg)]),
+            t.variableDeclaration('let', [
+                t.variableDeclarator(t.identifier(name), argsForClassify[i]),
+            ]),
         );
     }
 
-    // 2. Rewrite returns inside the cloned body.
+    // 4. Closure's `replaceReturns` (FunctionToBlockMutator.java:408) special-
+    //    cases a trailing `return X;` — the function's last statement. That
+    //    return falls through naturally, so it can be rewritten as a plain
+    //    assignment (or expression statement) with no `break LABEL;` needed.
+    //    If no other returns remain after that rewrite, the labeled wrapper
+    //    can be dropped entirely and the inlined region is just a BlockStatement
+    //    that the simplifier will flatten into the parent.
     let hasResultWrite = false;
-    rewriteReturns(body, label, resultName, needsResult, () => {
+    const onWrite = () => {
         hasResultWrite = true;
-    });
+    };
 
-    // 3. Wrap [...prologue, ...body.body] in a block, then label it.
-    const block = t.blockStatement([...prologue, ...body.body]);
-    const labeled = t.labeledStatement(t.identifier(label), block);
+    const hasReturnAtExit = endsWithReturn(body);
+    const interiorReturns = countShallowReturns(body) - (hasReturnAtExit ? 1 : 0);
 
-    return { block: labeled, hasResultWrite };
+    if (hasReturnAtExit) {
+        const last = body.body[body.body.length - 1] as t.ReturnStatement;
+        const replacement = makeTrailingReturnReplacement(
+            last.argument,
+            resultName,
+            needsResult,
+            onWrite,
+        );
+        body.body.splice(body.body.length - 1, 1, ...replacement);
+    }
+
+    // Port of FunctionToBlockMutator.java:447-450 (addDummyAssignment): when a
+    // result is required but the body has no return-at-exit, append
+    // `_r = void 0;` so `_r` is initialized on every fall-through path. Without
+    // this, downstream reads of `_r` could observe a previous BLOCK-inline's
+    // value when the function falls off the end.
+    if (needsResult && !hasReturnAtExit) {
+        body.body.push(
+            t.expressionStatement(
+                t.assignmentExpression('=', t.identifier(resultName), undefinedExpr()),
+            ),
+        );
+        hasResultWrite = true;
+    }
+
+    if (interiorReturns > 0) {
+        rewriteReturns(body, label, resultName, needsResult, onWrite);
+        const block = t.blockStatement([...prologue, ...body.body]);
+        const labeled = t.labeledStatement(t.identifier(label), block);
+        return { block: labeled, hasResultWrite };
+    }
+
+    return {
+        block: t.blockStatement([...prologue, ...body.body]),
+        hasResultWrite,
+    };
+}
+
+/** Closure's `NodeUtil.newUndefinedNode` — `void 0`. Shadow-proof and one
+ *  byte shorter than `undefined`. */
+function undefinedExpr(): t.Expression {
+    return t.unaryExpression('void', t.numericLiteral(0));
+}
+
+function countShallowReturns(root: t.Node): number {
+    let count = 0;
+    const walk = (n: t.Node): void => {
+        if (t.isFunction(n)) return;
+        if (t.isReturnStatement(n)) count++;
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child === null || child === undefined) continue;
+            if (Array.isArray(child)) {
+                for (const c of child) if (c) walk(c);
+            } else {
+                walk(child);
+            }
+        }
+    };
+    for (const k of t.VISITOR_KEYS[root.type] ?? []) {
+        const child = getSlot(root, k);
+        if (child === null || child === undefined) continue;
+        if (Array.isArray(child)) {
+            for (const c of child) if (c) walk(c);
+        } else {
+            walk(child);
+        }
+    }
+    return count;
+}
+
+function endsWithReturn(body: t.BlockStatement): boolean {
+    const last = body.body[body.body.length - 1];
+    return last !== undefined && t.isReturnStatement(last);
+}
+
+function makeTrailingReturnReplacement(
+    arg: t.Expression | null | undefined,
+    resultName: string,
+    needsResult: boolean,
+    onWrite: () => void,
+): t.Statement[] {
+    if (needsResult) {
+        const rhs = arg ?? undefinedExpr();
+        onWrite();
+        return [
+            t.expressionStatement(
+                t.assignmentExpression('=', t.identifier(resultName), rhs),
+            ),
+        ];
+    }
+    if (arg && hasSideEffects(arg)) return [t.expressionStatement(arg)];
+    return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -154,7 +283,7 @@ function makeReturnReplacement(
 ): t.Statement[] {
     const out: t.Statement[] = [];
     if (needsResult) {
-        const rhs = arg ?? t.identifier('undefined');
+        const rhs = arg ?? undefinedExpr();
         out.push(
             t.expressionStatement(
                 t.assignmentExpression('=', t.identifier(resultName), rhs),

@@ -18,6 +18,9 @@
 //                      \ | | /
 //                     (BOTTOM)
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. Maps
+// here key by slot, not by name; this is what makes shadowing correct.
+//
 // Used by FlowSensitiveInlineVariables.
 
 import * as t from '@babel/types';
@@ -31,16 +34,16 @@ import { getSlot } from './node-util';
 export type Definition = {
     /** CFG node (or function root for parameter sentinel) where the def lives. */
     node: t.Node;
-    /** Names of locals that this def's RHS reads from. */
-    depends: Set<string>;
+    /** Slots that this def's RHS reads from. */
+    depends: Set<number>;
     /** True if RHS references a name not in our local table — we then can't
      *  reason about whether the def is invariant across reorderings. */
     unknownDependencies: boolean;
 };
 
 export type MustDef = {
-    /** Per-variable reaching def. Missing key = TOP, null value = BOTTOM. */
-    reachingDef: Map<string, Definition | null>;
+    /** Per-slot reaching def. Missing key = TOP, null value = BOTTOM. */
+    reachingDef: Map<number, Definition | null>;
 };
 
 function newMustDef(): MustDef {
@@ -53,8 +56,8 @@ function cloneMustDef(d: MustDef): MustDef {
 
 function entryMustDef(table: LocalVariableTable, fnRoot: t.Node): MustDef {
     const m = newMustDef();
-    for (const name of table.indexByName.keys()) {
-        m.reachingDef.set(name, {
+    for (let slot = 0; slot < table.size; slot++) {
+        m.reachingDef.set(slot, {
             node: fnRoot,
             depends: new Set(),
             unknownDependencies: false,
@@ -109,8 +112,9 @@ export type MustReachResult = {
     table: LocalVariableTable;
     /** The CFG passed in, with annotations populated. */
     cfg: ControlFlowGraph;
-    /** Lookup: at the start of `cfgNode`, what def reaches this name? */
-    getDef: (name: string, cfgNode: CfgNode) => Definition | null | undefined;
+    /** Lookup: at the start of `cfgNode`, what def reaches the binding for
+     *  this identifier? */
+    getDef: (id: t.Identifier, cfgNode: CfgNode) => Definition | null | undefined;
 };
 
 export function runMustReachingDef(
@@ -141,10 +145,12 @@ export function runMustReachingDef(
         ran: true,
         table,
         cfg,
-        getDef: (name, cfgNode) => {
+        getDef: (id, cfgNode) => {
             const m = snapshot.get(cfgNode);
             if (m === undefined) return undefined;
-            return m.reachingDef.get(name);
+            const slot = table.resolve(id);
+            if (slot === undefined) return undefined;
+            return m.reachingDef.get(slot);
         },
     };
 }
@@ -190,10 +196,10 @@ function computeMustDef(
         if (t.isVariableDeclaration(lhs)) {
             const last = lhs.declarations[lhs.declarations.length - 1];
             if (last && t.isIdentifier(last.id)) {
-                addToDefIfLocal(last.id.name, conditional ? null : cfgNode, n.right, out, table);
+                addToDefIfLocal(last.id, conditional ? null : cfgNode, n.right, out, table);
             }
         } else if (t.isIdentifier(lhs)) {
-            addToDefIfLocal(lhs.name, conditional ? null : cfgNode, n.right, out, table);
+            addToDefIfLocal(lhs, conditional ? null : cfgNode, n.right, out, table);
         }
         return;
     }
@@ -224,7 +230,7 @@ function computeMustDef(
         for (const d of n.declarations) {
             if (d.init && t.isIdentifier(d.id)) {
                 computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-                addToDefIfLocal(d.id.name, conditional ? null : cfgNode, d.init, out, table);
+                addToDefIfLocal(d.id, conditional ? null : cfgNode, d.init, out, table);
             } else if (d.init) {
                 computeMustDef(fn, d.init, cfgNode, out, conditional, table);
             }
@@ -234,7 +240,7 @@ function computeMustDef(
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-            addToDefIfLocal(n.left.name, conditional ? null : cfgNode, n.right, out, table);
+            addToDefIfLocal(n.left, conditional ? null : cfgNode, n.right, out, table);
             return;
         }
         // Member or destructure assign — descend defensively.
@@ -245,17 +251,18 @@ function computeMustDef(
     if (t.isUpdateExpression(n)) {
         if (t.isIdentifier(n.argument)) {
             // Treat ++/-- as a self-referencing redefinition with depends={x}.
-            addToDefIfLocal(n.argument.name, conditional ? null : cfgNode, n.argument, out, table);
+            addToDefIfLocal(n.argument, conditional ? null : cfgNode, n.argument, out, table);
             return;
         }
     }
     if (t.isIdentifier(n) && n.name === 'arguments') {
-        // Closure's escapeParameters: lose all parameter knowledge.
-        for (const param of fn.params) {
-            for (const name of bindingIdNames(param)) {
-                if (table.indexByName.has(name)) out.reachingDef.set(name, null);
-            }
+        // Closure's escapeParameters: lose all parameter knowledge. We can't
+        // tell which slots are params from the table, so invalidate all
+        // slots. (escaped slots are filtered downstream.)
+        for (let slot = 0; slot < table.size; slot++) {
+            out.reachingDef.set(slot, null);
         }
+        void fn;
         return;
     }
 
@@ -273,24 +280,25 @@ function computeMustDef(
 }
 
 function addToDefIfLocal(
-    name: string,
+    id: t.Identifier,
     cfgNode: t.Node | null,
     rhs: t.Node | null,
     out: MustDef,
     table: LocalVariableTable,
 ): void {
-    if (!table.indexByName.has(name)) return;
+    const slot = table.resolve(id);
+    if (slot === undefined) return;
 
-    // Invalidate any existing def that depends on `name` (we just rebound it).
+    // Invalidate any existing def that depends on `slot` (we just rebound it).
     for (const [k, def] of out.reachingDef) {
         if (def === null) continue;
-        if (def.depends.has(name)) out.reachingDef.set(k, null);
+        if (def.depends.has(slot)) out.reachingDef.set(k, null);
     }
 
-    if (table.escaped.has(name)) return;
+    if (table.escaped.has(slot)) return;
 
     if (cfgNode === null) {
-        out.reachingDef.set(name, null);
+        out.reachingDef.set(slot, null);
         return;
     }
 
@@ -300,19 +308,20 @@ function addToDefIfLocal(
         unknownDependencies: false,
     };
     if (rhs !== null) computeDependence(def, rhs, table);
-    out.reachingDef.set(name, def);
+    out.reachingDef.set(slot, def);
 }
 
 function computeDependence(def: Definition, rhs: t.Node, table: LocalVariableTable): void {
     const visit = (n: t.Node, parent: t.Node | null) => {
         if (parent !== null && isEnteringNewCfgNode(n, parent)) return;
         if (t.isIdentifier(n)) {
-            if (!table.indexByName.has(n.name)) {
+            const slot = table.resolve(n);
+            if (slot === undefined) {
                 // External name (closure-captured, global, etc.) — we don't
                 // know whether it can change.
                 def.unknownDependencies = true;
             } else {
-                def.depends.add(n.name);
+                def.depends.add(slot);
             }
             return;
         }
@@ -329,37 +338,6 @@ function computeDependence(def: Definition, rhs: t.Node, table: LocalVariableTab
         }
     };
     visit(rhs, null);
-}
-
-function bindingIdNames(node: t.Node): string[] {
-    const out: string[] = [];
-    const visit = (n: t.Node) => {
-        if (t.isIdentifier(n)) {
-            out.push(n.name);
-            return;
-        }
-        if (t.isAssignmentPattern(n)) {
-            visit(n.left);
-            return;
-        }
-        if (t.isRestElement(n)) {
-            visit(n.argument);
-            return;
-        }
-        if (t.isArrayPattern(n)) {
-            for (const el of n.elements) if (el !== null) visit(el);
-            return;
-        }
-        if (t.isObjectPattern(n)) {
-            for (const p of n.properties) {
-                if (t.isRestElement(p)) visit(p.argument);
-                else if (t.isObjectProperty(p) && 'type' in p.value) visit(p.value as t.Node);
-            }
-            return;
-        }
-    };
-    visit(node);
-    return out;
 }
 
 // Used by FlowSensitiveInlineVariables to decide whether the def's RHS

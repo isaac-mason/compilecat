@@ -128,8 +128,9 @@ describe('InlineFunctions — cross-file', () => {
             `,
         };
         const out = runProject(files, '/proj/main.ts');
-        // BLOCK form alpha-renames params (out → out$p0_0, etc.); the body
-        // pattern survives in shape: `<o>[0] = <a>[0] + <b>[0]`.
+        // Args here are simple identifiers → FunctionArgumentInjector substitutes
+        // them directly, no param renames needed; the body pattern survives in
+        // shape: `<o>[0] = <a>[0] + <b>[0]`.
         expect(out).toMatch(/[\w$]+\[0\]\s*=\s*[\w$]+\[0\]\s*\+\s*[\w$]+\[0\]/);
         expect(out).not.toMatch(/\bvec3\.add\b/);
     });

@@ -26,9 +26,21 @@
 import * as t from '@babel/types';
 
 import { isLiteralValue } from './node-util';
+import { getBooleanValue, type Tri, TRI_UNKNOWN } from './tri';
 
 export function mayHaveSideEffects(node: t.Node): boolean {
     return !isPure(node);
+}
+
+/**
+ * Closure's `getSideEffectFreeBooleanValue` — returns the boolean value the
+ * expression would evaluate to (as a Tri) but only when the expression has no
+ * side effects; UNKNOWN otherwise. Used in cond rewriting to gate moves like
+ * `x || true → true` (only safe when `x` is pure).
+ */
+export function getSideEffectFreeBooleanValue(node: t.Node): Tri {
+    if (mayHaveSideEffects(node)) return TRI_UNKNOWN;
+    return getBooleanValue(node);
 }
 
 export function isPure(node: t.Node): boolean {

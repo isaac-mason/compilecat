@@ -16,6 +16,10 @@
 //          statement list, the common case)
 //   5. The use is not inside a loop (would inline N times into N iterations).
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. We never
+// compare names; only slot equality. This is correctness-critical when the
+// same name is shadowed across nested scopes.
+//
 // Drives MustBeReachingVariableDef + MaybeReachingVariableUse + the
 // CheckPathsBetweenNodes graph utility.
 
@@ -64,8 +68,8 @@ export function runFlowSensitiveInlineVariables(
 
     let inlined = 0;
     for (const c of candidates) {
-        if (canInline(c, fn, cfg, table, reachUse.getUsesAfter, parents)) {
-            performInline(c, parents);
+        if (canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents)) {
+            performInline(c, table, parents);
             inlined++;
         }
     }
@@ -76,7 +80,7 @@ export function runFlowSensitiveInlineVariables(
 // Candidate
 
 type Candidate = {
-    name: string;
+    slot: number;
     def: Definition;
     use: t.Identifier;
     useCfgNode: CfgNode;
@@ -86,7 +90,7 @@ function gatherCandidates(
     fn: t.Function,
     cfg: ControlFlowGraph,
     table: LocalVariableTable,
-    getDef: (name: string, cfgNode: CfgNode) => Definition | null | undefined,
+    getDef: (id: t.Identifier, cfgNode: CfgNode) => Definition | null | undefined,
     parents: ParentMap,
 ): Candidate[] {
     const out: Candidate[] = [];
@@ -97,14 +101,14 @@ function gatherCandidates(
         if (typeof value === 'symbol') continue;
 
         forEachIdentifierRead(value as t.Node, parents, (id) => {
-            const name = id.name;
-            if (!table.indexByName.has(name)) return;
-            if (table.escaped.has(name)) return;
-            const def = getDef(name, cfgNode);
+            const slot = table.resolve(id);
+            if (slot === undefined) return;
+            if (table.escaped.has(slot)) return;
+            const def = getDef(id, cfgNode);
             if (def === null || def === undefined) return;
             if (def.node === fn) return; // parameter sentinel — skip
             if (dependsOnOuterScopeVars(def)) return;
-            out.push({ name, def, use: id, useCfgNode: cfgNode });
+            out.push({ slot, def, use: id, useCfgNode: cfgNode });
         });
     }
     void fn;
@@ -119,10 +123,10 @@ function canInline(
     fn: t.Function,
     cfg: ControlFlowGraph,
     table: LocalVariableTable,
-    getUsesAfter: (name: string, cfgNode: CfgNode) => Set<t.Node>,
+    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => Set<t.Node>,
     parents: ParentMap,
 ): boolean {
-    const defLoc = locateDefExpr(c.def, c.name, parents);
+    const defLoc = locateDefExpr(c.def, c.slot, table, parents);
     if (defLoc === null) return false;
 
     // Reject defs whose enclosing AssignmentExpression isn't the top-level of
@@ -137,17 +141,17 @@ function canInline(
     // 2. RHS shape — Closure's isRhsSafeToInline.
     if (!isRhsSafeToInline(rhs)) return false;
 
-    // 3. Pre/post sibling side-effect checks on names this def depends on.
-    const namesToCheck = c.def.depends;
+    // 3. Pre/post sibling side-effect checks on slots this def depends on.
+    const slotsToCheck = c.def.depends;
     if (
-        checkPostExpressions(defLoc.expr, c.def.node, namesToCheck, parents) ||
-        checkPreExpressions(c.use, c.useCfgNode.value as t.Node, namesToCheck, parents)
+        checkPostExpressions(defLoc.expr, c.def.node, slotsToCheck, table, parents) ||
+        checkPreExpressions(c.use, c.useCfgNode.value as t.Node, slotsToCheck, table, parents)
     ) {
         return false;
     }
 
-    // 4. Exactly one syntactic use of `name` inside the use's CFG node.
-    if (countNameUsesInCfgNode(c.useCfgNode.value as t.Node, c.name, parents) !== 1) {
+    // 4. Exactly one syntactic use of the binding behind c.slot inside the use's CFG node.
+    if (countSlotUsesInCfgNode(c.useCfgNode.value as t.Node, c.slot, table, parents) !== 1) {
         return false;
     }
 
@@ -157,7 +161,7 @@ function canInline(
     // 6. Reaching-use set at the def's CFG node has exactly one element.
     const defCfg = cfg.nodes.get(c.def.node);
     if (defCfg === undefined) return false;
-    const usesAfter = getUsesAfter(c.name, defCfg);
+    const usesAfter = getUsesAfterSlot(c.slot, defCfg);
     if (usesAfter.size !== 1) return false;
     if (!usesAfter.has(c.use)) return false;
 
@@ -171,7 +175,7 @@ function canInline(
             end: useGraph,
             nodePredicate: (v) => {
                 if (typeof v === 'symbol') return false;
-                return nodeHasInterferingEffect(v as t.Node, namesToCheck, parents);
+                return nodeHasInterferingEffect(v as t.Node, slotsToCheck, table, parents);
             },
             edgePredicate: () => true,
             inclusive: false,
@@ -179,7 +183,75 @@ function canInline(
         if (sideEffectOnPath) return false;
     }
 
-    void table;
+    // 8. Scope visibility — every free local Identifier in the RHS must be in
+    //    lexical scope at the use site. Mirrors the second clause of Closure's
+    //    isRhsSafeToInline (FlowSensitiveInlineVariables.java:639). Without
+    //    this, we'd substitute `out$pN` (declared in an inner block) into a
+    //    `return` outside the block, producing an out-of-scope reference.
+    if (!rhsIdentifiersInScopeAt(rhs, c.use, table, parents)) return false;
+
+    return true;
+}
+
+/**
+ * For every free Identifier read inside `rhs` that resolves to a local slot,
+ * verify that the slot's binding scope is an ancestor of `useSite`. Free
+ * names that are outer-scope (table.resolve === undefined) are always safe —
+ * if they were visible at the def site, they're visible at any sibling/use
+ * inside the same function.
+ */
+function rhsIdentifiersInScopeAt(
+    rhs: t.Expression,
+    useSite: t.Node,
+    table: LocalVariableTable,
+    parents: ParentMap,
+): boolean {
+    const useAncestors = collectAncestorNodes(useSite, parents);
+    let ok = true;
+    t.traverseFast(rhs, (n) => {
+        if (!ok) return;
+        // Don't descend into nested functions — their free names are bound in
+        // their own scope chain, not the use site's.
+        if (t.isFunction(n)) return t.traverseFast.skip;
+        if (!t.isIdentifier(n)) return undefined;
+        const info = parents.get(n);
+        if (info === undefined) return undefined;
+        if (!isReferenceContext(info.parent, info.key)) return undefined;
+        const slot = table.resolve(n);
+        if (slot === undefined) return undefined; // outer-scope / global → safe
+        const scopeNode = table.scopeNodeOfSlot(slot);
+        if (scopeNode === undefined) {
+            ok = false;
+            return undefined;
+        }
+        if (!useAncestors.has(scopeNode)) ok = false;
+        return undefined;
+    });
+    return ok;
+}
+
+function collectAncestorNodes(node: t.Node, parents: ParentMap): Set<t.Node> {
+    const out = new Set<t.Node>();
+    let cur: t.Node | undefined = node;
+    while (cur !== undefined) {
+        out.add(cur);
+        cur = parents.get(cur)?.parent;
+    }
+    return out;
+}
+
+function isReferenceContext(parent: t.Node, key: string): boolean {
+    if (t.isVariableDeclarator(parent) && key === 'id') return false;
+    if (t.isFunctionDeclaration(parent) && key === 'id') return false;
+    if (t.isFunctionExpression(parent) && key === 'id') return false;
+    if (t.isClassDeclaration(parent) && key === 'id') return false;
+    if (t.isClassExpression(parent) && key === 'id') return false;
+    if (t.isLabeledStatement(parent) && key === 'label') return false;
+    if (t.isBreakStatement(parent) && key === 'label') return false;
+    if (t.isContinueStatement(parent) && key === 'label') return false;
+    if (t.isMemberExpression(parent) && key === 'property' && !parent.computed) return false;
+    if (t.isObjectProperty(parent) && key === 'key' && !parent.computed) return false;
+    if (t.isObjectMethod(parent) && key === 'key' && !parent.computed) return false;
     return true;
 }
 
@@ -191,7 +263,12 @@ type DefLoc =
     | { kind: 'var'; expr: t.VariableDeclarator; rhs: t.Expression; decl: t.VariableDeclaration }
     | { kind: 'assign'; expr: t.AssignmentExpression; rhs: t.Expression; topLevel: boolean };
 
-function locateDefExpr(def: Definition, name: string, parents: ParentMap): DefLoc | null {
+function locateDefExpr(
+    def: Definition,
+    slot: number,
+    table: LocalVariableTable,
+    parents: ParentMap,
+): DefLoc | null {
     let result: DefLoc | null = null;
     const visit = (n: t.Node, parent: t.Node | null) => {
         if (result !== null) return;
@@ -199,10 +276,8 @@ function locateDefExpr(def: Definition, name: string, parents: ParentMap): DefLo
         if (
             t.isVariableDeclarator(n) &&
             t.isIdentifier(n.id) &&
-            n.id.name === name &&
-            n.init &&
-            // Walk up to confirm parent is a VariableDeclaration we can mutate.
-            true
+            table.resolve(n.id) === slot &&
+            n.init
         ) {
             const declInfo = parents.get(n);
             if (declInfo && t.isVariableDeclaration(declInfo.parent)) {
@@ -214,7 +289,7 @@ function locateDefExpr(def: Definition, name: string, parents: ParentMap): DefLo
             t.isAssignmentExpression(n) &&
             n.operator === '=' &&
             t.isIdentifier(n.left) &&
-            n.left.name === name
+            table.resolve(n.left) === slot
         ) {
             // top-level iff parent is an ExpressionStatement (ignoring labels).
             let p: t.Node | null = parents.get(n)?.parent ?? null;
@@ -283,13 +358,14 @@ function isRhsSafeToInline(rhs: t.Node): boolean {
 function checkPostExpressions(
     n: t.Node,
     expressionRoot: t.Node,
-    namesToCheck: Set<string>,
+    slotsToCheck: Set<number>,
+    table: LocalVariableTable,
     parents: ParentMap,
 ): boolean {
     let cur: t.Node = n;
     while (cur !== expressionRoot) {
         for (const sib of rightSiblings(cur, parents)) {
-            if (subtreeHasInterferingEffect(sib, namesToCheck, parents)) return true;
+            if (subtreeHasInterferingEffect(sib, slotsToCheck, table, parents)) return true;
         }
         const info = parents.get(cur);
         if (info === undefined) return false;
@@ -301,13 +377,14 @@ function checkPostExpressions(
 function checkPreExpressions(
     n: t.Node,
     expressionRoot: t.Node,
-    namesToCheck: Set<string>,
+    slotsToCheck: Set<number>,
+    table: LocalVariableTable,
     parents: ParentMap,
 ): boolean {
     let cur: t.Node = n;
     while (cur !== expressionRoot) {
         for (const sib of leftSiblings(cur, parents)) {
-            if (subtreeHasInterferingEffect(sib, namesToCheck, parents)) return true;
+            if (subtreeHasInterferingEffect(sib, slotsToCheck, table, parents)) return true;
         }
         const info = parents.get(cur);
         if (info === undefined) return false;
@@ -318,7 +395,8 @@ function checkPreExpressions(
 
 function subtreeHasInterferingEffect(
     n: t.Node,
-    namesToCheck: Set<string>,
+    slotsToCheck: Set<number>,
+    table: LocalVariableTable,
     parents: ParentMap,
 ): boolean {
     let yes = false;
@@ -332,17 +410,19 @@ function subtreeHasInterferingEffect(
             yes = true;
             return;
         }
-        if (
-            t.isAssignmentExpression(m) &&
-            t.isIdentifier(m.left) &&
-            namesToCheck.has(m.left.name)
-        ) {
-            yes = true;
-            return;
+        if (t.isAssignmentExpression(m) && t.isIdentifier(m.left)) {
+            const s = table.resolve(m.left);
+            if (s !== undefined && slotsToCheck.has(s)) {
+                yes = true;
+                return;
+            }
         }
-        if (t.isUpdateExpression(m) && t.isIdentifier(m.argument) && namesToCheck.has(m.argument.name)) {
-            yes = true;
-            return;
+        if (t.isUpdateExpression(m) && t.isIdentifier(m.argument)) {
+            const s = table.resolve(m.argument);
+            if (s !== undefined && slotsToCheck.has(s)) {
+                yes = true;
+                return;
+            }
         }
         if (t.isUnaryExpression(m) && m.operator === 'delete') {
             yes = true;
@@ -368,10 +448,11 @@ function subtreeHasInterferingEffect(
 
 function nodeHasInterferingEffect(
     cfgValue: t.Node,
-    namesToCheck: Set<string>,
+    slotsToCheck: Set<number>,
+    table: LocalVariableTable,
     parents: ParentMap,
 ): boolean {
-    return subtreeHasInterferingEffect(cfgValue, namesToCheck, parents);
+    return subtreeHasInterferingEffect(cfgValue, slotsToCheck, table, parents);
 }
 
 // ---------------------------------------------------------------------------
@@ -427,14 +508,15 @@ function isWriteContext(id: t.Identifier, parent: t.Node): boolean {
     return false;
 }
 
-function countNameUsesInCfgNode(
+function countSlotUsesInCfgNode(
     cfgValue: t.Node,
-    name: string,
+    slot: number,
+    table: LocalVariableTable,
     parents: ParentMap,
 ): number {
     let count = 0;
     forEachIdentifierRead(cfgValue, parents, (id) => {
-        if (id.name === name) count++;
+        if (table.resolve(id) === slot) count++;
     });
     return count;
 }
@@ -479,8 +561,8 @@ function areAdjacentSiblings(
 // ---------------------------------------------------------------------------
 // performInline
 
-function performInline(c: Candidate, parents: ParentMap): void {
-    const loc = locateDefExpr(c.def, c.name, parents);
+function performInline(c: Candidate, table: LocalVariableTable, parents: ParentMap): void {
+    const loc = locateDefExpr(c.def, c.slot, table, parents);
     if (loc === null) return;
     const rhs = loc.rhs;
 

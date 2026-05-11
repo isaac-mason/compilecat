@@ -1,24 +1,34 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
+import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
+import { traverse } from '../src/compiler/babel-interop';
 import { buildControlFlowGraph } from '../src/compiler/control-flow-analysis';
 import { runFlowSensitiveInlineVariables } from '../src/compiler/flow-sensitive-inline-variables';
 import { buildLocalVariableTable } from '../src/compiler/local-variable-table';
 
-function parseFn(code: string): t.FunctionDeclaration {
+function parseFn(code: string): { fn: t.FunctionDeclaration; path: NodePath<t.Function> } {
     const file = parse(code, { plugins: ['typescript'] });
     const stmt = file.program.body[0];
     if (!t.isFunctionDeclaration(stmt)) throw new Error('expected function declaration');
-    return stmt;
+    let path: NodePath<t.Function> | null = null;
+    traverse(file, {
+        FunctionDeclaration(p) {
+            if (path === null) path = p;
+            p.skip();
+        },
+    });
+    if (path === null) throw new Error('no function path');
+    return { fn: stmt, path };
 }
 
 function run(code: string): { code: string; inlined: number; ran: boolean } {
-    const fn = parseFn(code);
+    const { fn, path } = parseFn(code);
     const cfg = buildControlFlowGraph({ root: fn.body });
     if (cfg === null) return { code: gen(fn), inlined: 0, ran: false };
-    const table = buildLocalVariableTable(fn);
+    const table = buildLocalVariableTable(path);
     const r = runFlowSensitiveInlineVariables(fn, cfg, table);
     return { code: gen(fn), inlined: r.inlined, ran: r.ran };
 }
@@ -83,8 +93,46 @@ describe('FlowSensitiveInlineVariables', () => {
         expect(r.inlined).toBe(0);
     });
 
+    it('does not inline an outer def into an inner-block use of the same name', () => {
+        // Regression for binding-identity: the outer `var x = p + 1` and the
+        // inner-block `let x` are different bindings. Name-keyed analysis
+        // could (depending on impl) wrongly fold the outer RHS into the
+        // inner read, producing `sink(p + 1)`. With slot-keyed identity the
+        // inner read isn't a use of the outer slot, so no inline happens.
+        const r = run(
+            'function f(p) { var x = p + 1; { let x = 7; sink(x); } return x; }',
+        );
+        // The inner sink must read 7, not p + 1.
+        expect(r.code).toContain('sink(7)');
+    });
+
     it('bails when CFG construction bails (try/catch)', () => {
         const r = run('function f() { try { var x = 1; return x; } catch (e) {} }');
         expect(r.ran).toBe(false);
+    });
+
+    it('does not inline across a scope boundary (RHS reads block-let)', () => {
+        // Regression for the "out__pN_M" bug we hit in crashcat: the inliner used
+        // to substitute `_r = inner` followed by `return _r` outside the inner
+        // block, producing `return inner` — but `inner` is `let`-scoped to the
+        // block and out of scope at the return. Closure's
+        // FlowSensitiveInlineVariables.isRhsSafeToInline rejects this; we now
+        // mirror that.
+        //
+        // We give `inner` an impure init so it can't first be inlined into the
+        // `_r = inner` assignment. That forces the buggy substitution path.
+        const r = run(
+            `function f() {
+                let _r;
+                {
+                    let inner = compute();
+                    _r = inner;
+                }
+                return _r;
+            }`,
+        );
+        // `_r = inner` must NOT be inlined into `return inner` — `inner` is
+        // out of scope at the return.
+        expect(r.code).not.toMatch(/return inner/);
     });
 });

@@ -15,8 +15,8 @@
 //   - `arguments` reference  → escape all simple parameters
 //
 // Differs from Closure:
-//   - Variable identity is by NAME (we don't have Closure's Var with scope
-//     resolution). See LocalVariableTable.ts for the limitations.
+//   - Variable identity is by binding-slot — see local-variable-table.ts.
+//     Identifier nodes are resolved through the table at every use/def site.
 //   - No ON_EX edges in the v1 CFG, so the "conditional kill if can throw"
 //     bit collapses; we still respect short-circuit conditional contexts in
 //     expression sub-trees.
@@ -101,10 +101,7 @@ export function runLiveVariablesAnalysis(
         // Escaped locals are live-out at function exit.
         entry: () => {
             const l = newLattice(table);
-            for (const name of table.escaped) {
-                const idx = table.indexByName.get(name);
-                if (idx !== undefined) bsSet(l, idx);
-            }
+            for (const slot of table.escaped) bsSet(l, slot);
             return l;
         },
     };
@@ -224,23 +221,19 @@ function computeGenKill(
             // Treated upstream by buildLocalVariableTable as escape source.
             return;
         }
-        const idx = table.indexByName.get(n.name);
-        if (idx !== undefined && !table.escaped.has(n.name)) {
-            bsSet(gen, idx);
+        const slot = table.resolve(n);
+        if (slot !== undefined && !table.escaped.has(slot)) {
+            bsSet(gen, slot);
         }
         return;
     }
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             // Plain `x = expr` or `x += expr`.
-            if (!conditional) {
-                const idx = table.indexByName.get(n.left.name);
-                if (idx !== undefined && !table.escaped.has(n.left.name)) bsSet(kill, idx);
-            }
-            if (n.operator !== '=') {
-                // Compound assign reads x first.
-                const idx = table.indexByName.get(n.left.name);
-                if (idx !== undefined && !table.escaped.has(n.left.name)) bsSet(gen, idx);
+            const slot = table.resolve(n.left);
+            if (slot !== undefined && !table.escaped.has(slot)) {
+                if (!conditional) bsSet(kill, slot);
+                if (n.operator !== '=') bsSet(gen, slot); // compound reads x first
             }
             computeGenKill(n.right, table, gen, kill, conditional);
             return;
@@ -259,10 +252,10 @@ function computeGenKill(
     if (t.isUpdateExpression(n)) {
         // `x++` or `++x` — both read and write x.
         if (t.isIdentifier(n.argument)) {
-            const idx = table.indexByName.get(n.argument.name);
-            if (idx !== undefined && !table.escaped.has(n.argument.name)) {
-                bsSet(gen, idx);
-                if (!conditional) bsSet(kill, idx);
+            const slot = table.resolve(n.argument);
+            if (slot !== undefined && !table.escaped.has(slot)) {
+                bsSet(gen, slot);
+                if (!conditional) bsSet(kill, slot);
             }
             return;
         }
@@ -289,8 +282,8 @@ function addBindingsToKill(
 ): void {
     const visit = (n: t.Node) => {
         if (t.isIdentifier(n)) {
-            const idx = table.indexByName.get(n.name);
-            if (idx !== undefined && !table.escaped.has(n.name)) bsSet(kill, idx);
+            const slot = table.resolve(n);
+            if (slot !== undefined && !table.escaped.has(slot)) bsSet(kill, slot);
             return;
         }
         if (t.isAssignmentPattern(n)) {

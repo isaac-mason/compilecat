@@ -14,7 +14,13 @@ export type BlockMutateInput = {
     needsResult: boolean;
 };
 export type BlockMutateOutput = {
-    block: t.LabeledStatement;
+    /** Either a LabeledStatement (when interior returns force a `break LABEL;`
+     *  out of the inlined region) or a plain BlockStatement (when the only
+     *  return — if any — is the body's last statement and gets rewritten as a
+     *  fall-through assignment). Mirrors Closure's `replaceReturns` returning
+     *  a labelled wrapper only when `returnCount > 0` after handling the
+     *  trailing return. */
+    block: t.Statement;
     /** True when at least one return was rewritten — i.e. `_r` is initialized
      *  on at least one path. Caller may choose to declare `_r` only when this
      *  is true. */

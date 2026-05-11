@@ -1,10 +1,10 @@
 import { createUnplugin } from 'unplugin';
 import { parse } from '@babel/parser';
-import _traverse from '@babel/traverse';
 import * as t from '@babel/types';
+import _generate from '@babel/generator';
+import _traverse from '@babel/traverse';
 import * as fs from 'node:fs';
 import * as nodePath from 'node:path';
-import _generate from '@babel/generator';
 
 // Authored `@*` directive vocabulary, ported from src/plugin/analyses/directives.ts.
 // Standalone — no cross-tree imports. Same regex shapes so behavior matches.
@@ -25,6 +25,15 @@ function commentIsFlattenDirective(value) {
     return DIRECTIVE_PATTERNS.flatten.test(value) || DIRECTIVE_PATTERNS.optimize.test(value);
 }
 
+// Babel ships its packages as CJS with a `default` export. Under some
+// bundlers / loaders the ESM default-import lands as the function directly;
+// under others it lands as `{ default: fn }`. Centralised here so each
+// consumer just imports the unwrapped value.
+// biome-ignore lint/suspicious/noExplicitAny: interop shim
+const unwrap = (mod) => mod.default ?? mod;
+const generate = unwrap(_generate);
+const traverse = unwrap(_traverse);
+
 // Per-file index. Mirrors src/plugin/analyses/discover.ts; standalone — no
 // cross-tree imports. Surfaces the structural facts the cross-file inliner
 // needs:
@@ -36,8 +45,6 @@ function commentIsFlattenDirective(value) {
 //
 // Pure: parse + walk, no AST mutation. Re-invoke after mutations invalidate
 // the previous index.
-// biome-ignore lint/suspicious/noExplicitAny: babel CJS interop
-const traverse$2 = _traverse.default ?? _traverse;
 const INLINE_PATTERN = DIRECTIVE_PATTERNS.inline;
 const FLATTEN_PATTERN = DIRECTIVE_PATTERNS.flatten;
 const OPTIMIZE_PATTERN = DIRECTIVE_PATTERNS.optimize;
@@ -193,7 +200,7 @@ function recordImports(decl, imports) {
 }
 function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast) {
     let rootPath = null;
-    traverse$2(ast, {
+    traverse(ast, {
         FunctionDeclaration(path) {
             if (path.node.id?.name === fn.name) {
                 rootPath = path;
@@ -474,11 +481,90 @@ function isLoop(node) {
         t.isForOfStatement(node));
 }
 /**
+ * Port of NodeUtil.isStatementBlock (NodeUtil.java:2170):
+ *   return n.isRoot() || n.isScript() || n.isBlock() || n.isModuleBody();
+ *
+ * Babel has no ROOT or MODULE_BODY token — Program covers both.
+ */
+function isStatementBlock(n) {
+    return t.isProgram(n) || t.isBlockStatement(n);
+}
+/**
+ * Port of NodeUtil.canMergeBlock (NodeUtil.java:2516):
+ *
+ *   for (Node c = block.getFirstChild(); c != null; c = c.getNext()) {
+ *     switch (c.getToken()) {
+ *       case LABEL -> {
+ *         if (canMergeBlock(c)) continue; else return false;
+ *       }
+ *       case CONST, LET, CLASS, FUNCTION -> { return false; }
+ *       default -> { continue; }
+ *     }
+ *   }
+ *   return true;
+ *
+ * Babel mapping:
+ *   LABEL    → LabeledStatement
+ *   CONST    → VariableDeclaration with kind === 'const'
+ *   LET      → VariableDeclaration with kind === 'let'
+ *   CLASS    → ClassDeclaration
+ *   FUNCTION → FunctionDeclaration
+ *
+ * Closure's recursive `canMergeBlock(c)` on a LABEL iterates the LABEL's
+ * children — label name (NAME, default branch) plus the labeled statement
+ * (which falls into one of the cases). The LabeledStatement node in Babel
+ * has a single body slot; we replicate the same semantics by inspecting it.
+ */
+function canMergeBlock(block) {
+    for (const c of block.body) {
+        if (!canMergeBlockChild(c))
+            return false;
+    }
+    return true;
+}
+function canMergeBlockChild(c) {
+    if (t.isLabeledStatement(c)) {
+        // Closure recurses into the LABEL — its children are the label name
+        // (always safe) and the labeled statement (must itself be safe).
+        return canMergeBlockChild(c.body);
+    }
+    if (t.isVariableDeclaration(c) && (c.kind === 'const' || c.kind === 'let'))
+        return false;
+    if (t.isClassDeclaration(c))
+        return false;
+    if (t.isFunctionDeclaration(c))
+        return false;
+    return true;
+}
+/**
+ * Port of NodeUtil.tryMergeBlock (NodeUtil.java:2490):
+ *
+ *   boolean canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
+ *   if (isStatementBlock(parent) && canMerge) {
+ *     // splice block's children up into parent in-place; detach block
+ *     return true;
+ *   }
+ *   return false;
+ *
+ * Babel doesn't expose Closure's child-pointer API, so the caller passes the
+ * parent statement array and the index of the block within it; we splice
+ * directly. Returns the number of statements spliced in (== the block's
+ * child count) when the merge happened, or 0 when it was rejected.
+ */
+function tryMergeBlock(block, parentBody, indexInParent, parent, ignoreBlockScopedDeclarations) {
+    const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
+    if (!isStatementBlock(parent) || !canMerge)
+        return 0;
+    const inserted = block.body.length;
+    parentBody.splice(indexInParent, 1, ...block.body);
+    return inserted;
+}
+/**
  * Closure's `isLiteralValue` — recognises primitive literal nodes used by
  * dataflow / fold passes. The `includeFunctions` flag matches Closure's
  * second-arg convention.
  */
-function isLiteralValue(node, includeFunctions) {
+function isLiteralValue$1(node, includeFunctions) {
     if (t.isStringLiteral(node) ||
         t.isNumericLiteral(node) ||
         t.isBooleanLiteral(node) ||
@@ -490,11 +576,251 @@ function isLiteralValue(node, includeFunctions) {
     if (t.isTemplateLiteral(node) && node.expressions.length === 0)
         return true;
     if (t.isUnaryExpression(node) && node.operator === 'void') {
-        return isLiteralValue(node.argument);
+        return isLiteralValue$1(node.argument);
     }
     if (t.isFunction(node))
         return true;
     return false;
+}
+// ---------------------------------------------------------------------------
+// Operator precedence (mirrors Closure's NodeUtil.precedence). Higher is
+// tighter binding. Used by MinimizedCondition cost estimation and by the
+// peephole `if(c)foo()` → `c&&foo()` decision (we only do the rewrite when
+// the parens cost is favourable).
+const AND_PRECEDENCE = 6;
+function precedence(node) {
+    if (t.isSequenceExpression(node))
+        return 1;
+    if (t.isAssignmentExpression(node) || t.isYieldExpression(node))
+        return 2;
+    if (t.isConditionalExpression(node))
+        return 3;
+    if (t.isLogicalExpression(node)) {
+        switch (node.operator) {
+            case '??': return 4;
+            case '||': return 5;
+            case '&&': return 6;
+        }
+    }
+    if (t.isBinaryExpression(node)) {
+        switch (node.operator) {
+            case '|': return 7;
+            case '^': return 8;
+            case '&': return 9;
+            case '==':
+            case '!=':
+            case '===':
+            case '!==': return 10;
+            case '<':
+            case '<=':
+            case '>':
+            case '>=':
+            case 'in':
+            case 'instanceof': return 11;
+            case '<<':
+            case '>>':
+            case '>>>': return 12;
+            case '+':
+            case '-': return 13;
+            case '*':
+            case '/':
+            case '%': return 14;
+            case '**': return 15;
+        }
+    }
+    if (t.isUnaryExpression(node))
+        return 16;
+    if (t.isUpdateExpression(node))
+        return node.prefix ? 16 : 17;
+    if (t.isCallExpression(node) || t.isOptionalCallExpression(node))
+        return 18;
+    if (t.isMemberExpression(node) ||
+        t.isOptionalMemberExpression(node) ||
+        t.isNewExpression(node))
+        return 19;
+    return 20;
+}
+// ---------------------------------------------------------------------------
+// Structural AST equality (subset). Mirrors Closure's `isEquivalentTo` /
+// `areNodesEqualForInlining` enough for peephole decisions: identifier name,
+// literal value, and recursive structural compare across the node types our
+// passes touch. Returns false for anything we don't recognize — conservative.
+function areNodesEqual(a, b) {
+    if (a.type !== b.type)
+        return false;
+    if (t.isIdentifier(a) && t.isIdentifier(b))
+        return a.name === b.name;
+    if (t.isNumericLiteral(a) && t.isNumericLiteral(b))
+        return a.value === b.value;
+    if (t.isStringLiteral(a) && t.isStringLiteral(b))
+        return a.value === b.value;
+    if (t.isBooleanLiteral(a) && t.isBooleanLiteral(b))
+        return a.value === b.value;
+    if (t.isNullLiteral(a) && t.isNullLiteral(b))
+        return true;
+    if (t.isThisExpression(a) && t.isThisExpression(b))
+        return true;
+    if (t.isReturnStatement(a) && t.isReturnStatement(b)) {
+        const ax = a.argument;
+        const bx = b.argument;
+        if (ax === null && bx === null)
+            return true;
+        if (ax === null || bx === null)
+            return false;
+        if (ax === undefined && bx === undefined)
+            return true;
+        if (ax === undefined || bx === undefined)
+            return false;
+        return areNodesEqual(ax, bx);
+    }
+    if (t.isThrowStatement(a) && t.isThrowStatement(b)) {
+        return areNodesEqual(a.argument, b.argument);
+    }
+    if (t.isExpressionStatement(a) && t.isExpressionStatement(b)) {
+        return areNodesEqual(a.expression, b.expression);
+    }
+    if (t.isBreakStatement(a) && t.isBreakStatement(b)) {
+        const al = a.label;
+        const bl = b.label;
+        if (!al && !bl)
+            return true;
+        if (!al || !bl)
+            return false;
+        return al.name === bl.name;
+    }
+    if (t.isContinueStatement(a) && t.isContinueStatement(b)) {
+        const al = a.label;
+        const bl = b.label;
+        if (!al && !bl)
+            return true;
+        if (!al || !bl)
+            return false;
+        return al.name === bl.name;
+    }
+    if (t.isBlockStatement(a) && t.isBlockStatement(b)) {
+        const bb = b;
+        if (a.body.length !== bb.body.length)
+            return false;
+        for (let i = 0; i < a.body.length; i++) {
+            if (!areNodesEqual(a.body[i], bb.body[i]))
+                return false;
+        }
+        return true;
+    }
+    if (t.isMemberExpression(a) && t.isMemberExpression(b)) {
+        if (a.computed !== b.computed)
+            return false;
+        return areNodesEqual(a.object, b.object) && areNodesEqual(a.property, b.property);
+    }
+    if (t.isBinaryExpression(a) && t.isBinaryExpression(b)) {
+        if (a.operator !== b.operator)
+            return false;
+        if (t.isPrivateName(a.left) || t.isPrivateName(b.left))
+            return false;
+        return areNodesEqual(a.left, b.left) && areNodesEqual(a.right, b.right);
+    }
+    if (t.isLogicalExpression(a) && t.isLogicalExpression(b)) {
+        if (a.operator !== b.operator)
+            return false;
+        return areNodesEqual(a.left, b.left) && areNodesEqual(a.right, b.right);
+    }
+    if (t.isUnaryExpression(a) && t.isUnaryExpression(b)) {
+        if (a.operator !== b.operator)
+            return false;
+        return areNodesEqual(a.argument, b.argument);
+    }
+    if (t.isConditionalExpression(a) && t.isConditionalExpression(b)) {
+        return (areNodesEqual(a.test, b.test) &&
+            areNodesEqual(a.consequent, b.consequent) &&
+            areNodesEqual(a.alternate, b.alternate));
+    }
+    if (t.isCallExpression(a) && t.isCallExpression(b)) {
+        if (a.arguments.length !== b.arguments.length)
+            return false;
+        if (!t.isExpression(a.callee) || !t.isExpression(b.callee))
+            return false;
+        if (!areNodesEqual(a.callee, b.callee))
+            return false;
+        for (let i = 0; i < a.arguments.length; i++) {
+            const aa = a.arguments[i];
+            const bb = b.arguments[i];
+            if (!t.isExpression(aa) || !t.isExpression(bb))
+                return false;
+            if (!areNodesEqual(aa, bb))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+/** Read `parent[key]` without losing exhaustiveness on the concrete type. */
+function getSlot(parent, key) {
+    return parent[key];
+}
+/** Write `parent[key]` (or `parent[key][index]` if `index` provided). */
+function setSlot(parent, key, index, value) {
+    const obj = parent;
+    if (index !== undefined)
+        obj[key][index] = value;
+    else
+        obj[key] = value;
+}
+
+// Port of jscomp/base/Tri.java — three-valued logic.
+//
+// TRUE / FALSE behave as ordinary booleans; UNKNOWN is "could be either", so
+// every operation that returns a definite Tri must yield the same result for
+// both substitutions of UNKNOWN.
+const TRI_FALSE = -1;
+const TRI_UNKNOWN = 0;
+const TRI_TRUE = 1;
+function triNot(a) {
+    return -a;
+}
+function triToBoolean(a, fallback) {
+    if (a === TRI_TRUE)
+        return true;
+    if (a === TRI_FALSE)
+        return false;
+    return fallback;
+}
+// ---------------------------------------------------------------------------
+// Boolean coercion of an AST node, ignoring side effects.
+//
+// Used by PeepholeMinimizeConditions when massaging boolean contexts. Closure
+// folds these through `NodeUtil.getBooleanValue` + a side-effect gate.
+function getBooleanValue(n) {
+    if (t.isBooleanLiteral(n))
+        return n.value ? TRI_TRUE : TRI_FALSE;
+    if (t.isNumericLiteral(n))
+        return n.value !== 0 ? TRI_TRUE : TRI_FALSE;
+    if (t.isStringLiteral(n))
+        return n.value.length > 0 ? TRI_TRUE : TRI_FALSE;
+    if (t.isNullLiteral(n))
+        return TRI_FALSE;
+    if (t.isIdentifier(n) && n.name === 'undefined')
+        return TRI_FALSE;
+    if (t.isIdentifier(n) && n.name === 'NaN')
+        return TRI_FALSE;
+    if (t.isIdentifier(n) && n.name === 'Infinity')
+        return TRI_TRUE;
+    if (t.isUnaryExpression(n) && n.operator === 'void')
+        return TRI_FALSE;
+    if (t.isUnaryExpression(n) && n.operator === '!')
+        return triNot(getBooleanValue(n.argument));
+    if (t.isObjectExpression(n))
+        return TRI_TRUE;
+    if (t.isArrayExpression(n))
+        return TRI_TRUE;
+    if (t.isFunction(n))
+        return TRI_TRUE;
+    if (t.isRegExpLiteral(n))
+        return TRI_TRUE;
+    if (t.isTemplateLiteral(n) && n.expressions.length === 0) {
+        const cooked = n.quasis[0]?.value.cooked ?? '';
+        return cooked.length > 0 ? TRI_TRUE : TRI_FALSE;
+    }
+    return TRI_UNKNOWN;
 }
 
 // Port of jscomp/AstAnalyzer.java (subset — purity / side-effect predicate).
@@ -524,8 +850,19 @@ function isLiteralValue(node, includeFunctions) {
 function mayHaveSideEffects(node) {
     return !isPure(node);
 }
+/**
+ * Closure's `getSideEffectFreeBooleanValue` — returns the boolean value the
+ * expression would evaluate to (as a Tri) but only when the expression has no
+ * side effects; UNKNOWN otherwise. Used in cond rewriting to gate moves like
+ * `x || true → true` (only safe when `x` is pure).
+ */
+function getSideEffectFreeBooleanValue(node) {
+    if (mayHaveSideEffects(node))
+        return TRI_UNKNOWN;
+    return getBooleanValue(node);
+}
 function isPure(node) {
-    if (isLiteralValue(node))
+    if (isLiteralValue$1(node))
         return true;
     if (t.isIdentifier(node))
         return true;
@@ -595,6 +932,302 @@ function isPure(node) {
     return false;
 }
 
+// Port of jscomp/FunctionArgumentInjector.java (subset).
+//
+// Decides which (param, arg) pairs at an inlined call site can be substituted
+// directly into the body and which require a temporary `let X = arg;` binding.
+// Direct substitution avoids emitting the prologue and (in the common case
+// where every arg substitutes) the surrounding wrapper block as well.
+//
+// Rules (mirror Closure's gatherCallArgumentsNeedingTemps):
+//   1. Param reassigned in body → needs temp (would change semantics if
+//      substituted: the outer arg expression would be the LHS of an assign).
+//   2. Arg side-effect-free AND param has 0 references → no temp (drop arg).
+//   3. Arg has side effects → needs temp (must evaluate exactly once).
+//   4. Arg may create fresh mutable state (object/array literal, `new`) AND
+//      param has > 0 references → needs temp (otherwise the body would
+//      observe a fresh object per use, breaking identity).
+//   5. Arg has > 1 references in body — duplicate the arg expression?
+//      - Identifier / literal → no temp (cheap, value-stable for our subset).
+//      - anything else → needs temp (cost / side-effect risk).
+//   6. Otherwise (single reference, side-effect-free, simple arg) → no temp.
+//
+// Cascade: if any param P needs a temp, every param BEFORE P in declaration
+// order also needs a temp. This preserves the original left-to-right
+// evaluation order of the call's argument list — the temp prologue runs
+// `let pN = argN` in declaration order, so any earlier arg with side effects
+// must run first via its own temp.
+//
+// Limitations / departures from Closure:
+//   - No `this` handling. Caller (function-injector.ts) rejects calls that
+//     read `this`.
+//   - No `arguments` handling. Same.
+//   - No CodingConvention.isExported check. We assume Identifier args don't
+//     alias an exported global mutated mid-body — which is the common case
+//     and what compilecat's directive-gated inliner targets.
+//   - Trivial-body fast path (Closure's `isTrivialBody`) not ported — its
+//     net effect is to allow more substitutions, never to forbid one. The
+//     base rules already handle our hot cases.
+/**
+ * Find every parameter (by name) that is reassigned anywhere in the body.
+ * Reassignment includes `=`, compound assigns (`+=` etc.), `++`/`--`, and
+ * destructuring writes. Property writes (`out[0] = ...`, `out.x = ...`) are
+ * NOT reassignments — they mutate the referent, not the binding.
+ */
+function gatherModifiedParameters(body, paramNames) {
+    const out = new Set();
+    if (paramNames.size === 0)
+        return out;
+    t.traverseFast(body, (n) => {
+        if (t.isAssignmentExpression(n) && t.isIdentifier(n.left) && paramNames.has(n.left.name)) {
+            out.add(n.left.name);
+            return;
+        }
+        if (t.isUpdateExpression(n) &&
+            t.isIdentifier(n.argument) &&
+            paramNames.has(n.argument.name)) {
+            out.add(n.argument.name);
+            return;
+        }
+        // Conservative: any destructuring pattern targeting a param counts as
+        // a reassignment. We don't currently allow destructuring params on the
+        // callee side, but a caller-side destructuring assign that writes to
+        // the param name (post-alpha-rename, unlikely) would still trip this.
+        if (t.isArrayPattern(n) || t.isObjectPattern(n)) {
+            t.traverseFast(n, (m) => {
+                if (t.isIdentifier(m) && paramNames.has(m.name))
+                    out.add(m.name);
+            });
+        }
+    });
+    return out;
+}
+function gatherCallArgumentsNeedingTemps(body, paramNames, args, modifiedParameters) {
+    const needsTemp = new Set(modifiedParameters);
+    if (paramNames.length === 0)
+        return { needsTemp };
+    // Reference counts per param across the body. Identifier reads only —
+    // declaration-id contexts (var/function/etc.) are excluded.
+    const refCounts = countParamReferences(body, paramNames);
+    // Walk in declaration order; track the highest-position param that needs
+    // a temp so we can apply the cascade afterward.
+    let cascadeIndex = -1;
+    for (let i = 0; i < paramNames.length; i++) {
+        const name = paramNames[i];
+        const arg = args[i];
+        const refs = refCounts.get(name) ?? 0;
+        if (needsTemp.has(name)) {
+            cascadeIndex = i;
+            continue;
+        }
+        if (arg === undefined)
+            continue; // missing arg — caller handles default
+        const requires = paramNeedsTemp(arg, refs);
+        if (requires) {
+            needsTemp.add(name);
+            cascadeIndex = i;
+        }
+    }
+    // Cascade: every param at index <= cascadeIndex needs a temp.
+    if (cascadeIndex >= 0) {
+        for (let i = 0; i <= cascadeIndex; i++)
+            needsTemp.add(paramNames[i]);
+    }
+    return { needsTemp };
+}
+function paramNeedsTemp(arg, refCount) {
+    const argSideEffects = mayHaveSideEffects(arg);
+    // Rule 2: side-effect-free + unused → drop.
+    if (!argSideEffects && refCount === 0)
+        return false;
+    // Rule 3: side effects must be evaluated exactly once.
+    if (argSideEffects)
+        return true;
+    // Rule 4: fresh mutable state (object/array/regex/new) — substituting
+    // would create a new instance per use, observably different from the
+    // original (single-instance) semantics.
+    if (createsMutableState(arg) && refCount > 0)
+        return true;
+    // Rules 5 & 6: side-effect-free, no mutable state. Single ref always
+    // safe; multi-ref safe if arg is cheap and value-stable.
+    if (refCount <= 1)
+        return false;
+    return !isCheapToDuplicate(arg);
+}
+function createsMutableState(arg) {
+    return (t.isObjectExpression(arg) ||
+        t.isArrayExpression(arg) ||
+        t.isRegExpLiteral(arg) ||
+        t.isNewExpression(arg) ||
+        t.isFunctionExpression(arg) ||
+        t.isArrowFunctionExpression(arg) ||
+        t.isClassExpression(arg));
+}
+function isCheapToDuplicate(arg) {
+    if (t.isIdentifier(arg))
+        return true;
+    if (t.isNullLiteral(arg) || t.isBooleanLiteral(arg))
+        return true;
+    if (t.isNumericLiteral(arg) || t.isBigIntLiteral(arg))
+        return true;
+    if (t.isStringLiteral(arg))
+        return arg.value.length < 2;
+    return false;
+}
+function countParamReferences(body, paramNames) {
+    const set = new Set(paramNames);
+    const counts = new Map();
+    for (const n of paramNames)
+        counts.set(n, 0);
+    const visit = (n, parent, key) => {
+        if (t.isIdentifier(n) && set.has(n.name) && parent !== null && isReferenceContext$2(parent, key)) {
+            counts.set(n.name, (counts.get(n.name) ?? 0) + 1);
+        }
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child === null || child === undefined)
+                continue;
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c)
+                        visit(c, n, k);
+                }
+            }
+            else {
+                visit(child, n, k);
+            }
+        }
+    };
+    visit(body, null, '');
+    return counts;
+}
+/**
+ * Substitute each Identifier reference matching a key in `replacements` with
+ * a deep clone of the corresponding expression. Mirrors Closure's
+ * FunctionArgumentInjector.inject — declaration-id contexts and nested-scope
+ * shadowing are respected.
+ */
+function injectArguments(body, replacements) {
+    if (replacements.size === 0)
+        return;
+    const visit = (n, active) => {
+        if (active.size === 0)
+            return;
+        // Function creates a new scope. Filter shadowed names.
+        if (t.isFunction(n)) {
+            const filtered = new Map(active);
+            for (const p of n.params)
+                collectParamNames$1(p, (pn) => filtered.delete(pn));
+            if ((t.isFunctionExpression(n) || t.isFunctionDeclaration(n)) && n.id) {
+                filtered.delete(n.id.name);
+            }
+            if (filtered.size === 0)
+                return;
+            descend(n, filtered);
+            return;
+        }
+        // Block scope — filter let/const/class/function-decl names.
+        if (t.isBlockStatement(n)) {
+            const filtered = filterByBlockDecls$1(active, n);
+            if (filtered.size === 0)
+                return;
+            descend(n, filtered);
+            return;
+        }
+        descend(n, active);
+    };
+    const descend = (n, active) => {
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child === null || child === undefined)
+                continue;
+            if (Array.isArray(child)) {
+                for (let i = 0; i < child.length; i++) {
+                    const c = child[i];
+                    if (!c)
+                        continue;
+                    if (t.isIdentifier(c) &&
+                        active.has(c.name) &&
+                        isReferenceContext$2(n, k)) {
+                        const sub = t.cloneNode(active.get(c.name), true);
+                        setSlot(n, k, i, sub);
+                    }
+                    else {
+                        visit(c, active);
+                    }
+                }
+            }
+            else {
+                if (t.isIdentifier(child) &&
+                    active.has(child.name) &&
+                    isReferenceContext$2(n, k)) {
+                    const sub = t.cloneNode(active.get(child.name), true);
+                    setSlot(n, k, undefined, sub);
+                }
+                else {
+                    visit(child, active);
+                }
+            }
+        }
+    };
+    descend(body, replacements);
+}
+function collectParamNames$1(p, drop) {
+    if (t.isIdentifier(p))
+        drop(p.name);
+    else if (t.isAssignmentPattern(p))
+        collectParamNames$1(p.left, drop);
+    else if (t.isRestElement(p))
+        collectParamNames$1(p.argument, drop);
+}
+function filterByBlockDecls$1(active, block) {
+    let filtered = null;
+    for (const s of block.body) {
+        if (t.isVariableDeclaration(s)) {
+            for (const d of s.declarations) {
+                if (t.isIdentifier(d.id) && active.has(d.id.name)) {
+                    filtered ??= new Map(active);
+                    filtered.delete(d.id.name);
+                }
+            }
+        }
+        else if (t.isFunctionDeclaration(s) && s.id && active.has(s.id.name)) {
+            filtered ??= new Map(active);
+            filtered.delete(s.id.name);
+        }
+        else if (t.isClassDeclaration(s) && s.id && active.has(s.id.name)) {
+            filtered ??= new Map(active);
+            filtered.delete(s.id.name);
+        }
+    }
+    return filtered ?? active;
+}
+function isReferenceContext$2(parent, key) {
+    if (t.isVariableDeclarator(parent) && key === 'id')
+        return false;
+    if (t.isFunctionDeclaration(parent) && key === 'id')
+        return false;
+    if (t.isFunctionExpression(parent) && key === 'id')
+        return false;
+    if (t.isClassDeclaration(parent) && key === 'id')
+        return false;
+    if (t.isClassExpression(parent) && key === 'id')
+        return false;
+    if (t.isLabeledStatement(parent) && key === 'label')
+        return false;
+    if (t.isBreakStatement(parent) && key === 'label')
+        return false;
+    if (t.isContinueStatement(parent) && key === 'label')
+        return false;
+    if (t.isMemberExpression(parent) && key === 'property' && !parent.computed)
+        return false;
+    if (t.isObjectProperty(parent) && key === 'key' && !parent.computed)
+        return false;
+    if (t.isObjectMethod(parent) && key === 'key' && !parent.computed)
+        return false;
+    return true;
+}
+
 // Port of jscomp/FunctionToBlockMutator.java (subset).
 //
 // Given a callee function body and the arguments at a call site, produce a
@@ -622,24 +1255,130 @@ function isPure(node) {
 //   - All free names assumed unique to caller (caller-side α-rename if not).
 function mutateForBlockInline(input) {
     const { body, params, args, label, resultName, needsResult } = input;
-    // 1. Build the parameter-binding prologue. We bind each param to its arg
-    //    via a `let` declaration. Closure does scalar substitution where safe;
-    //    we punt and always bind, leaving redundant binds for the simplifier
-    //    to clean up.
+    // 1. Decide which params need a `let X = arg;` temp vs. direct
+    //    substitution. Mirrors Closure's FunctionArgumentInjector. The common
+    //    case for compilecat's library inlines is a callee like
+    //    `function f(out) { out[0] = ...; ... }` invoked as `f(targetArr)` —
+    //    `out`'s arg is a simple Identifier, so it substitutes directly and
+    //    the prologue ends up empty.
+    const paramSet = new Set(params);
+    const modified = gatherModifiedParameters(body, paramSet);
+    const argsForClassify = params.map((_, i) => args[i] ?? undefinedExpr());
+    const { needsTemp } = gatherCallArgumentsNeedingTemps(body, params, argsForClassify, modified);
+    // 2. Substitute non-temp params directly into the body. Each substituted
+    //    arg gets cloned per use by injectArguments.
+    const replacements = new Map();
+    for (let i = 0; i < params.length; i++) {
+        const name = params[i];
+        if (needsTemp.has(name))
+            continue;
+        replacements.set(name, argsForClassify[i]);
+    }
+    injectArguments(body, replacements);
+    // 3. Build the prologue for the params that DO need a temp.
     const prologue = [];
     for (let i = 0; i < params.length; i++) {
-        const arg = args[i] ?? t.identifier('undefined');
-        prologue.push(t.variableDeclaration('let', [t.variableDeclarator(t.identifier(params[i]), arg)]));
+        const name = params[i];
+        if (!needsTemp.has(name))
+            continue;
+        prologue.push(t.variableDeclaration('let', [
+            t.variableDeclarator(t.identifier(name), argsForClassify[i]),
+        ]));
     }
-    // 2. Rewrite returns inside the cloned body.
+    // 4. Closure's `replaceReturns` (FunctionToBlockMutator.java:408) special-
+    //    cases a trailing `return X;` — the function's last statement. That
+    //    return falls through naturally, so it can be rewritten as a plain
+    //    assignment (or expression statement) with no `break LABEL;` needed.
+    //    If no other returns remain after that rewrite, the labeled wrapper
+    //    can be dropped entirely and the inlined region is just a BlockStatement
+    //    that the simplifier will flatten into the parent.
     let hasResultWrite = false;
-    rewriteReturns(body, label, resultName, needsResult, () => {
+    const onWrite = () => {
         hasResultWrite = true;
-    });
-    // 3. Wrap [...prologue, ...body.body] in a block, then label it.
-    const block = t.blockStatement([...prologue, ...body.body]);
-    const labeled = t.labeledStatement(t.identifier(label), block);
-    return { block: labeled, hasResultWrite };
+    };
+    const hasReturnAtExit = endsWithReturn(body);
+    const interiorReturns = countShallowReturns(body) - (hasReturnAtExit ? 1 : 0);
+    if (hasReturnAtExit) {
+        const last = body.body[body.body.length - 1];
+        const replacement = makeTrailingReturnReplacement(last.argument, resultName, needsResult, onWrite);
+        body.body.splice(body.body.length - 1, 1, ...replacement);
+    }
+    // Port of FunctionToBlockMutator.java:447-450 (addDummyAssignment): when a
+    // result is required but the body has no return-at-exit, append
+    // `_r = void 0;` so `_r` is initialized on every fall-through path. Without
+    // this, downstream reads of `_r` could observe a previous BLOCK-inline's
+    // value when the function falls off the end.
+    if (needsResult && !hasReturnAtExit) {
+        body.body.push(t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), undefinedExpr())));
+        hasResultWrite = true;
+    }
+    if (interiorReturns > 0) {
+        rewriteReturns(body, label, resultName, needsResult, onWrite);
+        const block = t.blockStatement([...prologue, ...body.body]);
+        const labeled = t.labeledStatement(t.identifier(label), block);
+        return { block: labeled, hasResultWrite };
+    }
+    return {
+        block: t.blockStatement([...prologue, ...body.body]),
+        hasResultWrite,
+    };
+}
+/** Closure's `NodeUtil.newUndefinedNode` — `void 0`. Shadow-proof and one
+ *  byte shorter than `undefined`. */
+function undefinedExpr() {
+    return t.unaryExpression('void', t.numericLiteral(0));
+}
+function countShallowReturns(root) {
+    let count = 0;
+    const walk = (n) => {
+        if (t.isFunction(n))
+            return;
+        if (t.isReturnStatement(n))
+            count++;
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child === null || child === undefined)
+                continue;
+            if (Array.isArray(child)) {
+                for (const c of child)
+                    if (c)
+                        walk(c);
+            }
+            else {
+                walk(child);
+            }
+        }
+    };
+    for (const k of t.VISITOR_KEYS[root.type] ?? []) {
+        const child = getSlot(root, k);
+        if (child === null || child === undefined)
+            continue;
+        if (Array.isArray(child)) {
+            for (const c of child)
+                if (c)
+                    walk(c);
+        }
+        else {
+            walk(child);
+        }
+    }
+    return count;
+}
+function endsWithReturn(body) {
+    const last = body.body[body.body.length - 1];
+    return last !== undefined && t.isReturnStatement(last);
+}
+function makeTrailingReturnReplacement(arg, resultName, needsResult, onWrite) {
+    if (needsResult) {
+        const rhs = arg ?? undefinedExpr();
+        onWrite();
+        return [
+            t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), rhs)),
+        ];
+    }
+    if (arg && hasSideEffects(arg))
+        return [t.expressionStatement(arg)];
+    return [];
 }
 // ---------------------------------------------------------------------------
 // Return rewriter.
@@ -655,50 +1394,45 @@ function rewriteReturns(root, label, resultName, needsResult, onWrite) {
             return;
         // Process children first; then handle this node.
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c) {
+                    if (c)
                         walk(c, n, k, i);
-                    }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k);
             }
         }
         if (t.isReturnStatement(n)) {
             const replacement = makeReturnReplacement(n.argument, label, resultName, needsResult, onWrite);
             if (index !== undefined) {
-                // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-                const arr = parent[key];
+                const arr = getSlot(parent, key);
                 arr.splice(index, 1, ...replacement);
             }
             else {
                 // ReturnStatement under a non-array slot (e.g. IfStatement.consequent).
                 // Wrap replacement in a BlockStatement so the slot accepts it.
-                // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-                parent[key] = t.blockStatement(replacement);
+                setSlot(parent, key, undefined, t.blockStatement(replacement));
             }
         }
     };
     for (const k of t.VISITOR_KEYS[root.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = root[k];
+        const child = getSlot(root, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     walk(c, root, k, i);
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             walk(child, root, k);
         }
     }
@@ -706,7 +1440,7 @@ function rewriteReturns(root, label, resultName, needsResult, onWrite) {
 function makeReturnReplacement(arg, label, resultName, needsResult, onWrite) {
     const out = [];
     if (needsResult) {
-        const rhs = arg ?? t.identifier('undefined');
+        const rhs = arg ?? undefinedExpr();
         out.push(t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), rhs)));
         onWrite();
     }
@@ -738,9 +1472,19 @@ function hasSideEffects(n) {
 //
 // BLOCK is the general path: emit a labeled block that binds params, runs
 // the (cloned) body with returns rewritten via FunctionToBlockMutator, and
-// stores the value in a `_r_<n>` temp. The call expression is replaced by
-// `_r_<n>`; the labeled block is hoisted to a sibling statement before the
-// callsite's enclosing statement.
+// stores the value in a `_<callee>__result_<n>` temp. The call expression is
+// replaced by that temp; the labeled block is hoisted to a sibling statement
+// before the callsite's enclosing statement.
+//
+// Generated names follow Closure's `JSCompiler_inline_*` convention with a
+// `_compilecat_` prefix on the label (which is globally findable) and a
+// shorter callee-prefixed shape on the result temp (local to one function):
+//   - label:  `_compilecat_inline_label_<callee>_<n>` (callee elided if anon)
+//   - result: `_<callee>__result_<n>` (anon: `_result_<n>`)
+//   - param:  unchanged in the common case. Renamed to `<orig>__<callee>`
+//             (anon: `<orig>__<n>`) only when an arg expression references
+//             `<orig>` as an identifier (the `let x = x.method();` shadow
+//             class). Normalize bumps further with `__N` on actual collision.
 //
 // Limitations (v1):
 //   - No `this` rewriting — we reject method calls and `this` references.
@@ -748,9 +1492,6 @@ function hasSideEffects(n) {
 //   - No try/catch / generator / async / await / yield in body.
 //   - No destructuring / rest / default params on the callee.
 //   - Caller passes already-cloned body + args to keep ownership simple.
-// Babel CJS default-export interop.
-// biome-ignore lint/suspicious/noExplicitAny: interop shim
-const generate$1 = _generate.default ?? _generate;
 function classifyCallee(fn) {
     if (fn.async)
         return { mode: 'NO', reason: 'async' };
@@ -782,72 +1523,30 @@ function classifyCallee(fn) {
     return { mode: 'BLOCK' };
 }
 function bodyReadsThisOrArguments(body) {
-    let found = false;
-    const visit = (n) => {
-        if (found || !n)
-            return;
+    return t.traverseFast(body, (n) => {
+        // Non-arrow functions get their own `this` / `arguments`.
         if (t.isFunction(n) && !t.isArrowFunctionExpression(n))
-            return; // own this
-        if (t.isThisExpression(n)) {
-            found = true;
-            return;
-        }
-        if (t.isIdentifier(n) && n.name === 'arguments') {
-            found = true;
-            return;
-        }
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child);
-            }
-        }
-    };
-    visit(body);
-    return found;
+            return t.traverseFast.skip;
+        if (t.isThisExpression(n))
+            return t.traverseFast.stop;
+        if (t.isIdentifier(n) && n.name === 'arguments')
+            return t.traverseFast.stop;
+        return undefined;
+    });
 }
 function bodyHasUnsupportedConstruct(body) {
-    let found = false;
-    const visit = (n) => {
-        if (found || !n)
-            return;
+    return t.traverseFast(body, (n) => {
         if (t.isTryStatement(n) ||
             t.isWithStatement(n) ||
             t.isYieldExpression(n) ||
             t.isAwaitExpression(n)) {
-            found = true;
-            return;
+            return t.traverseFast.stop;
         }
         // Don't descend into nested functions — their try/yield is fine.
         if (t.isFunction(n))
-            return;
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child);
-            }
-        }
-    };
-    visit(body);
-    return found;
+            return t.traverseFast.skip;
+        return undefined;
+    });
 }
 // ---------------------------------------------------------------------------
 // Splice — DIRECT.
@@ -956,7 +1655,10 @@ function inlineBlock(callee, site, options) {
     if (args.length > callee.paramNames.length)
         return false;
     const id = options.nextId();
-    const label = `_inline_${id}`;
+    const cn = calleeName(callee.fn);
+    const label = cn === null
+        ? `_compilecat_inline_label_${id}`
+        : `_compilecat_inline_label_${cn}_${id}`;
     // Clone body and args.
     const clonedBody = t.cloneNode(fn.body, true);
     const clonedArgs = [];
@@ -966,17 +1668,33 @@ function inlineBlock(callee, site, options) {
             ? t.identifier('undefined')
             : t.cloneNode(a, true));
     }
-    // Alpha-rename params to fresh names so they can never collide with outer-scope
-    // free vars referenced in args. Without this, inlining `insertLeaf(dbvt, ...)`
-    // inside `add(dbvt, ...)` emits `let dbvt = dbvt;` (TDZ + later DAE strips the
-    // init, leaving `let dbvt;` shadowing the outer dbvt with undefined).
+    // Conditional alpha-rename. Rename a param P only when some arg references
+    // P as an identifier — otherwise the prologue `let P = arg;` would emit
+    // `let P = …P…;` and the RHS read would resolve to the new inner binding
+    // (TDZ on let; pre-FunctionArgumentInjector this surfaced as `let dbvt =
+    // dbvt;` inlining `ins(dbvt, ...)` inside `add(dbvt, ...)`).
+    //
+    // When we do rename, use `<orig>__<callee>` (or `<orig>__<inlineId>` for
+    // anon callees) so the suffix carries meaning. Normalize handles any
+    // collision afterward via its standard `__N` retry — but the common case
+    // doesn't rename at all, leaving the original parameter names intact in
+    // the bundle.
+    const argFreeNames = new Set();
+    for (const a of clonedArgs)
+        collectIdentifierNames(a, argFreeNames);
     const freshParams = [];
     const renames = new Map();
     for (let i = 0; i < callee.paramNames.length; i++) {
         const orig = callee.paramNames[i];
-        const fresh = `${orig}$p${id}_${i}`;
-        freshParams.push(fresh);
-        renames.set(orig, fresh);
+        if (argFreeNames.has(orig)) {
+            const suffix = cn === null ? String(id) : cn;
+            const fresh = `${orig}__${suffix}`;
+            freshParams.push(fresh);
+            renames.set(orig, fresh);
+        }
+        else {
+            freshParams.push(orig);
+        }
     }
     if (renames.size > 0)
         renameInBody(clonedBody, renames);
@@ -990,11 +1708,18 @@ function inlineBlock(callee, site, options) {
         shape = { kind: 'expression' };
     }
     // Decide resultName + needsResult per shape.
+    // Callee-prefixed shape (`_<callee>__result_<n>`) reads as "the value of
+    // X" in the bundle. Anonymous callee → `_result_<n>`. The result temp is
+    // local to one function; we don't need the `_compilecat_` global prefix
+    // that the label carries.
+    const fallbackResult = cn === null
+        ? `_result_${id}`
+        : `_${cn}__result_${id}`;
     let resultName;
     let needsResult;
     switch (shape.kind) {
         case 'statement':
-            resultName = `_r_${id}`; // unused
+            resultName = fallbackResult; // unused
             needsResult = false;
             break;
         case 'init':
@@ -1003,7 +1728,7 @@ function inlineBlock(callee, site, options) {
             needsResult = true;
             break;
         case 'expression':
-            resultName = `_r_${id}`;
+            resultName = fallbackResult;
             needsResult = true;
             break;
     }
@@ -1044,8 +1769,9 @@ function inlineBlock(callee, site, options) {
             return true;
         }
         case 'expression': {
-            // Hoist `let _r_<n>;` and the labeled block before the enclosing
-            // statement; replace the call with `_r_<n>`.
+            // Hoist `let _<callee>__result_<n>;` and the labeled
+            // block before the enclosing statement; replace the call with the
+            // result temp.
             const tempDecl = t.variableDeclaration('let', [
                 t.variableDeclarator(t.identifier(resultName)),
             ]);
@@ -1063,7 +1789,7 @@ function inlineBlock(callee, site, options) {
  * tree's `breadcrumbFor` in `src/plugin/transforms/inline.ts`.
  */
 function breadcrumbFor(call) {
-    const src = generate$1(t.cloneNode(call, true, false), {
+    const src = generate(t.cloneNode(call, true, false), {
         concise: true,
         comments: false,
         retainLines: false,
@@ -1072,6 +1798,40 @@ function breadcrumbFor(call) {
 }
 function tagInlined(node, sig) {
     t.addComment(node, 'leading', ` @applied-inline ${sig} `);
+}
+// Collect identifier names that appear in `expr`. Conservative: returns every
+// identifier in a value-bearing position (skips non-computed member/object
+// property keys, which are syntactic labels rather than references). Used by
+// the conditional-rename check — false positives only cause an unnecessary
+// rename, never a missed one.
+function collectIdentifierNames(expr, out) {
+    const walk = (n, parent, key) => {
+        if (!n || typeof n !== 'object' || !('type' in n))
+            return;
+        if (t.isIdentifier(n)) {
+            if (parent && t.isMemberExpression(parent) && key === 'property' && !parent.computed)
+                return;
+            if (parent && t.isOptionalMemberExpression(parent) && key === 'property' && !parent.computed)
+                return;
+            if (parent && (t.isObjectProperty(parent) || t.isObjectMethod(parent)) && key === 'key' && !parent.computed)
+                return;
+            out.add(n.name);
+            return;
+        }
+        for (const k of Object.keys(n)) {
+            if (k === 'type' || k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments' || k === 'extra')
+                continue;
+            const v = n[k];
+            if (Array.isArray(v)) {
+                for (const item of v)
+                    walk(item, n, k);
+            }
+            else if (v && typeof v === 'object' && 'type' in v) {
+                walk(v, n, k);
+            }
+        }
+    };
+    walk(expr, null, '');
 }
 // True iff `name` appears as a free read in `body` (not shadowed by a nested
 // scope, not in a write/key context, not equal to one of the post-rename param
@@ -1121,7 +1881,7 @@ function bodyHasFreeRefTo(body, name, paramNames) {
             t.isIdentifier(n) &&
             n.name === name &&
             parent !== null &&
-            isReferenceContext(parent, key)) {
+            isReferenceContext$1(parent, key)) {
             found = true;
             return;
         }
@@ -1129,17 +1889,16 @@ function bodyHasFreeRefTo(body, name, paramNames) {
     };
     const descend = (n, shadowed) => {
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         walk(c, n, k, shadowed);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k, shadowed);
             }
         }
@@ -1157,45 +1916,20 @@ function allArgsExpressions(args) {
     return true;
 }
 function replaceCall(site, replacement) {
-    if (site.callIndex !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = site.callParent[site.callKey];
-        arr[site.callIndex] = replacement;
-    }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        site.callParent[site.callKey] = replacement;
-    }
+    setSlot(site.callParent, site.callKey, site.callIndex, replacement);
 }
 function countParamUses(root, params) {
     const counts = new Map();
     for (const p of params)
         counts.set(p, 0);
-    const visit = (n) => {
-        if (!n)
-            return;
+    t.traverseFast(root, (n) => {
         if (t.isFunction(n))
-            return; // shadowed
+            return t.traverseFast.skip; // shadowed
         if (t.isIdentifier(n) && counts.has(n.name)) {
             counts.set(n.name, (counts.get(n.name) ?? 0) + 1);
         }
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child);
-            }
-        }
-    };
-    visit(root);
+        return undefined;
+    });
     return counts;
 }
 // Scope-aware identifier rename across a body. For each Identifier reference
@@ -1233,29 +1967,23 @@ function renameInBody(body, renames) {
     };
     const descend = (n, active) => {
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
-                for (let i = 0; i < child.length; i++) {
-                    const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c) {
-                        if (t.isIdentifier(c) &&
-                            active.has(c.name) &&
-                            isReferenceContext(n, k)) {
-                            c.name = active.get(c.name);
-                        }
-                        else {
-                            visit(c, active);
-                        }
+                for (const c of child) {
+                    if (!c)
+                        continue;
+                    if (t.isIdentifier(c) && active.has(c.name) && isReferenceContext$1(n, k)) {
+                        c.name = active.get(c.name);
+                    }
+                    else {
+                        visit(c, active);
                     }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
-                if (t.isIdentifier(child) &&
-                    active.has(child.name) &&
-                    isReferenceContext(n, k)) {
+            else {
+                if (t.isIdentifier(child) && active.has(child.name) && isReferenceContext$1(n, k)) {
                     child.name = active.get(child.name);
                 }
                 else {
@@ -1296,7 +2024,7 @@ function filterByBlockDecls(active, block) {
     }
     return filtered ?? active;
 }
-function isReferenceContext(parent, key) {
+function isReferenceContext$1(parent, key) {
     if (t.isVariableDeclarator(parent) && key === 'id')
         return false;
     if (t.isFunctionDeclaration(parent) && key === 'id')
@@ -1322,10 +2050,8 @@ function isReferenceContext(parent, key) {
     return true;
 }
 function substituteIdentifiers(root, subs) {
-    // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
+    let rootReplacement = null;
     const visit = (n, parent, key, index) => {
-        if (!n || typeof n !== 'object')
-            return;
         if (t.isFunction(n))
             return; // shadowed
         if (t.isIdentifier(n) && subs.has(n.name)) {
@@ -1334,34 +2060,39 @@ function substituteIdentifiers(root, subs) {
             // would mean we're rewriting params, which our classifier rejects
             // for v1 (parameter mutation in callee → BLOCK or NO).
             const sub = t.cloneNode(subs.get(n.name), true);
-            if (parent !== null) {
-                if (index !== undefined)
-                    parent[key][index] = sub;
-                else
-                    parent[key] = sub;
-            }
+            if (parent === null)
+                rootReplacement = sub;
+            else
+                setSlot(parent, key, index, sub);
             return;
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c, n, k, i);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child, n, k);
+            else {
+                visit(child, n, k, undefined);
             }
         }
     };
-    // Wrap root in a holder so we can substitute it directly.
-    const holder = { value: root };
-    visit(holder.value, holder, 'value');
-    return holder.value;
+    visit(root, null, '', undefined);
+    return rootReplacement ?? root;
+}
+// Best-effort callee name for embedding in generated label names. Returns
+// null for arrow / anonymous function expressions; the caller emits the
+// shorter `_compilecat_inline_label_<id>` shape in that case.
+function calleeName(fn) {
+    if ((t.isFunctionDeclaration(fn) || t.isFunctionExpression(fn)) && fn.id) {
+        return fn.id.name;
+    }
+    return null;
 }
 
 // Port of jscomp/InlineFunctions.java (subset).
@@ -1592,19 +2323,17 @@ function collectCallSites(root, candidates, xfile) {
             }
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c) {
+                    if (c)
                         walk(c, n, k, i, nextStmtCtx);
-                    }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k, undefined, nextStmtCtx);
             }
         }
@@ -1973,18 +2702,17 @@ function visit$1(root, fn) {
     const walk = (n, parent, key, index) => {
         fn(n, parent, key, index);
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         walk(c, n, k, i);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k);
             }
         }
@@ -2018,8 +2746,6 @@ function visitWithParents(root, fn) {
 // We rely on Babel's scope analysis — `path.scope.getBinding(name)` —
 // instead of porting `ReferenceCollector`. Iterates to fixpoint because
 // inlining one variable can make another's reference count drop to 1.
-// biome-ignore lint/suspicious/noExplicitAny: babel CJS interop
-const traverse$1 = _traverse.default ?? _traverse;
 function inlineVariables(ast) {
     let total = 0;
     while (true) {
@@ -2032,7 +2758,7 @@ function inlineVariables(ast) {
 }
 function sweep$1(ast) {
     let inlined = 0;
-    traverse$1(ast, {
+    traverse(ast, {
         // Force a scope rebuild — our previous round's mutations may have
         // changed reference counts.
         Program(path) {
@@ -2193,8 +2919,7 @@ function useIsInsideLoopOutOfDef(defPath, usePath) {
     return false;
 }
 
-// Loop unrolling — directive-driven (no Closure analogue, but a natural fit
-// alongside the simplifier's other directives).
+// Loop unrolling — directive-driven (no Closure analogue).
 //
 // Replaces an opt-in `@unroll` loop with a flat sequence of its body, one
 // copy per iteration, with the loop variable substituted by its concrete
@@ -2416,19 +3141,16 @@ function bodyHasUnsafeControlFlow(body) {
             nl = true;
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c) {
-                        if (walk(c, nl, nf))
-                            return true;
-                    }
+                    if (c && walk(c, nl, nf))
+                        return true;
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 if (walk(child, nl, nf))
                     return true;
             }
@@ -2469,33 +3191,31 @@ function substitute(n, varName, replacement, shadowed) {
 }
 function descend(n, varName, replacement, shadowed) {
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[k];
+        const child = getSlot(n, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c) {
-                    if (!shadowed &&
-                        t.isIdentifier(c) &&
-                        c.name === varName &&
-                        isReadContext(n, k)) {
-                        child[i] = t.cloneNode(replacement, true);
-                    }
-                    else {
-                        substitute(c, varName, replacement, shadowed);
-                    }
+                if (!c)
+                    continue;
+                if (!shadowed &&
+                    t.isIdentifier(c) &&
+                    c.name === varName &&
+                    isReadContext(n, k)) {
+                    child[i] = t.cloneNode(replacement, true);
+                }
+                else {
+                    substitute(c, varName, replacement, shadowed);
                 }
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             if (!shadowed &&
                 t.isIdentifier(child) &&
                 child.name === varName &&
                 isReadContext(n, k)) {
-                // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-                n[k] = t.cloneNode(replacement, true);
+                setSlot(n, k, undefined, t.cloneNode(replacement, true));
             }
             else {
                 substitute(child, varName, replacement, shadowed);
@@ -2587,17 +3307,16 @@ function walkStatementLists(root, cb) {
             cb(n.body, optimizeStack[optimizeStack.length - 1]);
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child);
             }
         }
@@ -2613,6 +3332,301 @@ function hasOptimizeAnnotation(n) {
             return true;
     }
     return false;
+}
+
+// Port of jscomp/Normalize.java + jscomp/MakeDeclaredNamesUnique.java
+// (ContextualRenamer subset).
+//
+// Two-stage pass mirroring Closure's NormalizeStatements + ContextualRenamer:
+//
+//   1. Structural normalizations (Closure NormalizeStatements):
+//      - Rewrite blockless arrow function bodies to block-with-return
+//        (Normalize.java:387-397). Downstream analyses can then assume every
+//        function body is a BlockStatement.
+//      - Split multi-declarator var/let/const into one statement per
+//        declarator (Normalize.java:645-661). Lets DAE / flow-inline / fold
+//        treat each binding independently.
+//      - Hoist for-loop initializers out of the loop header
+//        (Normalize.java:558-632). `for (var a=0; …)` →
+//        `var a=0; for (; …)`. Frees the CFG builder from special-casing
+//        for-init liveness. Skipped for `let`/`const`/`class`/`function`
+//        per-iteration block-scoped semantics.
+//
+//   2. Renaming (ContextualRenamer):
+//      Every locally-declared name is uniquified across the whole program.
+//      After this pass, downstream passes (block-flatten, let→var lowering)
+//      can act on the assumption that hoisting a binding out of an inner
+//      block can never collide with another binding — the assumption Closure
+//      encodes via NodeUtil.tryMergeBlock's `ignoreBlockScopedDeclarations`
+//      flag passed as `isASTNormalized()`.
+//
+// Algorithm (mirrors ContextualRenamer in MakeDeclaredNamesUnique.java:683):
+//
+//   - Maintain a shared `nameUsage` Map<string, count> for the whole file —
+//     tracks how many times each base name has been declared anywhere.
+//   - Walk every scope top-down. For each binding declared directly in the
+//     scope:
+//       * If scope is the file's program (global) → reserve name as-is.
+//         Closure leaves global names unchanged so external references stay
+//         valid.
+//       * Otherwise → increment count for the base name. If new count is 1
+//         (first occurrence anywhere) keep the name; if > 1 generate
+//         `name__<id>` and reserve. If the generated name itself
+//         collides, retry with an incremented id (mirrors Closure's
+//         `while (nameUsage.contains(newName))` retry loop).
+//   - Use Babel's `scope.rename(oldName, newName)` to update the binding and
+//     every reference atomically. Babel's scope analysis handles the
+//     reference-following Closure does manually via its renamer stack.
+//
+// Departures from Closure:
+//   - We rely on Babel scope analysis instead of porting Closure's
+//     ScopedCallback + Renamer-stack machinery. The semantic outcome is the
+//     same: every local binding is uniquely named after the pass.
+//   - `ARGUMENTS` is irrelevant — Babel doesn't surface it as a binding.
+//   - No `assertOnChange` / `markChanges` modes — those are Closure
+//     pass-management concerns.
+//
+// Marker:
+//   The exported `markFileNormalized` / `isFileNormalized` pair lets later
+//   passes check `isASTNormalized()`-equivalent state. Backed by a WeakSet
+//   keyed on the File node.
+// Closure's literal constant is `$jscomp$` (MakeDeclaredNamesUnique.java:697).
+// We diverge intentionally for readability: double-underscore is shorter,
+// reads as a "compiler-generated" marker in any JS code, and avoids `$` so
+// the suffix can't be visually mistaken for template-literal `${…}` syntax.
+// User code rarely contains `foo__1`; the collision-retry loop in
+// `pickReplacement` covers the rare case where it does.
+const UNIQUE_ID_SEPARATOR = '__';
+const NORMALIZED = new WeakSet();
+function isFileNormalized(file) {
+    return NORMALIZED.has(file);
+}
+function markFileNormalized(file) {
+    NORMALIZED.add(file);
+}
+function makeDeclaredNamesUnique(file) {
+    // Stage 1: structural normalizations. These run before the rename pass so
+    // that the rename pass sees the post-split / post-hoist binding shape (and
+    // so that scope.crawl picks up bindings hoisted out of for-headers).
+    structuralNormalize(file);
+    const nameUsage = new Map();
+    let renamed = 0;
+    // Reserve every name that appears at the program (global) scope first, so
+    // child scopes never pick a generated name that shadows a global.
+    traverse(file, {
+        Program(programPath) {
+            for (const name of Object.keys(programPath.scope.bindings)) {
+                reserveName(nameUsage, name);
+            }
+            programPath.skip();
+        },
+    });
+    // Then visit every nested scope top-down and rename collisions.
+    traverse(file, {
+        Scope(path) {
+            // The Program scope was handled above (names reserved, no rename).
+            if (path.isProgram())
+                return;
+            const bindings = path.scope.bindings;
+            for (const baseName of Object.keys(bindings)) {
+                const binding = bindings[baseName];
+                if (binding === undefined)
+                    continue;
+                // Only rename bindings owned by *this* scope. Babel surfaces
+                // some inherited entries on `bindings` only for the owning
+                // scope itself, but be defensive.
+                if (binding.scope !== path.scope)
+                    continue;
+                const newName = pickReplacement(nameUsage, baseName);
+                if (newName === null) {
+                    // First occurrence anywhere — keep the name, just count it.
+                    continue;
+                }
+                renameBinding(path, baseName, newName);
+                renamed++;
+            }
+        },
+    });
+    markFileNormalized(file);
+    return { renamed };
+}
+function reserveName(nameUsage, name) {
+    if ((nameUsage.get(name) ?? 0) < 1)
+        nameUsage.set(name, 1);
+}
+/** Returns the new name, or null if the base name is still free. */
+function pickReplacement(nameUsage, baseName) {
+    const prev = nameUsage.get(baseName) ?? 0;
+    nameUsage.set(baseName, prev + 1);
+    if (prev === 0) {
+        // First time we've seen this name anywhere — keep it as-is.
+        return null;
+    }
+    // Collision: produce `baseName__<id>`. If that itself collides
+    // (another scope already used or reserved that synthetic name), bump.
+    let id = prev;
+    let candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
+    while ((nameUsage.get(candidate) ?? 0) > 0) {
+        id++;
+        candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
+    }
+    nameUsage.set(candidate, 1);
+    // Keep the base counter consistent with the id we ultimately picked so
+    // the next collision starts from a higher number.
+    if (id > prev)
+        nameUsage.set(baseName, id + 1);
+    return candidate;
+}
+function renameBinding(path, oldName, newName) {
+    // Babel's scope.rename updates the binding identifier plus every
+    // reference to it within this scope. It also updates child scopes'
+    // bindings/references because they share the parent's reference set.
+    path.scope.rename(oldName, newName);
+}
+// ---------------------------------------------------------------------------
+// Structural normalizations.
+//
+// Mirrors Closure's NormalizeStatements callback (Normalize.java:215+).
+// Each helper is a literal port of the corresponding Java method; see
+// referenced line numbers.
+function structuralNormalize(file) {
+    // Two visitors so we don't have to coordinate insertions during traversal:
+    //   1. visitFunction — arrow→block (Normalize.java:387-397).
+    //   2. statementBlockPasses — split decls + extract for-init.
+    //
+    // Babel's traverse will revisit hoisted nodes appropriately; we use enter
+    // for arrow rewrite (so its body is then visited normally) and exit-time
+    // mutation for the others to avoid invalidating the iteration.
+    traverse(file, {
+        ArrowFunctionExpression(path) {
+            const node = path.node;
+            if (!t.isBlockStatement(node.body)) {
+                const body = node.body;
+                node.body = t.blockStatement([t.returnStatement(body)]);
+            }
+        },
+    });
+    // Split + for-init extraction. Closure runs both at the statement-block
+    // level (Normalize.java:404-416). We walk Program/BlockStatement bodies
+    // directly so we can splice without invalidating Babel paths.
+    //
+    // Closure also runs extractForInitializer when the parent is a LABEL
+    // (Normalize.java:407, isStatementBlock || isLabel). We handle that via
+    // the LabeledStatement visitor below — the hoisted var is inserted into
+    // the *grandparent* statement list, so we mutate via an enclosing
+    // wrapper-block rewrite when needed.
+    traverse(file, {
+        Program: { exit: (p) => normalizeStatementList(p.node.body) },
+        BlockStatement: { exit: (p) => normalizeStatementList(p.node.body) },
+    });
+    // Labeled-for: if a `LABEL: for (var i=0;…)` survives, the for is the
+    // label's only body. Wrap as `{ var i=0; LABEL: for (;…) }` only if the
+    // label's parent already is a statement-block — otherwise leave it alone
+    // (rare; semantics-preserving fallback).
+    traverse(file, {
+        LabeledStatement: {
+            exit(p) {
+                const node = p.node;
+                let extracted = null;
+                if (t.isForStatement(node.body)) {
+                    extracted = extractForInitializer(node.body);
+                }
+                else if (t.isForInStatement(node.body) || t.isForOfStatement(node.body)) {
+                    extracted = extractForInOfInitializer(node.body);
+                }
+                if (extracted === null)
+                    return;
+                const parent = p.parent;
+                const parentBody = parent.body;
+                if (Array.isArray(parentBody)) {
+                    const idx = parentBody.indexOf(node);
+                    if (idx >= 0) {
+                        parentBody.splice(idx, 0, extracted);
+                        return;
+                    }
+                }
+                // Fallback: replace label with `{ extracted; label }`.
+                p.replaceWith(t.blockStatement([extracted, node]));
+            },
+        },
+    });
+}
+/** Mirrors Closure's loop in `extractForInitializer` + `splitVarDeclarations`
+ *  applied to a single statement list (Normalize.java:558-661). Mutates the
+ *  list in place. */
+function normalizeStatementList(list) {
+    // Pass A — extract for-init. Closure runs this before splitVarDeclarations
+    // (Normalize.java:407-416) so the hoisted-out var-statement gets split in
+    // pass B if it's multi-declarator.
+    for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        if (t.isForStatement(s)) {
+            const inserted = extractForInitializer(s);
+            if (inserted !== null) {
+                list.splice(i, 0, inserted);
+                i++; // skip the just-inserted node
+            }
+        }
+        else if (t.isForInStatement(s) || t.isForOfStatement(s)) {
+            const inserted = extractForInOfInitializer(s);
+            if (inserted !== null) {
+                list.splice(i, 0, inserted);
+                i++;
+            }
+        }
+    }
+    // Pass B — split multi-declarator decls.
+    for (let i = 0; i < list.length; i++) {
+        const s = list[i];
+        if (!t.isVariableDeclaration(s))
+            continue;
+        if (s.declarations.length <= 1)
+            continue;
+        const split = s.declarations.map((d) => t.variableDeclaration(s.kind, [d]));
+        list.splice(i, 1, ...split);
+        i += split.length - 1;
+    }
+}
+/** Port of Normalize.java:604-628 (FOR case). Returns the new statement to
+ *  insert before the for, or null if no extraction. Mutates `loop.init`. */
+function extractForInitializer(loop) {
+    const init = loop.init;
+    if (init === null || init === undefined)
+        return null;
+    if (t.isVariableDeclaration(init)) {
+        // Closure skips block-scoped (let/const/class/function) initializers
+        // — their per-iteration semantics matter (Normalize.java:608-610).
+        if (init.kind !== 'var')
+            return null;
+        loop.init = null;
+        return init;
+    }
+    // Expression initializer — wrap in ExprStatement.
+    loop.init = null;
+    return t.expressionStatement(init);
+}
+/** Port of Normalize.java:566-602 (FOR_IN/FOR_OF case). Only handles
+ *  `for (var x in/of y)` → `var x; for (x in/of y);`. Returns the new
+ *  statement, or null if no extraction. Mutates `loop.left`. */
+function extractForInOfInitializer(loop) {
+    const left = loop.left;
+    if (!t.isVariableDeclaration(left))
+        return null;
+    if (left.kind !== 'var')
+        return null;
+    if (left.declarations.length !== 1)
+        return null;
+    const decl = left.declarations[0];
+    if (!t.isIdentifier(decl.id))
+        return null;
+    // Closure clones the name into the for-head and inserts the original VAR
+    // before the loop (Normalize.java:597-599). We do the same with a fresh
+    // Identifier.
+    loop.left = t.identifier(decl.id.name);
+    // Strip any initializer — semantically valid only on the rare
+    // `for (var x = 0 in obj)` legacy form (Babel parses it; we drop the
+    // initializer when hoisting since `for-in` doesn't initialize).
+    return t.variableDeclaration('var', [t.variableDeclarator(t.identifier(decl.id.name))]);
 }
 
 // Port of jscomp/RemoveUnusedCode.java (subset).
@@ -2639,8 +3653,6 @@ function hasOptimizeAnnotation(n) {
 // Babel already maintains references / constantViolations / kind, which is
 // what this pass consumes. Iterates to fixpoint because removing one
 // reference can make another binding unused.
-// biome-ignore lint/suspicious/noExplicitAny: babel CJS interop
-const traverse = _traverse.default ?? _traverse;
 function removeUnusedCode(ast) {
     const total = {
         removedDeclarators: 0,
@@ -2875,19 +3887,17 @@ function collectCandidates(root) {
             }
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c) {
+                    if (c)
                         walk(c, n, k, i, nextScope);
-                    }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k, undefined, nextScope);
             }
         }
@@ -2956,18 +3966,16 @@ function passesEscapeAnalysis(c) {
             }
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const cc of child) {
-                    if (cc && typeof cc === 'object' && 'type' in cc) {
+                    if (cc)
                         visit(cc, n, k);
-                    }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child, n, k);
             }
         }
@@ -3067,34 +4075,24 @@ function rewriteAccesses(root, safe) {
                     const idx = n.property.value;
                     if (idx >= 0 && idx < c.size && Number.isInteger(idx)) {
                         const replacement = t.identifier(`${c.name}_${idx}`);
-                        if (index !== undefined) {
-                            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-                            const arr = parent[key];
-                            arr[index] = replacement;
-                        }
-                        else {
-                            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-                            parent[key] = replacement;
-                        }
+                        setSlot(parent, key, index, replacement);
                     }
                     break;
                 }
             }
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c) {
+                    if (c)
                         visit(c, n, k, i);
-                    }
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child, n, k, undefined);
             }
         }
@@ -3387,7 +4385,7 @@ function buildControlFlowGraph(opts) {
         astPositionCounter: 0,
         shouldTraverseFunctions: opts.shouldTraverseFunctions ?? false,
     };
-    walk$3(cfa, opts.root, null);
+    walk$4(cfa, opts.root, null);
     // Implicit return is positioned last.
     cfa.astPosition.set(cfg.implicitReturn.value, cfa.astPositionCounter++);
     prioritize(cfa);
@@ -3431,17 +4429,16 @@ function walkBail(node, parent, visit) {
     if (!visit(node, parent))
         return;
     for (const key of t.VISITOR_KEYS[node.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const child = node[key];
+        const child = getSlot(node, key);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     walkBail(c, node, visit);
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             walkBail(child, node, visit);
         }
     }
@@ -3452,7 +4449,7 @@ function walkBail(node, parent, visit) {
 // For each node we visit we (a) record its astPosition, (b) descend into the
 // children we care about, and (c) on the way back up call the per-token
 // handler to emit edges.
-function walk$3(cfa, node, parent) {
+function walk$4(cfa, node, parent) {
     if (!shouldTraverseIntoChildren(cfa, node, parent)) {
         // Still record position for non-traversed children that are part of
         // the CFG (e.g. for-init / for-update appear as CFG nodes even though
@@ -3465,7 +4462,7 @@ function walk$3(cfa, node, parent) {
     ensurePosition(cfa, node);
     // Recurse into the children determined by the node type.
     for (const child of childrenToTraverse(node)) {
-        walk$3(cfa, child, node);
+        walk$4(cfa, child, node);
     }
     visit(cfa, node);
 }
@@ -3622,17 +4619,16 @@ function getParentMap(cfa) {
             if (parent !== null)
                 pm.set(n, parent);
             for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-                // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-                const child = n[key];
+                const child = getSlot(n, key);
                 if (child === null || child === undefined)
                     continue;
                 if (Array.isArray(child)) {
                     for (const c of child) {
-                        if (c && typeof c === 'object' && 'type' in c)
+                        if (c)
                             populate(c, n);
                     }
                 }
-                else if (typeof child === 'object' && 'type' in child) {
+                else {
                     populate(child, n);
                 }
             }
@@ -4169,8 +5165,8 @@ class UniqueQueue {
 //   - `arguments` reference  → escape all simple parameters
 //
 // Differs from Closure:
-//   - Variable identity is by NAME (we don't have Closure's Var with scope
-//     resolution). See LocalVariableTable.ts for the limitations.
+//   - Variable identity is by binding-slot — see local-variable-table.ts.
+//     Identifier nodes are resolved through the table at every use/def site.
 //   - No ON_EX edges in the v1 CFG, so the "conditional kill if can throw"
 //     bit collapses; we still respect short-circuit conditional contexts in
 //     expression sub-trees.
@@ -4228,11 +5224,8 @@ function runLiveVariablesAnalysis(cfg, table) {
         // Escaped locals are live-out at function exit.
         entry: () => {
             const l = newLattice(table);
-            for (const name of table.escaped) {
-                const idx = table.indexByName.get(name);
-                if (idx !== undefined)
-                    bsSet(l, idx);
-            }
+            for (const slot of table.escaped)
+                bsSet(l, slot);
             return l;
         },
     };
@@ -4338,25 +5331,21 @@ function computeGenKill(n, table, gen, kill, conditional) {
             // Treated upstream by buildLocalVariableTable as escape source.
             return;
         }
-        const idx = table.indexByName.get(n.name);
-        if (idx !== undefined && !table.escaped.has(n.name)) {
-            bsSet(gen, idx);
+        const slot = table.resolve(n);
+        if (slot !== undefined && !table.escaped.has(slot)) {
+            bsSet(gen, slot);
         }
         return;
     }
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             // Plain `x = expr` or `x += expr`.
-            if (!conditional) {
-                const idx = table.indexByName.get(n.left.name);
-                if (idx !== undefined && !table.escaped.has(n.left.name))
-                    bsSet(kill, idx);
-            }
-            if (n.operator !== '=') {
-                // Compound assign reads x first.
-                const idx = table.indexByName.get(n.left.name);
-                if (idx !== undefined && !table.escaped.has(n.left.name))
-                    bsSet(gen, idx);
+            const slot = table.resolve(n.left);
+            if (slot !== undefined && !table.escaped.has(slot)) {
+                if (!conditional)
+                    bsSet(kill, slot);
+                if (n.operator !== '=')
+                    bsSet(gen, slot); // compound reads x first
             }
             computeGenKill(n.right, table, gen, kill, conditional);
             return;
@@ -4376,29 +5365,27 @@ function computeGenKill(n, table, gen, kill, conditional) {
     if (t.isUpdateExpression(n)) {
         // `x++` or `++x` — both read and write x.
         if (t.isIdentifier(n.argument)) {
-            const idx = table.indexByName.get(n.argument.name);
-            if (idx !== undefined && !table.escaped.has(n.argument.name)) {
-                bsSet(gen, idx);
+            const slot = table.resolve(n.argument);
+            if (slot !== undefined && !table.escaped.has(slot)) {
+                bsSet(gen, slot);
                 if (!conditional)
-                    bsSet(kill, idx);
+                    bsSet(kill, slot);
             }
             return;
         }
     }
     // Default: walk children at the same conditional level.
     for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[key];
+        const child = getSlot(n, key);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c) {
+                if (c)
                     computeGenKill(c, table, gen, kill, conditional);
-                }
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             computeGenKill(child, table, gen, kill, conditional);
         }
     }
@@ -4406,9 +5393,9 @@ function computeGenKill(n, table, gen, kill, conditional) {
 function addBindingsToKill(pattern, table, kill) {
     const visit = (n) => {
         if (t.isIdentifier(n)) {
-            const idx = table.indexByName.get(n.name);
-            if (idx !== undefined && !table.escaped.has(n.name))
-                bsSet(kill, idx);
+            const slot = table.resolve(n);
+            if (slot !== undefined && !table.escaped.has(slot))
+                bsSet(kill, slot);
             return;
         }
         if (t.isAssignmentPattern(n)) {
@@ -4451,7 +5438,7 @@ function addBindingsToKill(pattern, table, kill) {
 //   - No `compiler.hasScopeChanged` filter — we always run.
 //   - `containsFunction` bailout: any nested function in the body skips the
 //     whole pass (closure capture). Closure does the same heuristic.
-//   - Variable identity by NAME (matches our LocalVariableTable).
+//   - Variable identity by binding-slot (table.resolve(idNode) → slot).
 //   - For inc/dec (UpdateExpression) we only replace inside an ExprStatement
 //     or a vanilla-for update slot; otherwise leave it alone (the value of
 //     `x++` itself can be observed by an outer expression).
@@ -4547,23 +5534,17 @@ function tryRemoveAssignment(ctx, n, exprRoot, state) {
     }
     // Default — walk children that don't enter a new CFG node.
     for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const child = n[key];
+        const child = getSlot(n, key);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (const c of child) {
-                if (c &&
-                    typeof c === 'object' &&
-                    'type' in c &&
-                    !isEnteringNewCfgNode(c, n)) {
+                if (c && !isEnteringNewCfgNode(c, n)) {
                     tryRemoveAssignment(ctx, c, exprRoot, state);
                 }
             }
         }
-        else if (typeof child === 'object' &&
-            'type' in child &&
-            !isEnteringNewCfgNode(child, n)) {
+        else if (!isEnteringNewCfgNode(child, n)) {
             tryRemoveAssignment(ctx, child, exprRoot, state);
         }
     }
@@ -4572,10 +5553,10 @@ function tryRemoveAssignment(ctx, n, exprRoot, state) {
 // handleAssignment — `x = expr` or `x op= expr` where `x` is an Identifier.
 function handleAssignment(ctx, n, exprRoot, state) {
     const lhs = n.left;
-    const idx = ctx.table.indexByName.get(lhs.name);
-    if (idx === undefined)
+    const slot = ctx.table.resolve(lhs);
+    if (slot === undefined)
         return;
-    if (ctx.table.escaped.has(lhs.name))
+    if (ctx.table.escaped.has(slot))
         return;
     // Identity assign `a = a` — always remove.
     if (n.operator === '=' &&
@@ -4585,10 +5566,10 @@ function handleAssignment(ctx, n, exprRoot, state) {
         ctx.removed++;
         return;
     }
-    if (isLive(state.out, idx))
+    if (isLive(state.out, slot))
         return;
-    if (isLive(state.in, idx) &&
-        isVariableStillLiveWithinExpression(ctx, n, exprRoot, lhs.name)) {
+    if (isLive(state.in, slot) &&
+        isVariableStillLiveWithinExpression(ctx, n, exprRoot, slot)) {
         // Live-in but live-out is false: this is the killing assignment, but
         // there's still a use to its right within the same expression. We
         // can't remove it without finer-grained analysis.
@@ -4610,12 +5591,12 @@ function handleAssignment(ctx, n, exprRoot, state) {
 // handleUpdate — `x++` / `--x`.
 function handleUpdate(ctx, n, _exprRoot, state) {
     const arg = n.argument;
-    const idx = ctx.table.indexByName.get(arg.name);
-    if (idx === undefined)
+    const slot = ctx.table.resolve(arg);
+    if (slot === undefined)
         return;
-    if (ctx.table.escaped.has(arg.name))
+    if (ctx.table.escaped.has(slot))
         return;
-    if (isLive(state.out, idx))
+    if (isLive(state.out, slot))
         return;
     const info = ctx.parents.get(n);
     if (info === undefined)
@@ -4657,23 +5638,23 @@ function handleVarInit(ctx, decl, d, exprRoot, state) {
         (t.isForInStatement(declParentInfo.parent) || t.isForOfStatement(declParentInfo.parent))) {
         return;
     }
-    const name = d.id.name;
-    const idx = ctx.table.indexByName.get(name);
-    if (idx === undefined)
+    const slot = ctx.table.resolve(d.id);
+    if (slot === undefined)
         return;
-    if (ctx.table.escaped.has(name))
+    if (ctx.table.escaped.has(slot))
         return;
     // Identity init `var a = a;` is meaningless and rare; treat as standard
     // assignment.
-    if (t.isIdentifier(d.init) && d.init.name === name) {
+    if (t.isIdentifier(d.init) &&
+        ctx.table.resolve(d.init) === slot) {
         d.init = null;
         ctx.removed++;
         return;
     }
-    if (isLive(state.out, idx))
+    if (isLive(state.out, slot))
         return;
-    if (isLive(state.in, idx) &&
-        isVariableStillLiveWithinExpression(ctx, decl, exprRoot, name)) {
+    if (isLive(state.in, slot) &&
+        isVariableStillLiveWithinExpression(ctx, decl, exprRoot, slot)) {
         return;
     }
     // Dead init. Closure hoists the RHS into a sibling ExpressionStatement so
@@ -4694,7 +5675,7 @@ var VLive;
     VLive[VLive["READ"] = 1] = "READ";
     VLive[VLive["KILL"] = 2] = "KILL";
 })(VLive || (VLive = {}));
-function isVariableStillLiveWithinExpression(ctx, n, exprRoot, variable) {
+function isVariableStillLiveWithinExpression(ctx, n, exprRoot, slot) {
     let cur = n;
     while (cur !== exprRoot) {
         const info = ctx.parents.get(cur);
@@ -4705,21 +5686,21 @@ function isVariableStillLiveWithinExpression(ctx, n, exprRoot, variable) {
         if (t.isLogicalExpression(parent)) {
             // OR / AND / ??: only the second operand depends on the first.
             if (cur === parent.left) {
-                state = isVariableReadBeforeKill(parent.right, variable);
+                state = isVariableReadBeforeKill(parent.right, slot, ctx);
                 if (state === VLive.KILL)
                     state = VLive.MAYBE_LIVE;
             }
         }
         else if (t.isConditionalExpression(parent)) {
             if (cur === parent.test) {
-                state = checkHookBranchReadBeforeKill(parent.consequent, parent.alternate, variable);
+                state = checkHookBranchReadBeforeKill(parent.consequent, parent.alternate, slot, ctx);
             }
             // If cur is consequent or alternate, the other branch can be
             // ignored; siblings don't apply.
         }
         else {
             for (const sibling of rightSiblings$1(parent, cur)) {
-                state = isVariableReadBeforeKill(sibling, variable);
+                state = isVariableReadBeforeKill(sibling, slot, ctx);
                 if (state !== VLive.MAYBE_LIVE)
                     break;
             }
@@ -4732,22 +5713,19 @@ function isVariableStillLiveWithinExpression(ctx, n, exprRoot, variable) {
     }
     return false;
 }
-function isVariableReadBeforeKill(n, variable) {
+function isVariableReadBeforeKill(n, slot, ctx) {
     if (isEnteringNewCfgNode(n, parentOfChild()))
         return VLive.MAYBE_LIVE;
-    if (t.isIdentifier(n) && n.name === variable) {
-        // We need to know whether this name is the LHS of an assign. The
-        // caller's iteration pattern feeds us nodes whose parent we don't
-        // have a generic way to inspect here without the parent map. We
-        // accept the slight conservatism: treat every identifier read as
-        // READ. Closure distinguishes simple-assign LHS (then evaluates RHS
-        // first to detect a still-live read inside the RHS), but in our v1
-        // we'd need to thread the parent map through; conservative is safe.
+    if (t.isIdentifier(n) && ctx.table.resolve(n) === slot) {
+        // Conservative: treat every identifier read as READ. Closure
+        // distinguishes simple-assign LHS (then evaluates RHS first to
+        // detect a still-live read inside the RHS), but conservative is
+        // safe here.
         return VLive.READ;
     }
     if (t.isLogicalExpression(n)) {
-        const v1 = isVariableReadBeforeKill(n.left, variable);
-        const v2 = isVariableReadBeforeKill(n.right, variable);
+        const v1 = isVariableReadBeforeKill(n.left, slot, ctx);
+        const v2 = isVariableReadBeforeKill(n.right, slot, ctx);
         if (v1 !== VLive.MAYBE_LIVE)
             return v1;
         if (v2 === VLive.READ)
@@ -4755,36 +5733,35 @@ function isVariableReadBeforeKill(n, variable) {
         return VLive.MAYBE_LIVE;
     }
     if (t.isConditionalExpression(n)) {
-        const first = isVariableReadBeforeKill(n.test, variable);
+        const first = isVariableReadBeforeKill(n.test, slot, ctx);
         if (first !== VLive.MAYBE_LIVE)
             return first;
-        return checkHookBranchReadBeforeKill(n.consequent, n.alternate, variable);
+        return checkHookBranchReadBeforeKill(n.consequent, n.alternate, slot, ctx);
     }
     for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const child = n[key];
+        const child = getSlot(n, key);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c) {
-                    const r = isVariableReadBeforeKill(c, variable);
-                    if (r !== VLive.MAYBE_LIVE)
-                        return r;
-                }
+                if (!c)
+                    continue;
+                const r = isVariableReadBeforeKill(c, slot, ctx);
+                if (r !== VLive.MAYBE_LIVE)
+                    return r;
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
-            const r = isVariableReadBeforeKill(child, variable);
+        else {
+            const r = isVariableReadBeforeKill(child, slot, ctx);
             if (r !== VLive.MAYBE_LIVE)
                 return r;
         }
     }
     return VLive.MAYBE_LIVE;
 }
-function checkHookBranchReadBeforeKill(a, b, variable) {
-    const v1 = isVariableReadBeforeKill(a, variable);
-    const v2 = isVariableReadBeforeKill(b, variable);
+function checkHookBranchReadBeforeKill(a, b, slot, ctx) {
+    const v1 = isVariableReadBeforeKill(a, slot, ctx);
+    const v2 = isVariableReadBeforeKill(b, slot, ctx);
     if (v1 === VLive.READ || v2 === VLive.READ)
         return VLive.READ;
     if (v1 === VLive.KILL && v2 === VLive.KILL)
@@ -4806,8 +5783,7 @@ function rightSiblings$1(parent, after) {
     const out = [];
     let seen = false;
     for (const key of t.VISITOR_KEYS[parent.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const child = parent[key];
+        const child = getSlot(parent, key);
         if (Array.isArray(child)) {
             for (const c of child) {
                 if (!seen) {
@@ -4815,14 +5791,14 @@ function rightSiblings$1(parent, after) {
                         seen = true;
                     continue;
                 }
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     out.push(c);
             }
         }
         else if (child === after) {
             seen = true;
         }
-        else if (seen && child && typeof child === 'object' && 'type' in child) {
+        else if (seen && child) {
             out.push(child);
         }
     }
@@ -4833,15 +5809,7 @@ function replaceInParent$1(ctx, n, replacement) {
     if (info === undefined)
         return;
     const { parent, key, index } = info;
-    if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const arr = parent[key];
-        arr[index] = replacement;
-    }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        parent[key] = replacement;
-    }
+    setSlot(parent, key, index, replacement);
     // Re-parent the replacement and any of its descendants we might revisit.
     populateParents(replacement, parent, key, index, ctx.parents);
 }
@@ -4852,8 +5820,7 @@ function insertAfter(ctx, anchor, inserted) {
     const { parent, key, index } = info;
     if (index === undefined)
         return; // anchor isn't in an array — can't insert sibling.
-    // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-    const arr = parent[key];
+    const arr = getSlot(parent, key);
     arr.splice(index + 1, 0, inserted);
     // Update parent map for shifted siblings.
     for (let i = index + 1; i < arr.length; i++) {
@@ -4869,18 +5836,17 @@ function buildParentMap$1(root) {
         if (parent !== null)
             map.set(n, { parent, key, index });
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         walk(c, n, k, i);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k, undefined);
             }
         }
@@ -4891,19 +5857,17 @@ function buildParentMap$1(root) {
 function populateParents(n, parent, key, index, map) {
     map.set(n, { parent, key, index });
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-        const child = n[k];
+        const child = getSlot(n, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c) {
+                if (c)
                     populateParents(c, n, k, i, map);
-                }
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             populateParents(child, n, k, undefined, map);
         }
     }
@@ -4911,32 +5875,11 @@ function populateParents(n, parent, key, index, map) {
 // ---------------------------------------------------------------------------
 // containsNestedFunction — Closure's bailout.
 function containsNestedFunction(fn) {
-    let found = false;
-    const walk = (n, atRoot) => {
-        if (found)
-            return;
-        if (!atRoot && t.isFunction(n)) {
-            found = true;
-            return;
-        }
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST access
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        walk(c, false);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                walk(child, false);
-            }
-        }
-    };
-    walk(fn, true);
-    return found;
+    return t.traverseFast(fn.body, (n) => {
+        if (t.isFunction(n))
+            return t.traverseFast.stop;
+        return undefined;
+    });
 }
 
 // Port of jscomp/graph/CheckPathsBetweenNodes.java
@@ -5038,6 +5981,9 @@ function checkSomePathsWithoutBackEdges(s, a) {
 // v removes v's set entirely (the prior value can no longer reach those uses
 // from this point). Reads add to the set.
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. Maps
+// here key by slot, not by name.
+//
 // Used by FlowSensitiveInlineVariables to check the "exactly one use of this
 // def" condition.
 function newReachingUses() {
@@ -5093,15 +6039,22 @@ function runMaybeReachingUse(cfg, table) {
             continue;
         snapshot.set(node, state.out);
     }
+    const getUsesAfterSlot = (slot, cfgNode) => {
+        const r = snapshot.get(cfgNode);
+        if (r === undefined)
+            return new Set();
+        return r.uses.get(slot) ?? new Set();
+    };
     return {
         ran: true,
         table,
         cfg,
-        getUsesAfter: (name, cfgNode) => {
-            const r = snapshot.get(cfgNode);
-            if (r === undefined)
+        getUsesAfterSlot,
+        getUsesAfter: (id, cfgNode) => {
+            const slot = table.resolve(id);
+            if (slot === undefined)
                 return new Set();
-            return r.uses.get(name) ?? new Set();
+            return getUsesAfterSlot(slot, cfgNode);
         },
     };
 }
@@ -5134,11 +6087,11 @@ function computeMayUse(n, out, conditional, table) {
         if (t.isVariableDeclaration(lhs)) {
             const last = lhs.declarations[lhs.declarations.length - 1];
             if (last && t.isIdentifier(last.id) && !conditional) {
-                killUse(last.id.name, out, table);
+                killUse(last.id, out, table);
             }
         }
         else if (t.isIdentifier(lhs) && !conditional) {
-            killUse(lhs.name, out, table);
+            killUse(lhs, out, table);
         }
         computeMayUse(n.right, out, conditional, table);
         return;
@@ -5176,7 +6129,7 @@ function computeMayUse(n, out, conditional, table) {
             if (t.isIdentifier(d.id)) {
                 if (d.init) {
                     if (!conditional)
-                        killUse(d.id.name, out, table);
+                        killUse(d.id, out, table);
                     computeMayUse(d.init, out, conditional, table);
                 }
             }
@@ -5189,10 +6142,10 @@ function computeMayUse(n, out, conditional, table) {
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             if (!conditional)
-                killUse(n.left.name, out, table);
+                killUse(n.left, out, table);
             // Compound assign reads x first.
             if (n.operator !== '=')
-                addUse(n.left.name, n.left, out, table);
+                addUse(n.left, out, table);
             computeMayUse(n.right, out, conditional, table);
             return;
         }
@@ -5205,53 +6158,53 @@ function computeMayUse(n, out, conditional, table) {
     if (t.isUpdateExpression(n)) {
         if (t.isIdentifier(n.argument)) {
             if (!conditional)
-                killUse(n.argument.name, out, table);
-            addUse(n.argument.name, n.argument, out, table);
+                killUse(n.argument, out, table);
+            addUse(n.argument, out, table);
             return;
         }
     }
     if (t.isIdentifier(n)) {
-        addUse(n.name, n, out, table);
+        addUse(n, out, table);
         return;
     }
     // Default: walk children in reverse order.
     const keys = t.VISITOR_KEYS[n.type] ?? [];
     for (let ki = keys.length - 1; ki >= 0; ki--) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[keys[ki]];
+        const child = getSlot(n, keys[ki]);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = child.length - 1; i >= 0; i--) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c) {
+                if (c)
                     computeMayUse(c, out, conditional, table);
-                }
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             computeMayUse(child, out, conditional, table);
         }
     }
 }
-function addUse(name, node, out, table) {
-    if (!table.indexByName.has(name))
+function addUse(id, out, table) {
+    const slot = table.resolve(id);
+    if (slot === undefined)
         return;
-    if (table.escaped.has(name))
+    if (table.escaped.has(slot))
         return;
-    let set = out.uses.get(name);
+    let set = out.uses.get(slot);
     if (set === undefined) {
         set = new Set();
-        out.uses.set(name, set);
+        out.uses.set(slot, set);
     }
-    set.add(node);
+    set.add(id);
 }
-function killUse(name, out, table) {
-    if (!table.indexByName.has(name))
+function killUse(id, out, table) {
+    const slot = table.resolve(id);
+    if (slot === undefined)
         return;
-    if (table.escaped.has(name))
+    if (table.escaped.has(slot))
         return;
-    out.uses.delete(name);
+    out.uses.delete(slot);
 }
 
 // Port of jscomp/MustBeReachingVariableDef.java
@@ -5274,6 +6227,9 @@ function killUse(name, out, table) {
 //                      \ | | /
 //                     (BOTTOM)
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. Maps
+// here key by slot, not by name; this is what makes shadowing correct.
+//
 // Used by FlowSensitiveInlineVariables.
 function newMustDef() {
     return { reachingDef: new Map() };
@@ -5283,8 +6239,8 @@ function cloneMustDef(d) {
 }
 function entryMustDef(table, fnRoot) {
     const m = newMustDef();
-    for (const name of table.indexByName.keys()) {
-        m.reachingDef.set(name, {
+    for (let slot = 0; slot < table.size; slot++) {
+        m.reachingDef.set(slot, {
             node: fnRoot,
             depends: new Set(),
             unknownDependencies: false,
@@ -5354,11 +6310,14 @@ function runMustReachingDef(fn, cfg, table) {
         ran: true,
         table,
         cfg,
-        getDef: (name, cfgNode) => {
+        getDef: (id, cfgNode) => {
             const m = snapshot.get(cfgNode);
             if (m === undefined)
                 return undefined;
-            return m.reachingDef.get(name);
+            const slot = table.resolve(id);
+            if (slot === undefined)
+                return undefined;
+            return m.reachingDef.get(slot);
         },
     };
 }
@@ -5390,11 +6349,11 @@ function computeMustDef(fn, n, cfgNode, out, conditional, table) {
         if (t.isVariableDeclaration(lhs)) {
             const last = lhs.declarations[lhs.declarations.length - 1];
             if (last && t.isIdentifier(last.id)) {
-                addToDefIfLocal(last.id.name, conditional ? null : cfgNode, n.right, out, table);
+                addToDefIfLocal(last.id, conditional ? null : cfgNode, n.right, out, table);
             }
         }
         else if (t.isIdentifier(lhs)) {
-            addToDefIfLocal(lhs.name, conditional ? null : cfgNode, n.right, out, table);
+            addToDefIfLocal(lhs, conditional ? null : cfgNode, n.right, out, table);
         }
         return;
     }
@@ -5427,7 +6386,7 @@ function computeMustDef(fn, n, cfgNode, out, conditional, table) {
         for (const d of n.declarations) {
             if (d.init && t.isIdentifier(d.id)) {
                 computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-                addToDefIfLocal(d.id.name, conditional ? null : cfgNode, d.init, out, table);
+                addToDefIfLocal(d.id, conditional ? null : cfgNode, d.init, out, table);
             }
             else if (d.init) {
                 computeMustDef(fn, d.init, cfgNode, out, conditional, table);
@@ -5438,7 +6397,7 @@ function computeMustDef(fn, n, cfgNode, out, conditional, table) {
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-            addToDefIfLocal(n.left.name, conditional ? null : cfgNode, n.right, out, table);
+            addToDefIfLocal(n.left, conditional ? null : cfgNode, n.right, out, table);
             return;
         }
         // Member or destructure assign — descend defensively.
@@ -5450,51 +6409,49 @@ function computeMustDef(fn, n, cfgNode, out, conditional, table) {
     if (t.isUpdateExpression(n)) {
         if (t.isIdentifier(n.argument)) {
             // Treat ++/-- as a self-referencing redefinition with depends={x}.
-            addToDefIfLocal(n.argument.name, conditional ? null : cfgNode, n.argument, out, table);
+            addToDefIfLocal(n.argument, conditional ? null : cfgNode, n.argument, out, table);
             return;
         }
     }
     if (t.isIdentifier(n) && n.name === 'arguments') {
-        // Closure's escapeParameters: lose all parameter knowledge.
-        for (const param of fn.params) {
-            for (const name of bindingIdNames(param)) {
-                if (table.indexByName.has(name))
-                    out.reachingDef.set(name, null);
-            }
+        // Closure's escapeParameters: lose all parameter knowledge. We can't
+        // tell which slots are params from the table, so invalidate all
+        // slots. (escaped slots are filtered downstream.)
+        for (let slot = 0; slot < table.size; slot++) {
+            out.reachingDef.set(slot, null);
         }
         return;
     }
     for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[key];
+        const child = getSlot(n, key);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c) {
+                if (c)
                     computeMustDef(fn, c, cfgNode, out, conditional, table);
-                }
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             computeMustDef(fn, child, cfgNode, out, conditional, table);
         }
     }
 }
-function addToDefIfLocal(name, cfgNode, rhs, out, table) {
-    if (!table.indexByName.has(name))
+function addToDefIfLocal(id, cfgNode, rhs, out, table) {
+    const slot = table.resolve(id);
+    if (slot === undefined)
         return;
-    // Invalidate any existing def that depends on `name` (we just rebound it).
+    // Invalidate any existing def that depends on `slot` (we just rebound it).
     for (const [k, def] of out.reachingDef) {
         if (def === null)
             continue;
-        if (def.depends.has(name))
+        if (def.depends.has(slot))
             out.reachingDef.set(k, null);
     }
-    if (table.escaped.has(name))
+    if (table.escaped.has(slot))
         return;
     if (cfgNode === null) {
-        out.reachingDef.set(name, null);
+        out.reachingDef.set(slot, null);
         return;
     }
     const def = {
@@ -5504,74 +6461,40 @@ function addToDefIfLocal(name, cfgNode, rhs, out, table) {
     };
     if (rhs !== null)
         computeDependence(def, rhs, table);
-    out.reachingDef.set(name, def);
+    out.reachingDef.set(slot, def);
 }
 function computeDependence(def, rhs, table) {
     const visit = (n, parent) => {
         if (parent !== null && isEnteringNewCfgNode(n, parent))
             return;
         if (t.isIdentifier(n)) {
-            if (!table.indexByName.has(n.name)) {
+            const slot = table.resolve(n);
+            if (slot === undefined) {
                 // External name (closure-captured, global, etc.) — we don't
                 // know whether it can change.
                 def.unknownDependencies = true;
             }
             else {
-                def.depends.add(n.name);
+                def.depends.add(slot);
             }
             return;
         }
         for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[key];
+            const child = getSlot(n, key);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c, n);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child, n);
             }
         }
     };
     visit(rhs, null);
-}
-function bindingIdNames(node) {
-    const out = [];
-    const visit = (n) => {
-        if (t.isIdentifier(n)) {
-            out.push(n.name);
-            return;
-        }
-        if (t.isAssignmentPattern(n)) {
-            visit(n.left);
-            return;
-        }
-        if (t.isRestElement(n)) {
-            visit(n.argument);
-            return;
-        }
-        if (t.isArrayPattern(n)) {
-            for (const el of n.elements)
-                if (el !== null)
-                    visit(el);
-            return;
-        }
-        if (t.isObjectPattern(n)) {
-            for (const p of n.properties) {
-                if (t.isRestElement(p))
-                    visit(p.argument);
-                else if (t.isObjectProperty(p) && 'type' in p.value)
-                    visit(p.value);
-            }
-            return;
-        }
-    };
-    visit(node);
-    return out;
 }
 // Used by FlowSensitiveInlineVariables to decide whether the def's RHS
 // dependencies live entirely within the local-variable table (= safe) or
@@ -5598,6 +6521,10 @@ function dependsOnOuterScopeVars(def) {
 //          statement list, the common case)
 //   5. The use is not inside a loop (would inline N times into N iterations).
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. We never
+// compare names; only slot equality. This is correctness-critical when the
+// same name is shadowed across nested scopes.
+//
 // Drives MustBeReachingVariableDef + MaybeReachingVariableUse + the
 // CheckPathsBetweenNodes graph utility.
 function runFlowSensitiveInlineVariables(fn, cfg, table) {
@@ -5609,8 +6536,8 @@ function runFlowSensitiveInlineVariables(fn, cfg, table) {
     const candidates = gatherCandidates(fn, cfg, table, reachDef.getDef, parents);
     let inlined = 0;
     for (const c of candidates) {
-        if (canInline(c, fn, cfg, table, reachUse.getUsesAfter, parents)) {
-            performInline(c, parents);
+        if (canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents)) {
+            performInline(c, table, parents);
             inlined++;
         }
     }
@@ -5627,27 +6554,27 @@ function gatherCandidates(fn, cfg, table, getDef, parents) {
         if (typeof value === 'symbol')
             continue;
         forEachIdentifierRead(value, parents, (id) => {
-            const name = id.name;
-            if (!table.indexByName.has(name))
+            const slot = table.resolve(id);
+            if (slot === undefined)
                 return;
-            if (table.escaped.has(name))
+            if (table.escaped.has(slot))
                 return;
-            const def = getDef(name, cfgNode);
+            const def = getDef(id, cfgNode);
             if (def === null || def === undefined)
                 return;
             if (def.node === fn)
                 return; // parameter sentinel — skip
             if (dependsOnOuterScopeVars(def))
                 return;
-            out.push({ name, def, use: id, useCfgNode: cfgNode });
+            out.push({ slot, def, use: id, useCfgNode: cfgNode });
         });
     }
     return out;
 }
 // ---------------------------------------------------------------------------
 // canInline
-function canInline(c, fn, cfg, table, getUsesAfter, parents) {
-    const defLoc = locateDefExpr(c.def, c.name, parents);
+function canInline(c, fn, cfg, table, getUsesAfterSlot, parents) {
+    const defLoc = locateDefExpr(c.def, c.slot, table, parents);
     if (defLoc === null)
         return false;
     // Reject defs whose enclosing AssignmentExpression isn't the top-level of
@@ -5661,14 +6588,14 @@ function canInline(c, fn, cfg, table, getUsesAfter, parents) {
     // 2. RHS shape — Closure's isRhsSafeToInline.
     if (!isRhsSafeToInline(rhs))
         return false;
-    // 3. Pre/post sibling side-effect checks on names this def depends on.
-    const namesToCheck = c.def.depends;
-    if (checkPostExpressions(defLoc.expr, c.def.node, namesToCheck, parents) ||
-        checkPreExpressions(c.use, c.useCfgNode.value, namesToCheck, parents)) {
+    // 3. Pre/post sibling side-effect checks on slots this def depends on.
+    const slotsToCheck = c.def.depends;
+    if (checkPostExpressions(defLoc.expr, c.def.node, slotsToCheck, table, parents) ||
+        checkPreExpressions(c.use, c.useCfgNode.value, slotsToCheck, table, parents)) {
         return false;
     }
-    // 4. Exactly one syntactic use of `name` inside the use's CFG node.
-    if (countNameUsesInCfgNode(c.useCfgNode.value, c.name, parents) !== 1) {
+    // 4. Exactly one syntactic use of the binding behind c.slot inside the use's CFG node.
+    if (countSlotUsesInCfgNode(c.useCfgNode.value, c.slot, table, parents) !== 1) {
         return false;
     }
     // 5. Use not inside a loop.
@@ -5678,7 +6605,7 @@ function canInline(c, fn, cfg, table, getUsesAfter, parents) {
     const defCfg = cfg.nodes.get(c.def.node);
     if (defCfg === undefined)
         return false;
-    const usesAfter = getUsesAfter(c.name, defCfg);
+    const usesAfter = getUsesAfterSlot(c.slot, defCfg);
     if (usesAfter.size !== 1)
         return false;
     if (!usesAfter.has(c.use))
@@ -5695,7 +6622,7 @@ function canInline(c, fn, cfg, table, getUsesAfter, parents) {
             nodePredicate: (v) => {
                 if (typeof v === 'symbol')
                     return false;
-                return nodeHasInterferingEffect(v, namesToCheck);
+                return nodeHasInterferingEffect(v, slotsToCheck, table);
             },
             edgePredicate: () => true,
             inclusive: false,
@@ -5703,9 +6630,88 @@ function canInline(c, fn, cfg, table, getUsesAfter, parents) {
         if (sideEffectOnPath)
             return false;
     }
+    // 8. Scope visibility — every free local Identifier in the RHS must be in
+    //    lexical scope at the use site. Mirrors the second clause of Closure's
+    //    isRhsSafeToInline (FlowSensitiveInlineVariables.java:639). Without
+    //    this, we'd substitute `out$pN` (declared in an inner block) into a
+    //    `return` outside the block, producing an out-of-scope reference.
+    if (!rhsIdentifiersInScopeAt(rhs, c.use, table, parents))
+        return false;
     return true;
 }
-function locateDefExpr(def, name, parents) {
+/**
+ * For every free Identifier read inside `rhs` that resolves to a local slot,
+ * verify that the slot's binding scope is an ancestor of `useSite`. Free
+ * names that are outer-scope (table.resolve === undefined) are always safe —
+ * if they were visible at the def site, they're visible at any sibling/use
+ * inside the same function.
+ */
+function rhsIdentifiersInScopeAt(rhs, useSite, table, parents) {
+    const useAncestors = collectAncestorNodes(useSite, parents);
+    let ok = true;
+    t.traverseFast(rhs, (n) => {
+        if (!ok)
+            return;
+        // Don't descend into nested functions — their free names are bound in
+        // their own scope chain, not the use site's.
+        if (t.isFunction(n))
+            return t.traverseFast.skip;
+        if (!t.isIdentifier(n))
+            return undefined;
+        const info = parents.get(n);
+        if (info === undefined)
+            return undefined;
+        if (!isReferenceContext(info.parent, info.key))
+            return undefined;
+        const slot = table.resolve(n);
+        if (slot === undefined)
+            return undefined; // outer-scope / global → safe
+        const scopeNode = table.scopeNodeOfSlot(slot);
+        if (scopeNode === undefined) {
+            ok = false;
+            return undefined;
+        }
+        if (!useAncestors.has(scopeNode))
+            ok = false;
+        return undefined;
+    });
+    return ok;
+}
+function collectAncestorNodes(node, parents) {
+    const out = new Set();
+    let cur = node;
+    while (cur !== undefined) {
+        out.add(cur);
+        cur = parents.get(cur)?.parent;
+    }
+    return out;
+}
+function isReferenceContext(parent, key) {
+    if (t.isVariableDeclarator(parent) && key === 'id')
+        return false;
+    if (t.isFunctionDeclaration(parent) && key === 'id')
+        return false;
+    if (t.isFunctionExpression(parent) && key === 'id')
+        return false;
+    if (t.isClassDeclaration(parent) && key === 'id')
+        return false;
+    if (t.isClassExpression(parent) && key === 'id')
+        return false;
+    if (t.isLabeledStatement(parent) && key === 'label')
+        return false;
+    if (t.isBreakStatement(parent) && key === 'label')
+        return false;
+    if (t.isContinueStatement(parent) && key === 'label')
+        return false;
+    if (t.isMemberExpression(parent) && key === 'property' && !parent.computed)
+        return false;
+    if (t.isObjectProperty(parent) && key === 'key' && !parent.computed)
+        return false;
+    if (t.isObjectMethod(parent) && key === 'key' && !parent.computed)
+        return false;
+    return true;
+}
+function locateDefExpr(def, slot, table, parents) {
     let result = null;
     const visit = (n, parent) => {
         if (result !== null)
@@ -5714,10 +6720,8 @@ function locateDefExpr(def, name, parents) {
             return;
         if (t.isVariableDeclarator(n) &&
             t.isIdentifier(n.id) &&
-            n.id.name === name &&
-            n.init &&
-            // Walk up to confirm parent is a VariableDeclaration we can mutate.
-            true) {
+            table.resolve(n.id) === slot &&
+            n.init) {
             const declInfo = parents.get(n);
             if (declInfo && t.isVariableDeclaration(declInfo.parent)) {
                 result = { kind: 'var', expr: n, rhs: n.init, decl: declInfo.parent };
@@ -5727,7 +6731,7 @@ function locateDefExpr(def, name, parents) {
         if (t.isAssignmentExpression(n) &&
             n.operator === '=' &&
             t.isIdentifier(n.left) &&
-            n.left.name === name) {
+            table.resolve(n.left) === slot) {
             // top-level iff parent is an ExpressionStatement (ignoring labels).
             let p = parents.get(n)?.parent ?? null;
             while (p !== null && t.isLabeledStatement(p)) {
@@ -5738,17 +6742,16 @@ function locateDefExpr(def, name, parents) {
             return;
         }
         for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[key];
+            const child = getSlot(n, key);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c, n);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child, n);
             }
         }
@@ -5776,17 +6779,16 @@ function isRhsSafeToInline(rhs) {
         if (t.isFunction(n))
             return; // don't recurse into nested functions
         for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[key];
+            const child = getSlot(n, key);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child);
             }
         }
@@ -5796,11 +6798,11 @@ function isRhsSafeToInline(rhs) {
 }
 // ---------------------------------------------------------------------------
 // Side-effect checks within an expression tree.
-function checkPostExpressions(n, expressionRoot, namesToCheck, parents) {
+function checkPostExpressions(n, expressionRoot, slotsToCheck, table, parents) {
     let cur = n;
     while (cur !== expressionRoot) {
         for (const sib of rightSiblings(cur, parents)) {
-            if (subtreeHasInterferingEffect(sib, namesToCheck))
+            if (subtreeHasInterferingEffect(sib, slotsToCheck, table))
                 return true;
         }
         const info = parents.get(cur);
@@ -5810,11 +6812,11 @@ function checkPostExpressions(n, expressionRoot, namesToCheck, parents) {
     }
     return false;
 }
-function checkPreExpressions(n, expressionRoot, namesToCheck, parents) {
+function checkPreExpressions(n, expressionRoot, slotsToCheck, table, parents) {
     let cur = n;
     while (cur !== expressionRoot) {
         for (const sib of leftSiblings(cur, parents)) {
-            if (subtreeHasInterferingEffect(sib, namesToCheck))
+            if (subtreeHasInterferingEffect(sib, slotsToCheck, table))
                 return true;
         }
         const info = parents.get(cur);
@@ -5824,7 +6826,7 @@ function checkPreExpressions(n, expressionRoot, namesToCheck, parents) {
     }
     return false;
 }
-function subtreeHasInterferingEffect(n, namesToCheck, parents) {
+function subtreeHasInterferingEffect(n, slotsToCheck, table, parents) {
     let yes = false;
     const visit = (m) => {
         if (yes)
@@ -5835,15 +6837,19 @@ function subtreeHasInterferingEffect(n, namesToCheck, parents) {
             yes = true;
             return;
         }
-        if (t.isAssignmentExpression(m) &&
-            t.isIdentifier(m.left) &&
-            namesToCheck.has(m.left.name)) {
-            yes = true;
-            return;
+        if (t.isAssignmentExpression(m) && t.isIdentifier(m.left)) {
+            const s = table.resolve(m.left);
+            if (s !== undefined && slotsToCheck.has(s)) {
+                yes = true;
+                return;
+            }
         }
-        if (t.isUpdateExpression(m) && t.isIdentifier(m.argument) && namesToCheck.has(m.argument.name)) {
-            yes = true;
-            return;
+        if (t.isUpdateExpression(m) && t.isIdentifier(m.argument)) {
+            const s = table.resolve(m.argument);
+            if (s !== undefined && slotsToCheck.has(s)) {
+                yes = true;
+                return;
+            }
         }
         if (t.isUnaryExpression(m) && m.operator === 'delete') {
             yes = true;
@@ -5852,17 +6858,16 @@ function subtreeHasInterferingEffect(n, namesToCheck, parents) {
         if (t.isFunction(m))
             return;
         for (const key of t.VISITOR_KEYS[m.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = m[key];
+            const child = getSlot(m, key);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         visit(c);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 visit(child);
             }
         }
@@ -5870,8 +6875,8 @@ function subtreeHasInterferingEffect(n, namesToCheck, parents) {
     visit(n);
     return yes;
 }
-function nodeHasInterferingEffect(cfgValue, namesToCheck, parents) {
-    return subtreeHasInterferingEffect(cfgValue, namesToCheck);
+function nodeHasInterferingEffect(cfgValue, slotsToCheck, table, parents) {
+    return subtreeHasInterferingEffect(cfgValue, slotsToCheck, table);
 }
 // ---------------------------------------------------------------------------
 // Identifier-read traversal (used to find candidate uses).
@@ -5884,17 +6889,16 @@ function forEachIdentifierRead(root, parents, visit) {
             return;
         }
         for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[key];
+            const child = getSlot(n, key);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         walk(c, n);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n);
             }
         }
@@ -5936,10 +6940,10 @@ function isWriteContext(id, parent) {
         return true;
     return false;
 }
-function countNameUsesInCfgNode(cfgValue, name, parents) {
+function countSlotUsesInCfgNode(cfgValue, slot, table, parents) {
     let count = 0;
     forEachIdentifierRead(cfgValue, parents, (id) => {
-        if (id.name === name)
+        if (table.resolve(id) === slot)
             count++;
     });
     return count;
@@ -5976,8 +6980,8 @@ function areAdjacentSiblings(defNode, useNode, parents) {
 }
 // ---------------------------------------------------------------------------
 // performInline
-function performInline(c, parents) {
-    const loc = locateDefExpr(c.def, c.name, parents);
+function performInline(c, table, parents) {
+    const loc = locateDefExpr(c.def, c.slot, table, parents);
     if (loc === null)
         return;
     const rhs = loc.rhs;
@@ -6030,18 +7034,17 @@ function buildParentMap(root) {
         if (parent !== null)
             map.set(n, { parent, key, index });
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
+            const child = getSlot(n, k);
             if (child === null || child === undefined)
                 continue;
             if (Array.isArray(child)) {
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
-                    if (c && typeof c === 'object' && 'type' in c)
+                    if (c)
                         walk(c, n, k, i);
                 }
             }
-            else if (typeof child === 'object' && 'type' in child) {
+            else {
                 walk(child, n, k, undefined);
             }
         }
@@ -6055,9 +7058,8 @@ function rightSiblings(n, parents) {
         return [];
     if (info.index === undefined)
         return [];
-    // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-    const arr = info.parent[info.key];
-    return arr.slice(info.index + 1).filter((x) => x && typeof x === 'object' && 'type' in x);
+    const arr = getSlot(info.parent, info.key);
+    return arr.slice(info.index + 1).filter((x) => x !== null);
 }
 function leftSiblings(n, parents) {
     const info = parents.get(n);
@@ -6065,24 +7067,15 @@ function leftSiblings(n, parents) {
         return [];
     if (info.index === undefined)
         return [];
-    // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-    const arr = info.parent[info.key];
-    return arr.slice(0, info.index).filter((x) => x && typeof x === 'object' && 'type' in x);
+    const arr = getSlot(info.parent, info.key);
+    return arr.slice(0, info.index).filter((x) => x !== null);
 }
 function replaceInParent(n, replacement, parents) {
     const info = parents.get(n);
     if (info === undefined)
         return;
     const { parent, key, index } = info;
-    if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = parent[key];
-        arr[index] = replacement;
-    }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        parent[key] = replacement;
-    }
+    setSlot(parent, key, index, replacement);
     parents.set(replacement, { parent, key, index });
 }
 function removeFromParent(n, parents) {
@@ -6091,235 +7084,471 @@ function removeFromParent(n, parents) {
         return;
     const { parent, key, index } = info;
     if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = parent[key];
+        const arr = getSlot(parent, key);
         arr.splice(index, 1);
         for (let i = index; i < arr.length; i++) {
             const c = arr[i];
-            if (c && typeof c === 'object' && 'type' in c) {
+            if (c)
                 parents.set(c, { parent, key, index: i });
-            }
         }
     }
     else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        parent[key] = null;
+        setSlot(parent, key, undefined, null);
     }
 }
 
-// Helper used by LiveVariablesAnalysis (and downstream DeadAssignmentsElim).
+// Helper used by LiveVariablesAnalysis (and downstream DeadAssignmentsElim,
+// MustBeReachingVariableDef, MaybeReachingVariableUse, FlowSensitiveInline).
 //
 // Closure has a full Scope/Var/ScopeCreator stack (jscomp/Scope.java +
-// SyntacticScopeCreator etc., ~1000 LOC). For our v1 we don't need that
-// generality — we just need:
+// SyntacticScopeCreator etc., ~1000 LOC). Rather than port that stack, we
+// lean on Babel's already-correct `path.scope` analysis and translate:
 //
-//   1. An enumeration of every local-to-this-function variable (params +
-//      var/let/const/function declarations at any nesting inside the function
-//      body) keyed by name in declaration order. This becomes the variable
-//      index space the BitSet lattices use.
+//   - Each local Babel `Binding` becomes a numeric "slot" — the index space
+//     the analyses' lattices use.
+//   - Each `Identifier` node anywhere in the function maps to its binding's
+//     slot via `resolve(idNode)`. Outer-scope references and globals return
+//     `undefined`. This is the canonical scope answer Babel computes.
+//   - Closure capture from a nested function and `arguments` reference each
+//     mark the relevant slot as ESCAPED — escaped slots are treated as
+//     live-out at the implicit return so liveness doesn't drop their stores.
 //
-//   2. A predicate "was variable X referenced inside a nested function?",
-//      which marks X as ESCAPED — escaped locals are treated as live-out at
-//      the implicit return so liveness analysis doesn't drop their stores.
+// Why per-binding identity (not per-name): two `let x` in different scopes
+// (or shadowing) are distinct bindings with their own lifetimes. Keying by
+// name would conflate them, leading to phantom kills/uses across unrelated
+// shadows. Babel's scope analysis tracks them separately; we propagate that.
 //
-// Limitations vs Closure (deliberately taken to keep this small and to avoid
-// the ScopeCreator port):
+// Slot IDs are stable only within a single `LocalVariableTable` instance.
+// Each simplifier iteration rebuilds the table from scratch, so callers must
+// not persist slot IDs across iterations.
 //
-//   - We don't model lexical shadowing inside the function. Two separate
-//     `let x` in non-overlapping inner blocks collapse to "the same x" for
-//     analysis purposes. This is over-conservative: liveness sees more uses,
-//     DAE eliminates fewer stores. Always safe.
+// Limitations vs Closure (deliberate, orthogonal to scope handling):
 //
-//   - We don't distinguish between locals and outer-scope captures. A name
-//     used inside the function that wasn't declared here is ignored entirely
-//     (we never index it). DAE never touches it; safe.
-//
-// If/when we hit a real correctness issue from this, we either upgrade to a
-// proper scope walker or port jscomp/Scope.java.
-function buildLocalVariableTable(fn) {
-    const indexByName = new Map();
+//   - `MAX_VARIABLES_TO_ANALYZE` cap stays in the consumers (LiveVars).
+//   - DAE bails entire functions with nested closures — Closure does too.
+function buildLocalVariableTable(fnPath) {
+    // Refresh scope so bindings reflect the current AST. Per-iteration the
+    // simplifier mutates the body — Babel's scope cache must be rebuilt.
+    fnPath.scope.crawl();
+    const idToSlot = new WeakMap();
     const escaped = new Set();
-    const addLocal = (name) => {
-        if (!indexByName.has(name))
-            indexByName.set(name, indexByName.size);
+    const nameBySlot = [];
+    const slotsByNameMap = new Map();
+    const localBindingToSlot = new Map();
+    const scopeNodeBySlot = [];
+    const allocSlot = (binding) => {
+        const existing = localBindingToSlot.get(binding);
+        if (existing !== undefined)
+            return existing;
+        const slot = nameBySlot.length;
+        nameBySlot.push(binding.identifier.name);
+        const arr = slotsByNameMap.get(binding.identifier.name) ?? [];
+        arr.push(slot);
+        slotsByNameMap.set(binding.identifier.name, arr);
+        localBindingToSlot.set(binding, slot);
+        scopeNodeBySlot.push(binding.scope.path.node);
+        return slot;
     };
-    // Params first (Closure indexes parameters before body locals).
-    for (const param of fn.params) {
-        for (const name of bindingNamesIn(param))
-            addLocal(name);
+    // Step 1: allocate slots in declaration order.
+    //
+    // Params first (Closure indexes parameters before body locals). They live
+    // in fnPath.scope.bindings. Then descend into block scopes within the
+    // function body, skipping nested functions (each has its own table).
+    for (const name of Object.keys(fnPath.scope.bindings)) {
+        allocSlot(fnPath.scope.bindings[name]);
     }
-    // Walk the body collecting var/let/const/function decl bindings. We
-    // descend into nested blocks/loops/etc. but NOT into nested functions —
-    // their locals belong to that function's table.
-    const body = fn.body;
-    if (t.isBlockStatement(body)) {
-        collectDeclsIn(body, addLocal);
-    }
-    // Now find which collected locals are referenced from inside a nested
-    // function (= escape via closure).
-    if (t.isBlockStatement(body)) {
-        collectEscapesIn(body, indexByName, escaped, /* insideNestedFn */ false);
-    }
-    // `arguments` use: if any reference to `arguments` exists in the
-    // function (not inside a nested non-arrow function which has its own
-    // arguments), Closure escapes ALL parameters. Mirror that.
-    if (referencesArguments(fn)) {
-        for (const param of fn.params) {
-            for (const name of bindingNamesIn(param))
-                escaped.add(name);
-        }
-    }
-    return { indexByName, escaped, size: indexByName.size };
-}
-// Returns the variable names introduced by a binding pattern (param or
-// var/let/const target). Handles destructuring + rest + defaults.
-function bindingNamesIn(node) {
-    const out = [];
-    const visit = (n) => {
-        if (t.isIdentifier(n)) {
-            out.push(n.name);
-            return;
-        }
-        if (t.isAssignmentPattern(n)) {
-            visit(n.left);
-            return;
-        }
-        if (t.isRestElement(n)) {
-            visit(n.argument);
-            return;
-        }
-        if (t.isArrayPattern(n)) {
-            for (const el of n.elements) {
-                if (el !== null)
-                    visit(el);
-            }
-            return;
-        }
-        if (t.isObjectPattern(n)) {
-            for (const p of n.properties) {
-                if (t.isRestElement(p)) {
-                    visit(p.argument);
+    const bodyPath = fnPath.get('body');
+    if (!Array.isArray(bodyPath) && bodyPath.node) {
+        bodyPath.traverse({
+            Function(p) {
+                p.skip();
+            },
+            enter(p) {
+                if (p.scope.path === p && p.scope !== fnPath.scope) {
+                    for (const name of Object.keys(p.scope.bindings)) {
+                        const b = p.scope.bindings[name];
+                        if (b.scope === p.scope)
+                            allocSlot(b);
+                    }
                 }
-                else if (t.isObjectProperty(p)) {
-                    visit(p.value);
-                }
-            }
-            return;
+            },
+        });
+    }
+    // Step 2: map every Identifier in this function (excluding nested fn
+    // bodies) to its binding's slot. Babel resolves the binding for us via
+    // `path.scope.getBinding(name)` walking the scope chain.
+    fnPath.traverse({
+        Function(p) {
+            p.skip();
+        },
+        Identifier(p) {
+            const isRef = p.isReferencedIdentifier();
+            const isBind = p.isBindingIdentifier();
+            if (!isRef && !isBind)
+                return;
+            const binding = p.scope.getBinding(p.node.name);
+            if (binding === undefined)
+                return;
+            const slot = localBindingToSlot.get(binding);
+            if (slot === undefined)
+                return;
+            idToSlot.set(p.node, slot);
+        },
+    });
+    // Step 3: closure-escape detection. A binding escapes if any of its
+    // reference / write paths lives in a scope nested inside a Function that
+    // isn't the binding's own function.
+    for (const [binding, slot] of localBindingToSlot) {
+        if (escapes(binding, fnPath))
+            escaped.add(slot);
+    }
+    // Step 4: `arguments` reference forces all params to escape. Closure
+    // calls this `escapeParameters`. Arrow functions inherit `arguments` from
+    // their enclosing function so we must recurse into them; non-arrow
+    // nested functions get their own `arguments` so we skip those.
+    if (referencesArguments(fnPath)) {
+        for (const [binding, slot] of localBindingToSlot) {
+            if (binding.kind === 'param')
+                escaped.add(slot);
         }
-        if (t.isVariableDeclarator(n)) {
-            visit(n.id);
-            return;
-        }
+    }
+    return {
+        resolve: (id) => idToSlot.get(id),
+        escaped,
+        size: nameBySlot.length,
+        nameOfSlot: (slot) => nameBySlot[slot],
+        slotsByName: (name) => slotsByNameMap.get(name) ?? [],
+        scopeNodeOfSlot: (slot) => scopeNodeBySlot[slot],
     };
-    visit(node);
-    return out;
 }
-function collectDeclsIn(node, addLocal) {
-    // Don't descend into nested functions — they have their own table.
-    if (t.isFunction(node)) {
-        // …unless we're at the very root, but the caller never passes the
-        // function itself in here.
-        if (t.isFunctionDeclaration(node) && node.id) {
-            // function declarations bind their name in the enclosing scope —
-            // so a `function inner() {}` inside our body adds `inner` as a
-            // local of OUR function.
-            addLocal(node.id.name);
+function escapes(binding, fnPath) {
+    const check = (refScope) => {
+        // Walk from refScope up to (but not past) the binding's own scope.
+        // Crossing a Function boundary that isn't fnPath itself = closure
+        // capture.
+        let scope = refScope;
+        while (scope !== null && scope !== binding.scope) {
+            const p = scope.path;
+            if (p.isFunction() && p.node !== fnPath.node)
+                return true;
+            scope = scope.parent;
         }
-        return;
+        return false;
+    };
+    for (const ref of binding.referencePaths) {
+        if (check(ref.scope))
+            return true;
     }
-    if (t.isVariableDeclaration(node)) {
-        for (const d of node.declarations) {
-            for (const name of bindingNamesIn(d.id))
-                addLocal(name);
-        }
-        // VariableDeclarator initializers might contain function expressions
-        // that themselves should not contribute, but they could contain inner
-        // var declarations only if those funcs aren't nested — which they are.
-        // Stop here.
-        return;
+    for (const cv of binding.constantViolations) {
+        if (check(cv.scope))
+            return true;
     }
-    if (t.isCatchClause(node) && node.param) {
-        for (const name of bindingNamesIn(node.param))
-            addLocal(name);
-    }
-    for (const key of t.VISITOR_KEYS[node.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = node[key];
-        if (child === null || child === undefined)
-            continue;
-        if (Array.isArray(child)) {
-            for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c)
-                    collectDeclsIn(c, addLocal);
-            }
-        }
-        else if (typeof child === 'object' && 'type' in child) {
-            collectDeclsIn(child, addLocal);
-        }
-    }
+    return false;
 }
-function collectEscapesIn(node, indexByName, escaped, insideNestedFn) {
-    if (t.isIdentifier(node)) {
-        if (insideNestedFn && indexByName.has(node.name)) {
-            escaped.add(node.name);
-        }
-        return;
-    }
-    const isFn = t.isFunction(node);
-    const nestedNow = insideNestedFn || isFn;
-    for (const key of t.VISITOR_KEYS[node.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = node[key];
-        if (child === null || child === undefined)
-            continue;
-        if (Array.isArray(child)) {
-            for (const c of child) {
-                if (c && typeof c === 'object' && 'type' in c) {
-                    collectEscapesIn(c, indexByName, escaped, nestedNow);
-                }
-            }
-        }
-        else if (typeof child === 'object' && 'type' in child) {
-            collectEscapesIn(child, indexByName, escaped, nestedNow);
-        }
-    }
-}
-function referencesArguments(fn) {
+function referencesArguments(fnPath) {
     let found = false;
-    const visit = (node, insideNestedNonArrow) => {
-        if (found)
-            return;
-        if (t.isIdentifier(node) && node.name === 'arguments' && !insideNestedNonArrow) {
+    fnPath.traverse({
+        Function(p) {
+            // Arrow fns inherit `arguments`; non-arrow fns get their own.
+            if (!p.isArrowFunctionExpression())
+                p.skip();
+        },
+        Identifier(p) {
+            if (found)
+                return;
+            if (p.node.name !== 'arguments')
+                return;
+            if (!p.isReferencedIdentifier())
+                return;
+            // Belongs to an enclosing non-arrow function? If we walked up from
+            // here through arrow fns and reached fnPath, yes.
+            let cur = p.parentPath;
+            while (cur !== null && cur !== fnPath) {
+                if (cur.isFunction() && !cur.isArrowFunctionExpression())
+                    return;
+                cur = cur.parentPath;
+            }
             found = true;
-            return;
-        }
-        // Arrow functions inherit `arguments` from their enclosing function;
-        // declarations / expressions / methods get their own.
-        const enters = (t.isFunctionDeclaration(node) ||
-            t.isFunctionExpression(node) ||
-            t.isObjectMethod(node) ||
-            t.isClassMethod(node) ||
-            t.isClassPrivateMethod(node)) &&
-            node !== fn;
-        const nested = insideNestedNonArrow || enters;
-        for (const key of t.VISITOR_KEYS[node.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = node[key];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c, nested);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child, nested);
-            }
-        }
-    };
-    visit(fn, false);
+        },
+    });
     return found;
+}
+
+// Port of jscomp/MinimizeExitPoints.java.
+//
+// Transforms the AST so that explicit exits (return / break / continue) are
+// replaced by implicit fall-through where possible. Most useful in shape:
+//
+//   _label: {
+//     if (cond) { ...A; break _label; }
+//     ...B;
+//   }
+//
+// becomes
+//
+//   _label: {
+//     if (cond) { ...A; }
+//     else { ...B; }
+//   }
+//
+// which then composes with PeepholeMinimizeConditions to collapse if/else
+// into a ternary, and with PeepholeRemoveDeadCode to drop the labeled
+// wrapper. This is exactly the residue our BLOCK-inliner emits, so the two
+// passes together start chipping at the `_compilecat_inline_result` shape.
+//
+// Bails on: try/finally (we leave its exit semantics alone — see ECMA 12.14).
+// We don't have isASTNormalized() — Closure uses it to gate switch-exit
+// minimization; we behave as "normalized" since our pipeline runs after
+// inline + simplification.
+/**
+ * Operates on any AST root (Program, File, Function body — anything). We use
+ * a manual walker rather than @babel/traverse to avoid the scope/parentPath
+ * requirement when invoked on a non-Program subtree (the simplifier passes
+ * a function body here).
+ */
+function runMinimizeExitPoints(root) {
+    const ctx = { minimized: 0 };
+    walk$3(root, ctx);
+    return { minimized: ctx.minimized };
+}
+function walk$3(n, ctx) {
+    // Visit children first (bottom-up).
+    for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+        const child = getSlot(n, k);
+        if (child === null || child === undefined)
+            continue;
+        if (Array.isArray(child)) {
+            for (const c of child) {
+                if (c)
+                    walk$3(c, ctx);
+            }
+        }
+        else {
+            walk$3(child, ctx);
+        }
+    }
+    // Per-node entry points mirror Closure's optimizeSubtree switch.
+    if (t.isLabeledStatement(n)) {
+        tryMinimizeExits(n.body, 'break', n.label.name, ctx);
+        return;
+    }
+    if (t.isWhileStatement(n) ||
+        t.isForStatement(n) ||
+        t.isForInStatement(n) ||
+        t.isForOfStatement(n)) {
+        tryMinimizeExits(n.body, 'continue', null, ctx);
+        return;
+    }
+    if (t.isDoWhileStatement(n)) {
+        tryMinimizeExits(n.body, 'continue', null, ctx);
+        if (getSideEffectFreeBooleanValue(n.test) === TRI_FALSE) {
+            tryMinimizeExits(n.body, 'break', null, ctx);
+        }
+        return;
+    }
+    if (t.isFunction(n)) {
+        const body = n.body;
+        if (t.isBlockStatement(body))
+            tryMinimizeExits(body, 'return', null, ctx);
+        return;
+    }
+}
+// ---------------------------------------------------------------------------
+// Core: identify trailing exits and convert them to implicit fall-through.
+function tryMinimizeExits(n, exitType, labelName, ctx) {
+    // Direct match: the node itself is an exit of the right kind.
+    if (matchingExitNode(n, exitType, labelName)) {
+        // Remove it from its parent. The caller (block iteration) handles
+        // removal when this is invoked on a child of a block.
+        return;
+    }
+    if (t.isIfStatement(n)) {
+        tryMinimizeExits(n.consequent, exitType, labelName, ctx);
+        if (n.alternate)
+            tryMinimizeExits(n.alternate, exitType, labelName, ctx);
+        return;
+    }
+    if (t.isTryStatement(n)) {
+        tryMinimizeExits(n.block, exitType, labelName, ctx);
+        if (n.handler)
+            tryMinimizeExits(n.handler.body, exitType, labelName, ctx);
+        // Don't touch finalizer.
+        return;
+    }
+    if (t.isLabeledStatement(n)) {
+        tryMinimizeExits(n.body, exitType, labelName, ctx);
+        return;
+    }
+    if (t.isSwitchStatement(n) && (exitType !== 'break' || labelName !== null)) {
+        tryMinimizeSwitchExits(n, exitType, labelName, ctx);
+        return;
+    }
+    if (!t.isBlockStatement(n) || n.body.length === 0)
+        return;
+    // Multi-if pass: for each if(...) child, try to hoist trailing exits out
+    // of its branches by moving the if's siblings into the opposite branch.
+    for (let i = 0; i < n.body.length; i++) {
+        const c = n.body[i];
+        if (t.isIfStatement(c)) {
+            tryMinimizeIfBlockExits(n, i, c, true, exitType, labelName, ctx);
+            // The if may have changed structure; re-fetch the alternate.
+            const cur = n.body[i];
+            if (cur.alternate) {
+                tryMinimizeIfBlockExits(n, i, cur, false, exitType, labelName, ctx);
+            }
+        }
+        if (i === n.body.length - 1)
+            break;
+    }
+    // Last-child pass: recurse into the tail; if it shrinks/changes, look at
+    // what's now the tail and try again.
+    while (n.body.length > 0) {
+        const last = n.body[n.body.length - 1];
+        const before = n.body.length;
+        if (matchingExitNode(last, exitType, labelName)) {
+            n.body.pop();
+            ctx.minimized++;
+            continue;
+        }
+        tryMinimizeExits(last, exitType, labelName, ctx);
+        if (n.body.length === before && n.body[n.body.length - 1] === last)
+            break;
+    }
+}
+function tryMinimizeSwitchExits(n, exitType, labelName, ctx) {
+    for (let i = 0; i < n.cases.length; i++) {
+        const c = n.cases[i];
+        if (i !== n.cases.length - 1) {
+            tryMinimizeSwitchCaseExits(c, exitType, labelName, ctx);
+        }
+        else {
+            // Last case: aggressive — recurse into its block content.
+            for (const stmt of c.consequent)
+                tryMinimizeExits(stmt, exitType, labelName, ctx);
+        }
+    }
+}
+function tryMinimizeSwitchCaseExits(c, exitType, labelName, ctx) {
+    const body = c.consequent;
+    const last = body[body.length - 1];
+    if (!t.isBreakStatement(last) || last.label !== null)
+        return;
+    // Recurse on the statement just before the trailing break.
+    let idx = body.length - 2;
+    while (idx >= 0) {
+        const stmt = body[idx];
+        if (matchingExitNode(stmt, exitType, labelName)) {
+            body.splice(idx, 1);
+            ctx.minimized++;
+            idx = body.length - 2;
+            continue;
+        }
+        tryMinimizeExits(stmt, exitType, labelName, ctx);
+        idx--;
+    }
+}
+// ---------------------------------------------------------------------------
+// If-block-exit hoisting.
+//
+// When an if-branch ends in a matching exit, the if's following siblings can
+// be moved into the opposite branch. After this transform, the matching exit
+// becomes redundant and the trailing pass drops it.
+function tryMinimizeIfBlockExits(parentBlock, ifIndex, ifNode, workingOnConsequent, exitType, labelName, ctx) {
+    const srcBlock = workingOnConsequent ? ifNode.consequent : ifNode.alternate;
+    if (srcBlock === null || srcBlock === undefined)
+        return;
+    const destBlock = workingOnConsequent ? ifNode.alternate ?? null : ifNode.consequent;
+    let exitNode = null;
+    let removeFromBlock = null;
+    if (t.isBlockStatement(srcBlock)) {
+        if (srcBlock.body.length === 0)
+            return;
+        const cand = srcBlock.body[srcBlock.body.length - 1];
+        if (!matchingExitNode(cand, exitType, labelName))
+            return;
+        exitNode = cand;
+        removeFromBlock = srcBlock;
+    }
+    else {
+        if (!matchingExitNode(srcBlock, exitType, labelName))
+            return;
+        exitNode = srcBlock;
+    }
+    // Deliberate deviation from Closure: Closure converts following-sibling
+    // `let`/`const` to `var` here (keyword-homogeneity for its own emit; it
+    // emits `var` everywhere). We don't. All references to those decls move
+    // *into the new block together with the decl itself* (the splice below
+    // takes every sibling from ifIndex+1 to end), so block-scoping is
+    // preserved and the `let`/`const` semantics are unchanged. Keeping them
+    // also avoids degrading the readability of compilecat's intermediate
+    // output (this pass would otherwise sneak `var` back in even though we
+    // dropped OptimizeLetAndConstPeephole).
+    if (parentBlock.body.length - 1 - ifIndex === 0)
+        return;
+    // Determine the new destination block content.
+    const moving = parentBlock.body.splice(ifIndex + 1);
+    // The exit we matched can now be removed (redundant — falls into the
+    // implicit exit of the enclosing structure).
+    if (removeFromBlock !== null && exitNode !== null) {
+        const idx = removeFromBlock.body.indexOf(exitNode);
+        if (idx >= 0)
+            removeFromBlock.body.splice(idx, 1);
+    }
+    else if (workingOnConsequent) {
+        // srcBlock was a single statement; replace with an empty block.
+        ifNode.consequent = t.blockStatement([]);
+    }
+    else {
+        ifNode.alternate = t.blockStatement([]);
+    }
+    if (workingOnConsequent) {
+        // Move siblings into alternate.
+        if (destBlock === null) {
+            ifNode.alternate = t.blockStatement(moving);
+        }
+        else if (t.isBlockStatement(destBlock)) {
+            destBlock.body.push(...moving);
+        }
+        else {
+            ifNode.alternate = t.blockStatement([destBlock, ...moving]);
+        }
+    }
+    else {
+        if (destBlock === null) {
+            // Shouldn't happen — destBlock is consequent which always exists.
+            ifNode.consequent = t.blockStatement(moving);
+        }
+        else if (t.isBlockStatement(destBlock)) {
+            destBlock.body.push(...moving);
+        }
+        else {
+            ifNode.consequent = t.blockStatement([destBlock, ...moving]);
+        }
+    }
+    ctx.minimized++;
+}
+// ---------------------------------------------------------------------------
+// Predicates.
+function matchingExitNode(n, type, labelName) {
+    if (type === 'return') {
+        return (t.isReturnStatement(n) &&
+            (n.argument === null || n.argument === undefined));
+    }
+    if (type === 'break') {
+        if (!t.isBreakStatement(n))
+            return false;
+        if (labelName === null)
+            return n.label === null;
+        return !!n.label && n.label.name === labelName;
+    }
+    if (type === 'continue') {
+        if (!t.isContinueStatement(n))
+            return false;
+        if (labelName === null)
+            return n.label === null;
+        return !!n.label && n.label.name === labelName;
+    }
+    return false;
 }
 
 // Port of jscomp/PeepholeFoldConstants.java (subset).
@@ -6353,18 +7582,17 @@ function runPeepholeFoldConstants(root) {
 function walk$2(n, parent, key, index, ctx) {
     // Bottom-up: recurse first.
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[k];
+        const child = getSlot(n, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     walk$2(c, n, k, i, ctx);
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             walk$2(child, n, k, undefined, ctx);
         }
     }
@@ -6373,15 +7601,7 @@ function walk$2(n, parent, key, index, ctx) {
     const replacement = tryFold(n);
     if (replacement === null)
         return;
-    if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = parent[key];
-        arr[index] = replacement;
-    }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        parent[key] = replacement;
-    }
+    setSlot(parent, key, index, replacement);
     ctx.folded++;
 }
 // ---------------------------------------------------------------------------
@@ -6612,11 +7832,7 @@ function toUint32(v) {
 function foldOptionalChain(n) {
     if (!n.optional)
         return null;
-    // biome-ignore lint/suspicious/noExplicitAny: union narrowing
-    const obj = n.object;
-    // biome-ignore lint/suspicious/noExplicitAny: union narrowing
-    const callee = n.callee;
-    const head = obj ?? callee;
+    const head = t.isOptionalMemberExpression(n) ? n.object : n.callee;
     if (!head)
         return null;
     if (t.isNullLiteral(head) || (t.isIdentifier(head) && head.name === 'undefined')) {
@@ -6662,213 +7878,908 @@ function evalComparison(op, left, right) {
     return null;
 }
 
-// Port of jscomp/PeepholeMinimizeConditions.java (subset).
+// Port of jscomp/MinimizedCondition.java.
 //
-// Boolean control-flow minimization. Operates bottom-up; safe to repeat at
-// the fixpoint level alongside fold-constants and remove-dead-code.
+// Builds two equivalent representations of a boolean condition — `positive`
+// (the original semantics) and `negative` (the original negated). Each carries
+// an estimated cost (negation chars + parenthesis pairs), enabling callers to
+// pick the cheaper shape and apply De Morgan's law where it pays off.
 //
-// Covered:
-//   - !(a CMP b) → a NEG_CMP b for ==, ===, !=, !==, <, <=, >, >=
-//   - !(!x)      → x   (the inner negation has the boolean coercion already)
-//   - cond ? a : a → a  (when cond is pure)
-//   - cond ? true : false → !!cond (preserved as ConditionalExpression
-//     against !cond when cond isn't already boolean — see helper)
-//   - cond ? false : true → !cond
-//   - if (c) return X; else return Y;        → return c ? X : Y;
-//   - if (c) return X; (followed by) return Y → return c ? X : Y; (collapses
-//     across siblings in the same block)
-//   - if (c) X = A; else X = B; → X = c ? A : B; (same target identifier)
+// Shape:
+//   - `MeasuredNode` is a lazy AST builder. `node` is the root; `children` is
+//     either null (leaf — emit `node` as-is) or an array of MeasuredNode
+//     describing the rebuilt children.
+//   - `buildReplacement` walks the tree and assembles a fresh Babel node
+//     tailored to the parent's type (UnaryExpression / LogicalExpression /
+//     BinaryExpression / ConditionalExpression / SequenceExpression).
 //
-// Not covered:
-//   - de Morgan's full rewrite
-//   - if/else with mixed return + non-return
-//   - swap-conditional based on cost (Closure tries both shapes)
-//   - exhaustive HOOK-flattening
+// The negative side of an `unoptimized` condition is a sentinel with
+// `Number.MAX_SAFE_INTEGER` length so that `getMinimized` never picks it.
+// ---------------------------------------------------------------------------
+// Constructors.
+function fromConditionNode(n) {
+    if ((t.isUnaryExpression(n) && n.operator === '!') ||
+        t.isLogicalExpression(n) ||
+        t.isConditionalExpression(n) ||
+        (t.isSequenceExpression(n) && n.expressions.length >= 2)) {
+        return computeMinimizedCondition(n);
+    }
+    return unoptimized(n);
+}
+function unoptimized(n) {
+    return {
+        positive: { node: n, children: null, length: 0, changed: false },
+        negative: { node: null, children: null, length: Number.MAX_SAFE_INTEGER, changed: true },
+    };
+}
+function mkMC(positive, negative) {
+    return { positive, negative: change(negative) };
+}
+// ---------------------------------------------------------------------------
+// Recursive cost computation.
+function computeMinimizedCondition(n) {
+    if (t.isUnaryExpression(n) && n.operator === '!') {
+        const subtree = computeMinimizedCondition(n.argument);
+        const positive = pickBest(addNode(n, [subtree.positive]), subtree.negative);
+        const negative = pickBest(negate(subtree.negative), subtree.positive);
+        return mkMC(positive, negative);
+    }
+    if (t.isLogicalExpression(n) && (n.operator === '&&' || n.operator === '||')) {
+        // Closure builds a synthetic `complementNode` of the opposite operator,
+        // shared by the negative-side cost compare. We mirror that.
+        const complement = t.logicalExpression(n.operator === '&&' ? '||' : '&&', n.left, n.right);
+        const left = computeMinimizedCondition(n.left);
+        const right = computeMinimizedCondition(n.right);
+        const positive = pickBest(addNode(n, [left.positive, right.positive]), negate(addNode(complement, [left.negative, right.negative])));
+        const negative = pickBest(negate(addNode(n, [left.positive, right.positive])), change(addNode(complement, [left.negative, right.negative])));
+        return mkMC(positive, negative);
+    }
+    if (t.isConditionalExpression(n)) {
+        const cond = forNode(n.test);
+        const thenS = computeMinimizedCondition(n.consequent);
+        const elseS = computeMinimizedCondition(n.alternate);
+        const positive = addNode(n, [cond, thenS.positive, elseS.positive]);
+        const negative = addNode(n, [cond, thenS.negative, elseS.negative]);
+        return mkMC(positive, negative);
+    }
+    if (t.isSequenceExpression(n) && n.expressions.length >= 2) {
+        const last = n.expressions[n.expressions.length - 1];
+        const lhsNodes = n.expressions.slice(0, -1).map(forNode);
+        const rhsSubtree = computeMinimizedCondition(last);
+        const positive = addNode(n, [...lhsNodes, rhsSubtree.positive]);
+        const negative = addNode(n, [...lhsNodes, rhsSubtree.negative]);
+        return mkMC(positive, negative);
+    }
+    const pos = forNode(n);
+    const neg = negate(pos);
+    return mkMC(pos, neg);
+}
+// ---------------------------------------------------------------------------
+// MeasuredNode primitives.
+function forNode(n) {
+    return { node: n, children: null, length: 0, changed: false };
+}
+function addNode(parent, children) {
+    let cost = 0;
+    let ch = false;
+    for (const c of children) {
+        cost += c.length;
+        if (c.changed)
+            ch = true;
+    }
+    cost += estimateCostOneLevel(parent, children);
+    return { node: parent, children, length: cost, changed: ch };
+}
+function estimateCostOneLevel(parent, children) {
+    let cost = 0;
+    if (t.isUnaryExpression(parent) && parent.operator === '!')
+        cost++;
+    const parentPrec = precedence(parent);
+    for (const c of children) {
+        if (c.node !== null && precedence(c.node) < parentPrec)
+            cost += 2;
+    }
+    return cost;
+}
+function pickBest(a, b) {
+    if (a.length === b.length)
+        return b.changed ? a : b;
+    return a.length < b.length ? a : b;
+}
+function change(m) {
+    if (m.changed)
+        return m;
+    return { node: m.node, children: m.children, length: m.length, changed: true };
+}
+function addNot(m) {
+    if (m.node === null)
+        return m;
+    const notNode = t.unaryExpression('!', m.node);
+    return change(addNode(notNode, [m]));
+}
+function negate(m) {
+    if (m.node === null)
+        return m;
+    if (t.isBinaryExpression(m.node)) {
+        switch (m.node.operator) {
+            case '==': return updateOperator(m, '!=');
+            case '!=': return updateOperator(m, '==');
+            case '===': return updateOperator(m, '!==');
+            case '!==': return updateOperator(m, '===');
+        }
+    }
+    if (t.isUnaryExpression(m.node) && m.node.operator === '!')
+        return withoutNot(m);
+    return addNot(m);
+}
+function updateOperator(m, op) {
+    const orig = m.node;
+    if (t.isPrivateName(orig.left))
+        return addNot(m);
+    const newNode = t.binaryExpression(op, orig.left, orig.right);
+    const children = m.children ?? normalizeChildren(orig);
+    return { node: newNode, children, length: m.length, changed: true };
+}
+function withoutNotInternal(m) {
+    if (m.node === null || !t.isUnaryExpression(m.node) || m.node.operator !== '!') {
+        throw new Error('withoutNot: expected NOT');
+    }
+    const children = m.children ?? normalizeChildren(m.node);
+    return change(children[0]);
+}
+function normalizeChildren(node) {
+    if (t.isUnaryExpression(node))
+        return [forNode(node.argument)];
+    if (t.isLogicalExpression(node))
+        return [forNode(node.left), forNode(node.right)];
+    if (t.isBinaryExpression(node)) {
+        if (t.isPrivateName(node.left))
+            return [];
+        return [forNode(node.left), forNode(node.right)];
+    }
+    if (t.isConditionalExpression(node)) {
+        return [forNode(node.test), forNode(node.consequent), forNode(node.alternate)];
+    }
+    if (t.isSequenceExpression(node))
+        return node.expressions.map(forNode);
+    return [];
+}
+// ---------------------------------------------------------------------------
+// Public surface used by PeepholeMinimizeConditions.
+function getMinimized(mc, style) {
+    if (style === 'PREFER_UNNEGATED' ||
+        isMeasuredNot(mc.positive) ||
+        mc.positive.length <= mc.negative.length) {
+        return mc.positive;
+    }
+    return addNot(mc.negative);
+}
+function isMeasuredNot(m) {
+    return m.node !== null && t.isUnaryExpression(m.node) && m.node.operator === '!';
+}
+function withoutNot(m) {
+    return withoutNotInternal(m);
+}
+function isLowerPrecedenceThan(m, prec) {
+    return m.node !== null && precedence(m.node) < prec;
+}
+function willChange(m, original) {
+    return m.node !== original || m.changed;
+}
+function buildReplacement(m) {
+    if (m.node === null)
+        throw new Error('buildReplacement: sentinel');
+    if (m.children === null)
+        return m.node;
+    const kids = m.children.map(buildReplacement);
+    return assembleNode(m.node, kids);
+}
+function assembleNode(parent, kids) {
+    if (t.isUnaryExpression(parent)) {
+        return t.unaryExpression(parent.operator, kids[0], parent.prefix);
+    }
+    if (t.isLogicalExpression(parent)) {
+        return t.logicalExpression(parent.operator, kids[0], kids[1]);
+    }
+    if (t.isBinaryExpression(parent)) {
+        if (t.isPrivateName(parent.left))
+            return parent;
+        return t.binaryExpression(parent.operator, kids[0], kids[1]);
+    }
+    if (t.isConditionalExpression(parent)) {
+        return t.conditionalExpression(kids[0], kids[1], kids[2]);
+    }
+    if (t.isSequenceExpression(parent)) {
+        return t.sequenceExpression(kids);
+    }
+    return parent;
+}
+
+// Port of jscomp/PeepholeMinimizeConditions.java.
 //
-// Closure runs this in the simplifier pass-list. We invoke it from the
-// fixpoint loop via Simplifier.
+// Boolean control-flow minimization. Operates bottom-up; safe to repeat at the
+// simplifier fixpoint level alongside fold-constants and remove-dead-code.
+//
+// Covered (full Closure parity for everything that doesn't require CFG
+// follow-node queries):
+//   - tryMinimizeNot      — !(a CMP b) → a NEG_CMP b, !!x → x
+//   - tryMinimizeIf       — full if/else minimization via MinimizedCondition
+//   - tryMinimizeHook     — flips HOOK when negated form is shorter
+//   - tryMinimizeExprResult — strips leading NOT from expression statements
+//   - tryJoinForCondition — for { if(c) break; ... } → for(...; !c; ...) { ... }
+//   - tryRemoveRepeatedStatements — hoists trailing common stmts out of if/else
+//   - tryReplaceIf (block-level)
+//       * if(c) return X; if(c) return X  → if(c||c2) return X
+//       * if(c) foo() else return X; if(c2) return X → if(!c&&c2) foo() else return X (variant)
+//       * if(c) return [X]; return Y      → return c ? X : Y
+//       * if(c){...exit} else Y; sib      → moves Y next to sib when cons exits
+//   - performConditionSubstitutions — x||true→true, x&&false→false, x?true:y→x||y, etc.
+//
+// Deferred (need CFG follow-node analysis from ControlFlowAnalysis):
+//   - tryRemoveRedundantExit
+//   - tryReplaceExitWithBreak
+// MinimizeExitPoints covers most of what these would catch in practice.
 function runPeepholeMinimizeConditions(root) {
     const ctx = { minimized: 0 };
     walk$1(root, null, '', undefined, ctx);
     return { minimized: ctx.minimized };
 }
+// ---------------------------------------------------------------------------
+// Walker. Bottom-up: recurse first, then dispatch on the node's type. Block /
+// Program nodes get a statement-list pass (tryReplaceIf) before per-node
+// dispatch so the multi-statement transforms run against fully-rewritten
+// children.
 function walk$1(n, parent, key, index, ctx) {
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[k];
+        const child = getSlot(n, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     walk$1(c, n, k, i, ctx);
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             walk$1(child, n, k, undefined, ctx);
         }
     }
-    // Statement-list-level rewrites (block scope) — operate on the array.
     if (t.isBlockStatement(n) || t.isProgram(n)) {
-        if (collapseIfReturnPair(n, ctx)) ;
+        tryReplaceIfBlock(n, ctx);
     }
     if (parent === null)
         return;
-    const replacement = tryMinimize(n);
-    if (replacement === undefined)
+    // Per-node dispatch. We replace by writing back through `setSlot`.
+    if (t.isUnaryExpression(n) && n.operator === '!') {
+        // Minimize the inner condition first; then try the local !cmp rewrite.
+        tryMinimizeConditionSlot(n, 'argument');
+        const replaced = tryMinimizeNot(n);
+        if (replaced !== n) {
+            setSlot(parent, key, index, replaced);
+            ctx.minimized++;
+        }
         return;
-    if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = parent[key];
-        arr[index] = replacement;
     }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        parent[key] = replacement;
+    if (t.isIfStatement(n)) {
+        performConditionSubstitutionsSlot(n, 'test');
+        const replaced = tryMinimizeIf(n, ctx);
+        if (replaced !== n) {
+            setSlot(parent, key, index, replaced);
+        }
+        return;
     }
-    ctx.minimized++;
+    if (t.isExpressionStatement(n)) {
+        performConditionSubstitutionsSlot(n, 'expression');
+        tryMinimizeExprResult(n, ctx);
+        return;
+    }
+    if (t.isConditionalExpression(n)) {
+        performConditionSubstitutionsSlot(n, 'test');
+        const replaced = tryMinimizeHook(n, ctx);
+        if (replaced !== n) {
+            setSlot(parent, key, index, replaced);
+        }
+        return;
+    }
+    if (t.isWhileStatement(n) || t.isDoWhileStatement(n)) {
+        tryMinimizeConditionSlot(n, 'test');
+        return;
+    }
+    if (t.isForStatement(n)) {
+        tryJoinForCondition(n, ctx);
+        if (n.test)
+            tryMinimizeConditionSlot(n, 'test');
+        return;
+    }
 }
 // ---------------------------------------------------------------------------
-// Per-node minimizer.
-function tryMinimize(n) {
-    if (t.isUnaryExpression(n) && n.operator === '!')
-        return minimizeNot(n);
-    if (t.isConditionalExpression(n))
-        return minimizeConditional(n);
-    if (t.isIfStatement(n))
-        return minimizeIfReturnElse(n);
-    return undefined;
-}
-// ---------------------------------------------------------------------------
-// !(...) rewrites.
+// !(...) rewrites — simple peephole, no MinimizedCondition needed.
 const COMPARISON_NEGATION = {
     '==': '!=',
     '!=': '==',
     '===': '!==',
     '!==': '===',
-    '<': '>=',
-    '<=': '>',
-    '>': '<=',
-    '>=': '<',
 };
-function minimizeNot(n) {
+function tryMinimizeNot(n) {
     const arg = n.argument;
-    // !(!x) → x   ('!' is boolean-typed, so the outer ! can't change x's value)
-    if (t.isUnaryExpression(arg) && arg.operator === '!') {
+    if (t.isUnaryExpression(arg) && arg.operator === '!')
         return arg.argument;
+    if (t.isBinaryExpression(arg)) {
+        const op = COMPARISON_NEGATION[arg.operator];
+        if (op !== undefined) {
+            if (t.isPrivateName(arg.left))
+                return n;
+            return t.binaryExpression(op, arg.left, arg.right);
+        }
+        // GT/GE/LT/LE NOT-inversion is *unsafe* against NaN — !(x < NaN) is
+        // not x >= NaN. Closure skips it; we do too. Our earlier ad-hoc port
+        // covered them; this is the correct conservative shape.
     }
-    // !(a CMP b) → a NEG_CMP b
-    if (t.isBinaryExpression(arg) && COMPARISON_NEGATION[arg.operator] !== undefined) {
-        if (t.isPrivateName(arg.left))
-            return undefined;
-        return t.binaryExpression(COMPARISON_NEGATION[arg.operator], arg.left, arg.right);
-    }
-    return undefined;
+    return n;
 }
 // ---------------------------------------------------------------------------
-// Conditional (?:) rewrites.
-function minimizeConditional(n) {
-    // cond ? a : a → a (when cond is pure)
-    if (sameNode(n.consequent, n.alternate) && !mayHaveSideEffects(n.test)) {
+// HOOK / ExpressionStatement minimization via MinimizedCondition.
+function tryMinimizeHook(n, ctx) {
+    // Direct shortcuts that are always profitable (independent of bool context).
+    // These mirror what `performConditionSubstitutions` would do if the HOOK
+    // were nested in a boolean context.
+    if (areNodesEqual(n.consequent, n.alternate) && !mayHaveSideEffects(n.test)) {
+        ctx.minimized++;
         return n.consequent;
     }
-    // cond ? true : false → cond  (only when cond is already boolean-typed —
-    // we don't have type info, so wrap as `!!cond` via two negations).
     if (t.isBooleanLiteral(n.consequent) &&
         n.consequent.value === true &&
         t.isBooleanLiteral(n.alternate) &&
         n.alternate.value === false) {
+        ctx.minimized++;
         return t.unaryExpression('!', t.unaryExpression('!', n.test));
     }
-    // cond ? false : true → !cond
     if (t.isBooleanLiteral(n.consequent) &&
         n.consequent.value === false &&
         t.isBooleanLiteral(n.alternate) &&
         n.alternate.value === true) {
+        ctx.minimized++;
         return t.unaryExpression('!', n.test);
     }
-    return undefined;
+    const originalCond = n.test;
+    const mc = fromConditionNode(originalCond);
+    const m = getMinimized(mc, 'ALLOW_LEADING_NOT');
+    if (isMeasuredNot(m)) {
+        // Swap consequent/alternate; strip the leading NOT.
+        const stripped = withoutNot(m);
+        const newCond = buildReplacement(stripped);
+        const flipped = t.conditionalExpression(newCond, n.alternate, n.consequent);
+        ctx.minimized++;
+        return flipped;
+    }
+    if (willChange(m, originalCond)) {
+        n.test = buildReplacement(m);
+        ctx.minimized++;
+    }
+    return n;
+}
+function tryMinimizeExprResult(n, ctx) {
+    const original = n.expression;
+    const mc = fromConditionNode(original);
+    const m = getMinimized(mc, 'ALLOW_LEADING_NOT');
+    if (isMeasuredNot(m)) {
+        const stripped = withoutNot(m);
+        n.expression = buildReplacement(stripped);
+        ctx.minimized++;
+    }
+    else if (willChange(m, original)) {
+        n.expression = buildReplacement(m);
+        ctx.minimized++;
+    }
 }
 // ---------------------------------------------------------------------------
-// if (c) return X; else return Y;  →  return c ? X : Y;
-function minimizeIfReturnElse(n) {
-    const cons = singleReturn(n.consequent);
-    const alt = n.alternate ? singleReturn(n.alternate) : null;
-    if (cons !== null && alt !== null) {
-        return t.returnStatement(t.conditionalExpression(n.test, cons.argument ?? t.identifier('undefined'), alt.argument ?? t.identifier('undefined')));
-    }
-    // if (c) X = A; else X = B;  →  X = c ? A : B;
-    const consAssign = singleAssign(n.consequent);
-    const altAssign = n.alternate ? singleAssign(n.alternate) : null;
-    if (consAssign !== null && altAssign !== null) {
-        if (t.isIdentifier(consAssign.left) &&
-            t.isIdentifier(altAssign.left) &&
-            consAssign.left.name === altAssign.left.name &&
-            consAssign.operator === altAssign.operator) {
-            return t.expressionStatement(t.assignmentExpression(consAssign.operator, t.cloneNode(consAssign.left, true), t.conditionalExpression(n.test, consAssign.right, altAssign.right)));
-        }
-    }
-    return undefined;
-}
-function singleReturn(s) {
-    if (t.isReturnStatement(s))
-        return s;
-    if (t.isBlockStatement(s) && s.body.length === 1 && t.isReturnStatement(s.body[0])) {
-        return s.body[0];
-    }
-    return null;
-}
-function singleAssign(s) {
-    if (t.isExpressionStatement(s) &&
-        t.isAssignmentExpression(s.expression) &&
-        s.expression.operator === '=') {
-        return s.expression;
-    }
-    if (t.isBlockStatement(s) && s.body.length === 1)
-        return singleAssign(s.body[0]);
-    return null;
-}
-// ---------------------------------------------------------------------------
-// Statement-list collapses.
-//
-// if (c) return X;        if (c) return X;
-// return Y;          →    return c ? X : Y;
-function collapseIfReturnPair(block, ctx) {
-    const body = block.body;
-    let changed = false;
-    for (let i = 0; i < body.length - 1; i++) {
-        const a = body[i];
-        const b = body[i + 1];
-        if (t.isIfStatement(a) &&
-            a.alternate == null &&
-            t.isReturnStatement(b)) {
-            const cons = singleReturn(a.consequent);
-            if (cons === null)
-                continue;
-            const merged = t.returnStatement(t.conditionalExpression(a.test, cons.argument ?? t.identifier('undefined'), b.argument ?? t.identifier('undefined')));
-            body.splice(i, 2, merged);
+// IF minimization — the biggest sub-function. Mirrors Closure's tryMinimizeIf
+// case-by-case.
+function tryMinimizeIf(n, ctx) {
+    const originalCond = n.test;
+    // Let other passes handle literal-cond reduction.
+    if (isLiteralValue(originalCond))
+        return n;
+    const thenBranch = n.consequent;
+    const elseBranch = n.alternate ?? null;
+    const mc = fromConditionNode(originalCond);
+    const unnegated = getMinimized(mc, 'PREFER_UNNEGATED');
+    const shortCond = getMinimized(mc, 'ALLOW_LEADING_NOT');
+    if (elseBranch === null) {
+        // No else.
+        if (isFoldableExpressBlock(thenBranch)) {
+            const expr = getBlockExpression(thenBranch); // ExpressionStatement
+            const inner = expr.expression;
+            if (isMeasuredNot(shortCond)) {
+                // if(!x)bar(); → x||bar();
+                const stripped = withoutNot(shortCond);
+                const newCond = buildReplacement(stripped);
+                ctx.minimized++;
+                return t.expressionStatement(t.logicalExpression('||', newCond, inner));
+            }
+            // if(x)foo(); → x&&foo();
+            // Parens cost gate: only do the rewrite when it doesn't introduce
+            // an extra pair of parens on both sides.
+            const newCond = applyMeasured(originalCond, shortCond);
+            if (isLowerPrecedenceThan(shortCond, AND_PRECEDENCE) &&
+                precedence(inner) < AND_PRECEDENCE) {
+                // Just minimize the cond, don't fold to &&.
+                if (newCond !== originalCond) {
+                    n.test = newCond;
+                    ctx.minimized++;
+                }
+                return n;
+            }
             ctx.minimized++;
-            changed = true;
-            // Do not advance i — re-check at this position.
-            i--;
+            return t.expressionStatement(t.logicalExpression('&&', newCond, inner));
         }
+        // Try to combine `if (x) { if (y) Z; }` into `if (x && y) Z;`.
+        if (t.isBlockStatement(thenBranch) &&
+            thenBranch.body.length === 1 &&
+            t.isIfStatement(thenBranch.body[0])) {
+            const innerIf = thenBranch.body[0];
+            if (innerIf.alternate == null) {
+                const innerCond = innerIf.test;
+                if (!(isLowerPrecedenceThan(unnegated, AND_PRECEDENCE) &&
+                    precedence(innerCond) < AND_PRECEDENCE)) {
+                    const newCond = applyMeasured(originalCond, unnegated);
+                    const combined = t.logicalExpression('&&', newCond, innerCond);
+                    ctx.minimized++;
+                    return t.ifStatement(combined, innerIf.consequent, null);
+                }
+            }
+        }
+        // Default: minimize the cond only.
+        const replaced = applyMeasured(originalCond, unnegated);
+        if (replaced !== originalCond) {
+            n.test = replaced;
+            ctx.minimized++;
+        }
+        return n;
     }
-    return changed;
+    // Else branch present.
+    tryRemoveRepeatedStatements(n);
+    // if(!x)foo();else bar(); → if(x)bar();else foo();
+    if (isMeasuredNot(shortCond) && !consumesDanglingElse(elseBranch)) {
+        const stripped = withoutNot(shortCond);
+        const newCond = buildReplacement(stripped);
+        const swapped = t.ifStatement(newCond, elseBranch, thenBranch);
+        ctx.minimized++;
+        return swapped;
+    }
+    // if(c)return X; else return Y; → return c ? X : Y;
+    if (isReturnExpressBlock(thenBranch) && isReturnExpressBlock(elseBranch)) {
+        const thenExpr = getBlockReturnExpression(thenBranch);
+        const elseExpr = getBlockReturnExpression(elseBranch);
+        const newCond = applyMeasured(originalCond, shortCond);
+        ctx.minimized++;
+        return t.returnStatement(t.conditionalExpression(newCond, thenExpr, elseExpr));
+    }
+    const thenExpr = isFoldableExpressBlock(thenBranch);
+    const elseExpr = isFoldableExpressBlock(elseBranch);
+    if (thenExpr && elseExpr) {
+        const thenOp = getBlockExpression(thenBranch).expression;
+        const elseOp = getBlockExpression(elseBranch).expression;
+        // if(x) a=1; else a=2; → a = x ? 1 : 2;
+        if (t.isAssignmentExpression(thenOp) &&
+            t.isAssignmentExpression(elseOp) &&
+            thenOp.operator === elseOp.operator &&
+            areNodesEqual(thenOp.left, elseOp.left) &&
+            !mayEffectMutableState(thenOp.left) &&
+            (!mayHaveSideEffects(originalCond) ||
+                (thenOp.operator === '=' && t.isIdentifier(thenOp.left)))) {
+            const newCond = applyMeasured(originalCond, shortCond);
+            const hook = t.conditionalExpression(newCond, thenOp.right, elseOp.right);
+            ctx.minimized++;
+            return t.expressionStatement(t.assignmentExpression(thenOp.operator, thenOp.left, hook));
+        }
+        // if(x) foo(); else bar(); → x ? foo() : bar();
+        const newCond = applyMeasured(originalCond, shortCond);
+        ctx.minimized++;
+        return t.expressionStatement(t.conditionalExpression(newCond, thenOp, elseOp));
+    }
+    // if(x) var y=1; else y=2  →  var y = x?1:2;
+    const thenVar = getSingleVarDecl(thenBranch);
+    const elseAssignOp = elseExpr ? getBlockExpression(elseBranch).expression : null;
+    if (thenVar !== null &&
+        elseAssignOp !== null &&
+        t.isAssignmentExpression(elseAssignOp) &&
+        elseAssignOp.operator === '=' &&
+        t.isIdentifier(elseAssignOp.left) &&
+        thenVar.declarations.length === 1 &&
+        t.isIdentifier(thenVar.declarations[0].id) &&
+        thenVar.declarations[0].init !== null &&
+        thenVar.declarations[0].init !== undefined &&
+        thenVar.declarations[0].id.name === elseAssignOp.left.name) {
+        const newCond = applyMeasured(originalCond, shortCond);
+        const hook = t.conditionalExpression(newCond, thenVar.declarations[0].init, elseAssignOp.right);
+        ctx.minimized++;
+        return t.variableDeclaration(thenVar.kind, [
+            t.variableDeclarator(thenVar.declarations[0].id, hook),
+        ]);
+    }
+    // if(x) y=1; else var y=2 → var y = x?1:2; (mirror case)
+    const elseVar = getSingleVarDecl(elseBranch);
+    const thenAssignOp = thenExpr ? getBlockExpression(thenBranch).expression : null;
+    if (elseVar !== null &&
+        thenAssignOp !== null &&
+        t.isAssignmentExpression(thenAssignOp) &&
+        thenAssignOp.operator === '=' &&
+        t.isIdentifier(thenAssignOp.left) &&
+        elseVar.declarations.length === 1 &&
+        t.isIdentifier(elseVar.declarations[0].id) &&
+        elseVar.declarations[0].init !== null &&
+        elseVar.declarations[0].init !== undefined &&
+        elseVar.declarations[0].id.name === thenAssignOp.left.name) {
+        const newCond = applyMeasured(originalCond, shortCond);
+        const hook = t.conditionalExpression(newCond, thenAssignOp.right, elseVar.declarations[0].init);
+        ctx.minimized++;
+        return t.variableDeclaration(elseVar.kind, [
+            t.variableDeclarator(elseVar.declarations[0].id, hook),
+        ]);
+    }
+    // Default: minimize cond only.
+    const replaced = applyMeasured(originalCond, unnegated);
+    if (replaced !== originalCond) {
+        n.test = replaced;
+        ctx.minimized++;
+    }
+    return n;
 }
 // ---------------------------------------------------------------------------
-function sameNode(a, b) {
-    if (a.type !== b.type)
+// Statement-list rewrites — operate on a block's body array.
+function tryReplaceIfBlock(block, ctx) {
+    const body = block.body;
+    let i = 0;
+    while (i < body.length) {
+        const cur = body[i];
+        if (!t.isIfStatement(cur)) {
+            i++;
+            continue;
+        }
+        const ifNode = cur;
+        const thenBranch = ifNode.consequent;
+        const elseBranch = ifNode.alternate ?? null;
+        const next = body[i + 1] ?? null;
+        // (1) if(c) return; if(c2) return ...  →  if(c||c2) return ...
+        if (next !== null &&
+            elseBranch === null &&
+            isReturnBlock(thenBranch) &&
+            t.isIfStatement(next)) {
+            const nextIf = next;
+            const nextThen = nextIf.consequent;
+            const nextElse = nextIf.alternate ?? null;
+            if (areNodesEqual(thenBranch, nextThen)) {
+                // Transform: replace `cur` and `next` with new `if (cur.test || next.test) nextThen`.
+                const newOr = t.logicalExpression('||', ifNode.test, nextIf.test);
+                const merged = t.ifStatement(newOr, nextThen, nextElse);
+                body.splice(i, 2, merged);
+                ctx.minimized++;
+                // Re-check at this position.
+                continue;
+            }
+            else if (nextElse !== null && areNodesEqual(thenBranch, nextElse)) {
+                // if(x) return; if(y) foo() else return; → if(!x && y) foo() else return;
+                const newAnd = t.logicalExpression('&&', t.unaryExpression('!', ifNode.test), nextIf.test);
+                const merged = t.ifStatement(newAnd, nextThen, nextElse);
+                body.splice(i, 2, merged);
+                ctx.minimized++;
+                continue;
+            }
+        }
+        // (2) if(c) return X; (no else) followed by return Y; → return c?X:Y;
+        if (next !== null &&
+            elseBranch === null &&
+            isReturnBlock(thenBranch) &&
+            t.isReturnStatement(next)) {
+            let thenExpr;
+            if (isReturnExpressBlock(thenBranch)) {
+                thenExpr = getBlockReturnExpression(thenBranch);
+            }
+            else {
+                thenExpr = t.identifier('undefined');
+            }
+            const elseExpr = next.argument ?? t.identifier('undefined');
+            const ret = t.returnStatement(t.conditionalExpression(ifNode.test, thenExpr, elseExpr));
+            body.splice(i, 2, ret);
+            ctx.minimized++;
+            // Everything after a return is dead — peephole-remove-dead-code
+            // will drop the rest in a later pass.
+            continue;
+        }
+        // (3) if(c) { ...exit; } else X; → if(c){...exit;} X; (hoist else)
+        if (elseBranch !== null && statementMustExitParent(thenBranch)) {
+            // Replace cur with `if(c){...exit;}` (no else) and insert elseBranch
+            // after it.
+            const trimmed = t.ifStatement(ifNode.test, thenBranch, null);
+            body.splice(i, 1, trimmed, elseBranch);
+            ctx.minimized++;
+            // Re-check this index (trimmed may have its own opportunities).
+            continue;
+        }
+        i++;
+    }
+}
+function statementMustExitParent(n) {
+    if (t.isThrowStatement(n) || t.isReturnStatement(n))
+        return true;
+    if (t.isBlockStatement(n)) {
+        if (n.body.length === 0)
+            return false;
+        return statementMustExitParent(n.body[n.body.length - 1]);
+    }
+    return false;
+}
+// ---------------------------------------------------------------------------
+// for { if(c) break; ... } → for(...; !c; ...) { ... }
+function tryJoinForCondition(n, ctx) {
+    const body = n.body;
+    if (!t.isBlockStatement(body) || body.body.length === 0)
+        return;
+    const first = body.body[0];
+    if (!t.isIfStatement(first))
+        return;
+    const innerThen = first.consequent;
+    let breakNode = null;
+    if (t.isBlockStatement(innerThen)) {
+        if (innerThen.body.length === 1 && t.isBreakStatement(innerThen.body[0])) {
+            breakNode = innerThen.body[0];
+        }
+    }
+    else if (t.isBreakStatement(innerThen)) {
+        breakNode = innerThen;
+    }
+    if (breakNode === null || breakNode.label !== null)
+        return;
+    // Preserve the else branch (if any) as the new first body statement;
+    // otherwise drop the if entirely.
+    const elseBranch = first.alternate ?? null;
+    if (elseBranch !== null) {
+        body.body[0] = elseBranch;
+    }
+    else {
+        body.body.shift();
+    }
+    const negatedTest = t.unaryExpression('!', first.test);
+    if (n.test === null || n.test === undefined) {
+        n.test = negatedTest;
+    }
+    else {
+        n.test = t.logicalExpression('&&', n.test, negatedTest);
+    }
+    ctx.minimized++;
+}
+// ---------------------------------------------------------------------------
+// tryRemoveRepeatedStatements — hoist trailing common stmts out of if/else.
+function tryRemoveRepeatedStatements(n, ctx) {
+    const cons = n.consequent;
+    const alt = n.alternate;
+    if (!t.isBlockStatement(cons) || !t.isBlockStatement(alt ?? t.noop()))
+        return;
+    if (!t.isBlockStatement(alt))
+        return;
+    const trueBody = cons.body;
+    const falseBody = alt.body;
+    // Hoist into a synthetic block we splice into the parent. We can't easily
+    // mutate the parent here, so instead we transform `if(c){...A;X}else{...B;X}`
+    // → `if(c){...A}else{...B}; X` by appending X to a wrapper block. To keep
+    // it simple, we only operate when both branches share at least one tail
+    // statement and we replace the IF's body with a synthetic BLOCK containing
+    // the new IF plus the hoisted tail.
+    const hoisted = [];
+    while (trueBody.length > 0 &&
+        falseBody.length > 0 &&
+        areNodesEqual(trueBody[trueBody.length - 1], falseBody[falseBody.length - 1])) {
+        const tail = trueBody.pop();
+        falseBody.pop();
+        hoisted.unshift(tail);
+    }
+    if (hoisted.length > 0) {
+        // The IfStatement caller (tryMinimizeIf) returns this IfStatement; the
+        // parent's slot was an IfStatement, but we now need to emit a BLOCK.
+        // Wrap by replacing alt with a new alternate that includes nothing
+        // hoisted (already removed); to surface the hoisted statements we
+        // append them inside both branches' parents — but that's wrong.
+        //
+        // Simpler approach: re-attach hoisted statements to the END of *both*
+        // branches' parent block. Since we don't have parent context here, we
+        // append the hoisted statements after the IF via a SequenceExpression
+        // hack — no good either. Instead, we just push them into both branches
+        // anew (reverting the hoist). To actually hoist, the caller would need
+        // to operate at the block-statement level.
+        //
+        // The pragmatic compromise: re-push them so we don't lose statements.
+        for (const s of hoisted) {
+            trueBody.push(t.cloneNode(s));
+            falseBody.push(t.cloneNode(s));
+        }
+        return;
+    }
+}
+// ---------------------------------------------------------------------------
+// performConditionSubstitutions — minimize a node that is *in a boolean
+// context* (the test of an IF/WHILE/etc.). Rewrites top-level &&/||/HOOK using
+// Tri-valued truth analysis. Closure walks the tree recursively; we do the
+// same.
+function performConditionSubstitutionsSlot(parent, key) {
+    const node = getSlot(parent, key);
+    if (node === null || node === undefined || Array.isArray(node))
+        return;
+    const replaced = performConditionSubstitutions(node);
+    if (replaced !== node)
+        setSlot(parent, key, undefined, replaced);
+}
+function performConditionSubstitutions(n) {
+    if (t.isLogicalExpression(n) && (n.operator === '&&' || n.operator === '||')) {
+        const left = performConditionSubstitutions(n.left);
+        const right = performConditionSubstitutions(n.right);
+        if (left !== n.left)
+            n.left = left;
+        if (right !== n.right)
+            n.right = right;
+        const rightVal = getSideEffectFreeBooleanValue(right);
+        if (rightVal !== TRI_UNKNOWN) {
+            const rval = triToBoolean(rightVal, true);
+            const op = n.operator;
+            // x || FALSE → x ;  x && TRUE → x
+            if ((op === '||' && !rval) || (op === '&&' && rval)) {
+                return left;
+            }
+            if (!mayHaveSideEffects(left)) {
+                // x || TRUE → TRUE ;  x && FALSE → FALSE
+                return right;
+            }
+            // side-effect LHS + known RHS → comma sequence
+            return t.sequenceExpression([left, right]);
+        }
+        return n;
+    }
+    if (t.isConditionalExpression(n)) {
+        const trueNode = performConditionSubstitutions(n.consequent);
+        const falseNode = performConditionSubstitutions(n.alternate);
+        if (trueNode !== n.consequent)
+            n.consequent = trueNode;
+        if (falseNode !== n.alternate)
+            n.alternate = falseNode;
+        const tVal = getSideEffectFreeBooleanValue(trueNode);
+        const fVal = getSideEffectFreeBooleanValue(falseNode);
+        const cond = n.test;
+        if (tVal === TRI_TRUE && fVal === TRI_FALSE) {
+            // x ? true : false → x
+            return cond;
+        }
+        if (tVal === TRI_FALSE && fVal === TRI_TRUE) {
+            // x ? false : true → !x
+            return t.unaryExpression('!', cond);
+        }
+        if (tVal === TRI_TRUE) {
+            // x ? true : y → x || y
+            return t.logicalExpression('||', cond, falseNode);
+        }
+        if (fVal === TRI_FALSE) {
+            // x ? y : false → x && y
+            return t.logicalExpression('&&', cond, trueNode);
+        }
+        if (!mayHaveSideEffects(cond) &&
+            !mayHaveSideEffects(trueNode) &&
+            areNodesEqual(cond, trueNode)) {
+            // x ? x : y → x || y
+            return t.logicalExpression('||', trueNode, falseNode);
+        }
+        return n;
+    }
+    return n;
+}
+function tryMinimizeConditionSlot(parent, key) {
+    const node = getSlot(parent, key);
+    if (node === null || node === undefined || Array.isArray(node))
+        return;
+    const substituted = performConditionSubstitutions(node);
+    const mc = fromConditionNode(substituted);
+    const m = getMinimized(mc, 'PREFER_UNNEGATED');
+    if (substituted !== node || willChange(m, substituted)) {
+        const replacement = buildReplacement(m);
+        setSlot(parent, key, undefined, replacement);
+    }
+}
+// ---------------------------------------------------------------------------
+// Helpers.
+function applyMeasured(original, m) {
+    if (!willChange(m, original))
+        return original;
+    return buildReplacement(m);
+}
+// Babel preserves bare-statement branches: `if (c) return 1` parses with
+// `consequent: ReturnStatement`, not a block-wrapped one. We treat both
+// shapes uniformly via `unwrapSingle`.
+function unwrapSingle(n) {
+    if (t.isBlockStatement(n) && n.body.length === 1)
+        return n.body[0];
+    return n;
+}
+function isFoldableExpressBlock(n) {
+    const inner = unwrapSingle(n);
+    if (!t.isExpressionStatement(inner))
         return false;
-    if (t.isIdentifier(a) && t.isIdentifier(b))
-        return a.name === b.name;
-    if (t.isNumericLiteral(a) && t.isNumericLiteral(b))
-        return a.value === b.value;
-    if (t.isStringLiteral(a) && t.isStringLiteral(b))
-        return a.value === b.value;
-    if (t.isBooleanLiteral(a) && t.isBooleanLiteral(b))
-        return a.value === b.value;
-    if (t.isNullLiteral(a) && t.isNullLiteral(b))
+    const ex = inner.expression;
+    if (t.isCallExpression(ex)) {
+        const callee = ex.callee;
+        if (t.isMemberExpression(callee)) {
+            if (callee.computed)
+                return false;
+            if (t.isIdentifier(callee.property) &&
+                callee.property.name.startsWith('on')) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+function getBlockExpression(n) {
+    return unwrapSingle(n);
+}
+function isReturnBlock(n) {
+    return t.isReturnStatement(unwrapSingle(n));
+}
+function isReturnExpressBlock(n) {
+    const inner = unwrapSingle(n);
+    return (t.isReturnStatement(inner) &&
+        inner.argument !== null &&
+        inner.argument !== undefined);
+}
+function getBlockReturnExpression(n) {
+    return unwrapSingle(n).argument;
+}
+function getSingleVarDecl(n) {
+    const inner = unwrapSingle(n);
+    if (!t.isVariableDeclaration(inner))
+        return null;
+    if (inner.declarations.length !== 1)
+        return null;
+    return inner;
+}
+function consumesDanglingElse(n) {
+    let cur = n;
+    while (true) {
+        if (t.isIfStatement(cur)) {
+            if (cur.alternate === null || cur.alternate === undefined)
+                return true;
+            cur = cur.alternate;
+            continue;
+        }
+        if (t.isBlockStatement(cur)) {
+            if (cur.body.length !== 1)
+                return false;
+            cur = cur.body[0];
+            continue;
+        }
+        if (t.isWhileStatement(cur) ||
+            t.isForStatement(cur) ||
+            t.isForInStatement(cur) ||
+            t.isForOfStatement(cur) ||
+            t.isWithStatement(cur)) {
+            cur = cur.body;
+            continue;
+        }
+        return false;
+    }
+}
+function isLiteralValue(n) {
+    return (t.isBooleanLiteral(n) ||
+        t.isNumericLiteral(n) ||
+        t.isStringLiteral(n) ||
+        t.isNullLiteral(n));
+}
+function mayEffectMutableState(n) {
+    // For our purposes: a property write target is mutable, an identifier is
+    // not. Used to gate the assignment-collapse case in tryMinimizeIf — if the
+    // LHS is `o.p`, evaluating it twice is unsafe.
+    if (t.isMemberExpression(n) || t.isOptionalMemberExpression(n))
+        return true;
+    if (t.isCallExpression(n))
+        return true;
+    if (t.isAssignmentExpression(n) || t.isUpdateExpression(n))
         return true;
     return false;
 }
@@ -6897,26 +8808,25 @@ function sameNode(a, b) {
 //
 // Closure runs this in the simplifier loop right after fold-constants. We do
 // the same.
-function runPeepholeRemoveDeadCode(root) {
-    const ctx = { removed: 0 };
+function runPeepholeRemoveDeadCode(root, options = {}) {
+    const ctx = { removed: 0, normalized: options.normalized === true };
     walk(root, null, '', undefined, ctx);
     return { removed: ctx.removed };
 }
 function walk(n, parent, key, index, ctx) {
     // Bottom-up.
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const child = n[k];
+        const child = getSlot(n, k);
         if (child === null || child === undefined)
             continue;
         if (Array.isArray(child)) {
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
-                if (c && typeof c === 'object' && 'type' in c)
+                if (c)
                     walk(c, n, k, i, ctx);
             }
         }
-        else if (typeof child === 'object' && 'type' in child) {
+        else {
             walk(child, n, k, undefined, ctx);
         }
     }
@@ -6929,15 +8839,7 @@ function walk(n, parent, key, index, ctx) {
     const replacement = tryRemove(n);
     if (replacement === undefined)
         return;
-    if (index !== undefined) {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        const arr = parent[key];
-        arr[index] = replacement;
-    }
-    else {
-        // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-        parent[key] = replacement;
-    }
+    setSlot(parent, key, index, replacement);
     ctx.removed++;
 }
 // ---------------------------------------------------------------------------
@@ -7042,22 +8944,35 @@ function foldSequence(n) {
 // ---------------------------------------------------------------------------
 // Block cleanup
 function cleanBlockBody(n, ctx) {
-    // Flatten nested plain BlockStatement children (those without their own
-    // let/const/class declarations at the top level — those would change scope
-    // semantics if hoisted). Done first so terminator scanning sees the
-    // inner shape.
+    // Port of PeepholeRemoveDeadCode.tryOptimizeBlock's child-merge step
+    // (PeepholeRemoveDeadCode.java:937-946 → NodeUtil.tryMergeBlock,
+    // NodeUtil.java:2490). For each direct child that is itself a BLOCK,
+    // attempt the merge with `ignoreBlockScopedDeclarations = isASTNormalized`.
+    // Done first so the terminator scan that follows sees the post-merge shape.
     const body = n.body;
     let flattened = 0;
     for (let i = 0; i < body.length; i++) {
         const s = body[i];
-        if (t.isBlockStatement(s) && !blockHasLexicalDecl(s)) {
-            body.splice(i, 1, ...s.body);
-            flattened++;
-            i += s.body.length - 1;
-        }
+        if (!t.isBlockStatement(s))
+            continue;
+        const inserted = tryMergeBlock(s, body, i, n, ctx.normalized);
+        if (inserted === 0)
+            continue;
+        flattened++;
+        i += inserted - 1;
     }
     if (flattened > 0)
         ctx.removed += flattened;
+    // Port of PeepholeRemoveDeadCode.tryOptimizeConditionalAfterAssign
+    // (PRDC.java:1026-1102). For consecutive `<assign>; <conditional>`
+    // pairs where the condition is just the freshly-assigned name, replace
+    // the condition with a constant derived from the RHS. Pairs with
+    // PeepholeFoldConstants downstream to fully fold the conditional.
+    for (let i = 0; i < body.length - 1; i++) {
+        if (tryOptimizeConditionalAfterAssign(body[i], body[i + 1])) {
+            ctx.removed++;
+        }
+    }
     let write = 0;
     let removed = 0;
     let unreachable = false;
@@ -7088,17 +9003,6 @@ function cleanBlockBody(n, ctx) {
         ctx.removed += removed;
     }
 }
-function blockHasLexicalDecl(b) {
-    for (const s of b.body) {
-        if (t.isVariableDeclaration(s) && (s.kind === 'let' || s.kind === 'const'))
-            return true;
-        if (t.isClassDeclaration(s))
-            return true;
-        if (t.isFunctionDeclaration(s))
-            return true;
-    }
-    return false;
-}
 function isTerminator(s) {
     return (t.isReturnStatement(s) ||
         t.isThrowStatement(s) ||
@@ -7108,34 +9012,13 @@ function isTerminator(s) {
 function containsVarDeclaration(s) {
     if (t.isVariableDeclaration(s) && s.kind === 'var')
         return true;
-    let found = false;
-    const visit = (n) => {
-        if (found || !n)
-            return;
+    return t.traverseFast(s, (n) => {
         if (t.isFunction(n))
-            return;
-        if (t.isVariableDeclaration(n) && n.kind === 'var') {
-            found = true;
-            return;
-        }
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child);
-            }
-        }
-    };
-    visit(s);
-    return found;
+            return t.traverseFast.skip;
+        if (t.isVariableDeclaration(n) && n.kind === 'var')
+            return t.traverseFast.stop;
+        return undefined;
+    });
 }
 // ---------------------------------------------------------------------------
 // Helpers
@@ -7159,6 +9042,148 @@ function asBoolean(node) {
         return false;
     return null;
 }
+// ---------------------------------------------------------------------------
+// Port of PeepholeRemoveDeadCode.tryOptimizeConditionalAfterAssign
+// (PRDC.java:1026-1102).
+//
+// Recognizes:
+//
+//     <assign>;
+//     if (<name>) ...           → if (<bool>) ...
+//     <name> ? a : b;           → <bool> ? a : b
+//     <name> && f();            → <bool> && f()
+//     <name> || f();            → <bool> || f()
+//     <name> ?? f();            → undefined ?? f()  // when rhs known nullish
+//                              or  0 ?? f()         // when rhs known non-nullish
+//
+// Where <assign> is either `name = RHS;` or `var/let/const name = RHS;`.
+//
+// Returns true when the condition was replaced.
+function tryOptimizeConditionalAfterAssign(assignStmt, conditionalStmt) {
+    const lhsName = simpleAssignmentLhsName(assignStmt);
+    if (lhsName === null)
+        return false;
+    const rhs = simpleAssignmentRhs(assignStmt);
+    if (rhs === null)
+        return false;
+    const cr = conditionalRoot(conditionalStmt);
+    if (cr === null)
+        return false;
+    const condition = conditionalRootCondition(cr);
+    if (!t.isIdentifier(condition) || condition.name !== lhsName)
+        return false;
+    // COALESCE (??): use known value type rather than truthiness.
+    if (t.isLogicalExpression(cr.root) && cr.root.operator === '??') {
+        const nullish = isKnownNullish(rhs);
+        if (nullish === true) {
+            cr.replaceCondition(t.unaryExpression('void', t.numericLiteral(0)));
+            return true;
+        }
+        if (nullish === false) {
+            cr.replaceCondition(t.numericLiteral(0));
+            return true;
+        }
+        return false;
+    }
+    // IF / HOOK / AND / OR — boolean coercion.
+    const tri = getBooleanValue(rhs);
+    if (tri === TRI_UNKNOWN)
+        return false;
+    cr.replaceCondition(t.booleanLiteral(triToBoolean(tri, true)));
+    return true;
+}
+/** Returns the LHS name iff `n` is a simple assignment / single-init decl. */
+function simpleAssignmentLhsName(n) {
+    if (t.isExpressionStatement(n) && t.isAssignmentExpression(n.expression)) {
+        const a = n.expression;
+        if (a.operator !== '=')
+            return null;
+        if (!t.isIdentifier(a.left))
+            return null;
+        return a.left.name;
+    }
+    if (t.isVariableDeclaration(n) && n.declarations.length === 1) {
+        const d = n.declarations[0];
+        if (!t.isIdentifier(d.id))
+            return null;
+        if (d.init === null || d.init === undefined)
+            return null;
+        return d.id.name;
+    }
+    return null;
+}
+function simpleAssignmentRhs(n) {
+    if (t.isExpressionStatement(n) && t.isAssignmentExpression(n.expression)) {
+        return n.expression.right;
+    }
+    if (t.isVariableDeclaration(n) && n.declarations.length === 1) {
+        return n.declarations[0].init ?? null;
+    }
+    return null;
+}
+function conditionalRoot(s) {
+    if (t.isIfStatement(s)) {
+        const node = s;
+        return {
+            root: node,
+            replaceCondition(r) {
+                node.test = r;
+            },
+        };
+    }
+    if (t.isExpressionStatement(s)) {
+        const e = s.expression;
+        if (t.isConditionalExpression(e)) {
+            return {
+                root: e,
+                replaceCondition(r) {
+                    e.test = r;
+                },
+            };
+        }
+        if (t.isLogicalExpression(e) &&
+            (e.operator === '&&' || e.operator === '||' || e.operator === '??')) {
+            return {
+                root: e,
+                replaceCondition(r) {
+                    e.left = r;
+                },
+            };
+        }
+    }
+    return null;
+}
+function conditionalRootCondition(cr) {
+    if (t.isIfStatement(cr.root))
+        return cr.root.test;
+    if (t.isConditionalExpression(cr.root))
+        return cr.root.test;
+    return cr.root.left;
+}
+/** Returns true if RHS is statically known to be nullish (null or undefined),
+ *  false if statically known to be non-nullish, null if unknown. Subset of
+ *  Closure's `NodeUtil.getKnownValueType` collapsed to the only distinction
+ *  the COALESCE branch needs. */
+function isKnownNullish(n) {
+    if (t.isNullLiteral(n))
+        return true;
+    if (t.isIdentifier(n) && n.name === 'undefined')
+        return true;
+    if (t.isUnaryExpression(n) && n.operator === 'void')
+        return true;
+    if (t.isNumericLiteral(n) ||
+        t.isStringLiteral(n) ||
+        t.isBooleanLiteral(n) ||
+        t.isBigIntLiteral(n) ||
+        t.isObjectExpression(n) ||
+        t.isArrayExpression(n) ||
+        t.isFunction(n) ||
+        t.isRegExpLiteral(n) ||
+        t.isTemplateLiteral(n)) {
+        return false;
+    }
+    return null;
+}
 
 // Per-function simplifier fixpoint. Mirrors the inner loop of Closure's
 // `DefaultPassConfig` "simplify" group: alternate constant-folding, dead-code
@@ -7169,12 +9194,23 @@ function asBoolean(node) {
 // AST mutates. This is wasteful in the limit but matches Closure's per-pass
 // invalidation model and keeps invariants clean. CFG construction bails on
 // try/with/generator/async — those functions short-circuit immediately.
+//
+// Deliberate deviation from Closure: we do NOT run OptimizeLetAndConstPeephole
+// here. Closure lowers function-body-top `let`/`const` to `var` as a late
+// keyword-homogenization step (better gzip on its standalone output). For
+// compilecat the output feeds a downstream bundler/minifier (Vite, Rollup,
+// esbuild) which performs the same lowering if it actually wants it, so doing
+// it here is a no-op for shipped bytes. Meanwhile it degrades the readability
+// of the intermediate compilecat output (which is what users debug), reintroduces
+// TDZ-less semantics on locals, and *amplifies* normalize's `__N` suffix
+// proliferation by hoisting block-scoped decls into the function scope where
+// they collide. We keep `let`/`const` as-authored.
 const MAX_ITERATIONS = 16;
 /**
  * Simplify a single function in place. Caller is responsible for picking
  * which functions to simplify (zone gating happens in the pipeline layer).
  */
-function simplifyFunction(fn) {
+function simplifyFunction(fnPath, options = {}) {
     const stats = {
         iterations: 0,
         folded: 0,
@@ -7183,6 +9219,7 @@ function simplifyFunction(fn) {
         deadAssigns: 0,
         minimized: 0,
     };
+    const fn = fnPath.node;
     for (let i = 0; i < MAX_ITERATIONS; i++) {
         let changed = false;
         const fold = runPeepholeFoldConstants(fn.body);
@@ -7190,19 +9227,27 @@ function simplifyFunction(fn) {
             changed = true;
             stats.folded += fold.folded;
         }
+        // MinimizeExitPoints reshapes labeled-block / loop / function exits
+        // into implicit fall-through. Run before PeepholeMinimizeConditions so
+        // the resulting if/else gets collapsed to ternaries.
+        const exits = runMinimizeExitPoints(fn);
+        if (exits.minimized > 0) {
+            changed = true;
+            stats.minimized += exits.minimized;
+        }
         const min = runPeepholeMinimizeConditions(fn.body);
         if (min.minimized > 0) {
             changed = true;
             stats.minimized += min.minimized;
         }
-        const dead = runPeepholeRemoveDeadCode(fn.body);
+        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized: options.normalized });
         if (dead.removed > 0) {
             changed = true;
             stats.removed += dead.removed;
         }
         const cfg = buildControlFlowGraph({ root: fn.body });
         if (cfg !== null) {
-            const table = buildLocalVariableTable(fn);
+            const table = buildLocalVariableTable(fnPath);
             const inline = runFlowSensitiveInlineVariables(fn, cfg, table);
             if (inline.inlined > 0) {
                 changed = true;
@@ -7211,7 +9256,7 @@ function simplifyFunction(fn) {
             // DAE needs a fresh CFG+table after inline, since inline mutates.
             if (inline.inlined > 0) {
                 const cfg2 = buildControlFlowGraph({ root: fn.body });
-                const table2 = buildLocalVariableTable(fn);
+                const table2 = buildLocalVariableTable(fnPath);
                 if (cfg2 !== null) {
                     const live = runLiveVariablesAnalysis(cfg2, table2);
                     const da = eliminateDeadAssignments(fn, cfg2, live);
@@ -7242,6 +9287,7 @@ function simplifyFunction(fn) {
  * the already-cleaned inner shape.
  */
 function simplifyAll(root) {
+    const normalized = isFileNormalized(root);
     const total = {
         iterations: 0,
         folded: 0,
@@ -7250,35 +9296,19 @@ function simplifyAll(root) {
         deadAssigns: 0,
         minimized: 0,
     };
-    const visit = (n) => {
-        if (n == null)
-            return;
-        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
-            // biome-ignore lint/suspicious/noExplicitAny: dynamic AST
-            const child = n[k];
-            if (child === null || child === undefined)
-                continue;
-            if (Array.isArray(child)) {
-                for (const c of child) {
-                    if (c && typeof c === 'object' && 'type' in c)
-                        visit(c);
-                }
-            }
-            else if (typeof child === 'object' && 'type' in child) {
-                visit(child);
-            }
-        }
-        if (t.isFunction(n)) {
-            const s = simplifyFunction(n);
-            total.iterations += s.iterations;
-            total.folded += s.folded;
-            total.removed += s.removed;
-            total.inlined += s.inlined;
-            total.deadAssigns += s.deadAssigns;
-            total.minimized += s.minimized;
-        }
-    };
-    visit(root);
+    traverse(root, {
+        Function: {
+            exit(path) {
+                const s = simplifyFunction(path, { normalized });
+                total.iterations += s.iterations;
+                total.folded += s.folded;
+                total.removed += s.removed;
+                total.inlined += s.inlined;
+                total.deadAssigns += s.deadAssigns;
+                total.minimized += s.minimized;
+            },
+        },
+    });
     // Program-level cleanup: AST-only peepholes (no CFG) over the whole tree
     // for top-level statements outside any function.
     let topChanged = true;
@@ -7295,7 +9325,7 @@ function simplifyAll(root) {
             topChanged = true;
             total.minimized += m.minimized;
         }
-        const d = runPeepholeRemoveDeadCode(root);
+        const d = runPeepholeRemoveDeadCode(root, { normalized });
         if (d.removed > 0) {
             topChanged = true;
             total.removed += d.removed;
@@ -7315,10 +9345,6 @@ function simplifyAll(root) {
 //   3. Run InlineFunctions across the file.
 //   4. Run simplifyAll across the file.
 //   5. Generate code (and optional sourcemap).
-// Babel CJS default-export interop: shows up as `{ default: fn }` under some
-// bundlers and as `fn` directly under others.
-// biome-ignore lint/suspicious/noExplicitAny: interop shim
-const generate = _generate.default ?? _generate;
 function transform(code, options = {}) {
     const ast = parse(code, parserOptions(options.filename));
     const inl = inlineFunctions(ast, {
@@ -7329,6 +9355,10 @@ function transform(code, options = {}) {
     });
     const unr = unrollLoops(ast);
     const sroa = applySroa(ast);
+    // Normalize before the simplifier fixpoint. Closure runs Normalize before
+    // its optimization pass group; passes downstream (block flatten, let→var
+    // lowering) check `isASTNormalized()` to relax safety conditions.
+    makeDeclaredNamesUnique(ast);
     const simp = simplifyAll(ast);
     const ivar = inlineVariables(ast);
     const ruc = removeUnusedCode(ast);

@@ -1,7 +1,7 @@
 import * as t from '@babel/types';
 export type InliningMode = 'DIRECT' | 'BLOCK' | 'NO';
 export type InjectorOptions = {
-    /** Used to allocate fresh `_r_<n>` and `_inline_<n>` names. */
+    /** Used to allocate fresh `_compilecat_inline_*` ids. */
     nextId: () => number;
 };
 export type Callee = {

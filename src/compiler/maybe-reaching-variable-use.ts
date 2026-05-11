@@ -9,6 +9,9 @@
 // v removes v's set entirely (the prior value can no longer reach those uses
 // from this point). Reads add to the set.
 //
+// Variable identity is by binding-slot — see local-variable-table.ts. Maps
+// here key by slot, not by name.
+//
 // Used by FlowSensitiveInlineVariables to check the "exactly one use of this
 // def" condition.
 
@@ -20,9 +23,9 @@ import type { LocalVariableTable } from './local-variable-table';
 import { getSlot } from './node-util';
 
 export type ReachingUses = {
-    /** Per-variable set of identifier nodes whose read might be reached
+    /** Per-slot set of identifier nodes whose read might be reached
      *  from this program point. */
-    uses: Map<string, Set<t.Node>>;
+    uses: Map<number, Set<t.Node>>;
 };
 
 function newReachingUses(): ReachingUses {
@@ -64,9 +67,11 @@ export type MaybeReachResult = {
     table: LocalVariableTable;
     cfg: ControlFlowGraph;
     /** At the OUT of `cfgNode` (= just after this node executes — equivalently,
-     *  the in-set of its CFG successor), which use sites of `name` might be
-     *  reached? Used by FSIV to count uses of a def. */
-    getUsesAfter: (name: string, cfgNode: CfgNode) => Set<t.Node>;
+     *  the in-set of its CFG successor), which use sites of the binding behind
+     *  `id` might be reached? Used by FSIV to count uses of a def. */
+    getUsesAfter: (id: t.Identifier, cfgNode: CfgNode) => Set<t.Node>;
+    /** Slot-keyed variant — used when the caller already has a slot in hand. */
+    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => Set<t.Node>;
 };
 
 export function runMaybeReachingUse(
@@ -90,14 +95,21 @@ export function runMaybeReachingUse(
         snapshot.set(node, state.out);
     }
 
+    const getUsesAfterSlot = (slot: number, cfgNode: CfgNode): Set<t.Node> => {
+        const r = snapshot.get(cfgNode);
+        if (r === undefined) return new Set();
+        return r.uses.get(slot) ?? new Set();
+    };
+
     return {
         ran: true,
         table,
         cfg,
-        getUsesAfter: (name, cfgNode) => {
-            const r = snapshot.get(cfgNode);
-            if (r === undefined) return new Set();
-            return r.uses.get(name) ?? new Set();
+        getUsesAfterSlot,
+        getUsesAfter: (id, cfgNode) => {
+            const slot = table.resolve(id);
+            if (slot === undefined) return new Set();
+            return getUsesAfterSlot(slot, cfgNode);
         },
     };
 }
@@ -141,10 +153,10 @@ function computeMayUse(
         if (t.isVariableDeclaration(lhs)) {
             const last = lhs.declarations[lhs.declarations.length - 1];
             if (last && t.isIdentifier(last.id) && !conditional) {
-                killUse(last.id.name, out, table);
+                killUse(last.id, out, table);
             }
         } else if (t.isIdentifier(lhs) && !conditional) {
-            killUse(lhs.name, out, table);
+            killUse(lhs, out, table);
         }
         computeMayUse(n.right, out, conditional, table);
         return;
@@ -179,7 +191,7 @@ function computeMayUse(
             const d = n.declarations[i];
             if (t.isIdentifier(d.id)) {
                 if (d.init) {
-                    if (!conditional) killUse(d.id.name, out, table);
+                    if (!conditional) killUse(d.id, out, table);
                     computeMayUse(d.init, out, conditional, table);
                 }
             } else if (d.init) {
@@ -190,9 +202,9 @@ function computeMayUse(
     }
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
-            if (!conditional) killUse(n.left.name, out, table);
+            if (!conditional) killUse(n.left, out, table);
             // Compound assign reads x first.
-            if (n.operator !== '=') addUse(n.left.name, n.left, out, table);
+            if (n.operator !== '=') addUse(n.left, out, table);
             computeMayUse(n.right, out, conditional, table);
             return;
         }
@@ -203,13 +215,13 @@ function computeMayUse(
     }
     if (t.isUpdateExpression(n)) {
         if (t.isIdentifier(n.argument)) {
-            if (!conditional) killUse(n.argument.name, out, table);
-            addUse(n.argument.name, n.argument, out, table);
+            if (!conditional) killUse(n.argument, out, table);
+            addUse(n.argument, out, table);
             return;
         }
     }
     if (t.isIdentifier(n)) {
-        addUse(n.name, n, out, table);
+        addUse(n, out, table);
         return;
     }
 
@@ -229,19 +241,21 @@ function computeMayUse(
     }
 }
 
-function addUse(name: string, node: t.Node, out: ReachingUses, table: LocalVariableTable): void {
-    if (!table.indexByName.has(name)) return;
-    if (table.escaped.has(name)) return;
-    let set = out.uses.get(name);
+function addUse(id: t.Identifier, out: ReachingUses, table: LocalVariableTable): void {
+    const slot = table.resolve(id);
+    if (slot === undefined) return;
+    if (table.escaped.has(slot)) return;
+    let set = out.uses.get(slot);
     if (set === undefined) {
         set = new Set();
-        out.uses.set(name, set);
+        out.uses.set(slot, set);
     }
-    set.add(node);
+    set.add(id);
 }
 
-function killUse(name: string, out: ReachingUses, table: LocalVariableTable): void {
-    if (!table.indexByName.has(name)) return;
-    if (table.escaped.has(name)) return;
-    out.uses.delete(name);
+function killUse(id: t.Identifier, out: ReachingUses, table: LocalVariableTable): void {
+    const slot = table.resolve(id);
+    if (slot === undefined) return;
+    if (table.escaped.has(slot)) return;
+    out.uses.delete(slot);
 }

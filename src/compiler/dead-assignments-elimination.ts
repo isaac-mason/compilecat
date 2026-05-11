@@ -11,7 +11,7 @@
 //   - No `compiler.hasScopeChanged` filter — we always run.
 //   - `containsFunction` bailout: any nested function in the body skips the
 //     whole pass (closure capture). Closure does the same heuristic.
-//   - Variable identity by NAME (matches our LocalVariableTable).
+//   - Variable identity by binding-slot (table.resolve(idNode) → slot).
 //   - For inc/dec (UpdateExpression) we only replace inside an ExprStatement
 //     or a vanilla-for update slot; otherwise leave it alone (the value of
 //     `x++` itself can be observed by an outer expression).
@@ -179,9 +179,9 @@ function handleAssignment(
     state: LinearFlowState<LiveVariableLattice>,
 ): void {
     const lhs = n.left as t.Identifier;
-    const idx = ctx.table.indexByName.get(lhs.name);
-    if (idx === undefined) return;
-    if (ctx.table.escaped.has(lhs.name)) return;
+    const slot = ctx.table.resolve(lhs);
+    if (slot === undefined) return;
+    if (ctx.table.escaped.has(slot)) return;
 
     // Identity assign `a = a` — always remove.
     if (
@@ -194,11 +194,11 @@ function handleAssignment(
         return;
     }
 
-    if (isLive(state.out, idx)) return;
+    if (isLive(state.out, slot)) return;
 
     if (
-        isLive(state.in, idx) &&
-        isVariableStillLiveWithinExpression(ctx, n, exprRoot, lhs.name)
+        isLive(state.in, slot) &&
+        isVariableStillLiveWithinExpression(ctx, n, exprRoot, slot)
     ) {
         // Live-in but live-out is false: this is the killing assignment, but
         // there's still a use to its right within the same expression. We
@@ -228,10 +228,10 @@ function handleUpdate(
     state: LinearFlowState<LiveVariableLattice>,
 ): void {
     const arg = n.argument as t.Identifier;
-    const idx = ctx.table.indexByName.get(arg.name);
-    if (idx === undefined) return;
-    if (ctx.table.escaped.has(arg.name)) return;
-    if (isLive(state.out, idx)) return;
+    const slot = ctx.table.resolve(arg);
+    if (slot === undefined) return;
+    if (ctx.table.escaped.has(slot)) return;
+    if (isLive(state.out, slot)) return;
 
     const info = ctx.parents.get(n);
     if (info === undefined) return;
@@ -284,23 +284,25 @@ function handleVarInit(
         return;
     }
 
-    const name = d.id.name;
-    const idx = ctx.table.indexByName.get(name);
-    if (idx === undefined) return;
-    if (ctx.table.escaped.has(name)) return;
+    const slot = ctx.table.resolve(d.id);
+    if (slot === undefined) return;
+    if (ctx.table.escaped.has(slot)) return;
 
     // Identity init `var a = a;` is meaningless and rare; treat as standard
     // assignment.
-    if (t.isIdentifier(d.init) && d.init.name === name) {
+    if (
+        t.isIdentifier(d.init) &&
+        ctx.table.resolve(d.init) === slot
+    ) {
         d.init = null;
         ctx.removed++;
         return;
     }
 
-    if (isLive(state.out, idx)) return;
+    if (isLive(state.out, slot)) return;
     if (
-        isLive(state.in, idx) &&
-        isVariableStillLiveWithinExpression(ctx, decl, exprRoot, name)
+        isLive(state.in, slot) &&
+        isVariableStillLiveWithinExpression(ctx, decl, exprRoot, slot)
     ) {
         return;
     }
@@ -329,7 +331,7 @@ function isVariableStillLiveWithinExpression(
     ctx: Ctx,
     n: t.Node,
     exprRoot: t.Node,
-    variable: string,
+    slot: number,
 ): boolean {
     let cur: t.Node = n;
     while (cur !== exprRoot) {
@@ -342,18 +344,18 @@ function isVariableStillLiveWithinExpression(
         if (t.isLogicalExpression(parent)) {
             // OR / AND / ??: only the second operand depends on the first.
             if (cur === parent.left) {
-                state = isVariableReadBeforeKill(parent.right, variable);
+                state = isVariableReadBeforeKill(parent.right, slot, ctx);
                 if (state === VLive.KILL) state = VLive.MAYBE_LIVE;
             }
         } else if (t.isConditionalExpression(parent)) {
             if (cur === parent.test) {
-                state = checkHookBranchReadBeforeKill(parent.consequent, parent.alternate, variable);
+                state = checkHookBranchReadBeforeKill(parent.consequent, parent.alternate, slot, ctx);
             }
             // If cur is consequent or alternate, the other branch can be
             // ignored; siblings don't apply.
         } else {
             for (const sibling of rightSiblings(parent, cur)) {
-                state = isVariableReadBeforeKill(sibling, variable);
+                state = isVariableReadBeforeKill(sibling, slot, ctx);
                 if (state !== VLive.MAYBE_LIVE) break;
             }
         }
@@ -365,32 +367,29 @@ function isVariableStillLiveWithinExpression(
     return false;
 }
 
-function isVariableReadBeforeKill(n: t.Node, variable: string): VLive {
+function isVariableReadBeforeKill(n: t.Node, slot: number, ctx: Ctx): VLive {
     if (isEnteringNewCfgNode(n, parentOfChild(n))) return VLive.MAYBE_LIVE;
 
-    if (t.isIdentifier(n) && n.name === variable) {
-        // We need to know whether this name is the LHS of an assign. The
-        // caller's iteration pattern feeds us nodes whose parent we don't
-        // have a generic way to inspect here without the parent map. We
-        // accept the slight conservatism: treat every identifier read as
-        // READ. Closure distinguishes simple-assign LHS (then evaluates RHS
-        // first to detect a still-live read inside the RHS), but in our v1
-        // we'd need to thread the parent map through; conservative is safe.
+    if (t.isIdentifier(n) && ctx.table.resolve(n) === slot) {
+        // Conservative: treat every identifier read as READ. Closure
+        // distinguishes simple-assign LHS (then evaluates RHS first to
+        // detect a still-live read inside the RHS), but conservative is
+        // safe here.
         return VLive.READ;
     }
 
     if (t.isLogicalExpression(n)) {
-        const v1 = isVariableReadBeforeKill(n.left, variable);
-        const v2 = isVariableReadBeforeKill(n.right, variable);
+        const v1 = isVariableReadBeforeKill(n.left, slot, ctx);
+        const v2 = isVariableReadBeforeKill(n.right, slot, ctx);
         if (v1 !== VLive.MAYBE_LIVE) return v1;
         if (v2 === VLive.READ) return VLive.READ;
         return VLive.MAYBE_LIVE;
     }
 
     if (t.isConditionalExpression(n)) {
-        const first = isVariableReadBeforeKill(n.test, variable);
+        const first = isVariableReadBeforeKill(n.test, slot, ctx);
         if (first !== VLive.MAYBE_LIVE) return first;
-        return checkHookBranchReadBeforeKill(n.consequent, n.alternate, variable);
+        return checkHookBranchReadBeforeKill(n.consequent, n.alternate, slot, ctx);
     }
 
     for (const key of t.VISITOR_KEYS[n.type] ?? []) {
@@ -399,11 +398,11 @@ function isVariableReadBeforeKill(n: t.Node, variable: string): VLive {
         if (Array.isArray(child)) {
             for (const c of child) {
                 if (!c) continue;
-                const r = isVariableReadBeforeKill(c, variable);
+                const r = isVariableReadBeforeKill(c, slot, ctx);
                 if (r !== VLive.MAYBE_LIVE) return r;
             }
         } else {
-            const r = isVariableReadBeforeKill(child, variable);
+            const r = isVariableReadBeforeKill(child, slot, ctx);
             if (r !== VLive.MAYBE_LIVE) return r;
         }
     }
@@ -413,10 +412,11 @@ function isVariableReadBeforeKill(n: t.Node, variable: string): VLive {
 function checkHookBranchReadBeforeKill(
     a: t.Node,
     b: t.Node,
-    variable: string,
+    slot: number,
+    ctx: Ctx,
 ): VLive {
-    const v1 = isVariableReadBeforeKill(a, variable);
-    const v2 = isVariableReadBeforeKill(b, variable);
+    const v1 = isVariableReadBeforeKill(a, slot, ctx);
+    const v2 = isVariableReadBeforeKill(b, slot, ctx);
     if (v1 === VLive.READ || v2 === VLive.READ) return VLive.READ;
     if (v1 === VLive.KILL && v2 === VLive.KILL) return VLive.KILL;
     return VLive.MAYBE_LIVE;

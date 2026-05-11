@@ -106,3 +106,50 @@ describe('PeepholeRemoveDeadCode', () => {
         expect(r.code).toContain('if');
     });
 });
+
+describe('PeepholeRemoveDeadCode — tryOptimizeConditionalAfterAssign', () => {
+    it('folds `a = 1; if (a) ...` to `if (true) ...`', () => {
+        const r = rm('function f() { var a; a = 1; if (a) { sink(); } }');
+        expect(r.code).toContain('if (true)');
+    });
+
+    it('folds `var a = /re/; if (a)` to true (regexp is truthy)', () => {
+        const r = rm('function f() { var a = /re/; if (a) { sink(); } }');
+        expect(r.code).toContain('if (true)');
+    });
+
+    it('folds `a = 0; if (a)` to false', () => {
+        const r = rm('function f() { var a; a = 0; if (a) { sink(); } }');
+        expect(r.code).toContain('if (false)');
+    });
+
+    it('folds `a = 0; a ? f() : g()` ternary expr-stmt', () => {
+        const r = rm('function f() { var a; a = 0; a ? p() : q(); }');
+        expect(r.code).toMatch(/false \? p\(\) : q\(\)/);
+    });
+
+    it('folds `a = 1; a && f()`', () => {
+        const r = rm('function f() { var a; a = 1; a && p(); }');
+        expect(r.code).toMatch(/true && p\(\)/);
+    });
+
+    it('leaves unknown rhs alone', () => {
+        const r = rm('function f(x) { var a; a = x; if (a) { sink(); } }');
+        expect(r.code).toMatch(/if \(a\)/);
+    });
+
+    it('does not fold when condition is not exactly the assigned name', () => {
+        const r = rm('function f() { var a, b; a = 1; if (b) { sink(); } }');
+        expect(r.code).toMatch(/if \(b\)/);
+    });
+
+    it('folds `a = null; a ?? f()` to `void 0 ?? f()`', () => {
+        const r = rm('function f() { var a; a = null; a ?? p(); }');
+        expect(r.code).toMatch(/void 0 \?\? p\(\)/);
+    });
+
+    it('folds `a = 1; a ?? f()` to `0 ?? f()` (known non-nullish)', () => {
+        const r = rm('function f() { var a; a = 1; a ?? p(); }');
+        expect(r.code).toMatch(/0 \?\? p\(\)/);
+    });
+});

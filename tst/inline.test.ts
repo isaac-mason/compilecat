@@ -54,7 +54,7 @@ describe('InlineFunctions', () => {
         `);
         expect(r.succeeded).toBe(1);
         // Either contains the labeled block or its post-simplifier reduction.
-        expect(r.code).toMatch(/_inline_0|_r_0/);
+        expect(r.code).toMatch(/_compilecat_inline_label_abs_0|_abs__result_0/);
     });
 
     it('BLOCK with discarded result drops the temp', () => {
@@ -64,7 +64,7 @@ describe('InlineFunctions', () => {
             noisy(p);
         `);
         expect(r.succeeded).toBe(1);
-        expect(r.code).toContain('_inline_0');
+        expect(r.code).toContain('_compilecat_inline_label_noisy_0');
     });
 
     it('rejects async / generator functions', () => {
@@ -122,6 +122,11 @@ describe('InlineFunctions', () => {
         // whose own params are also `dbvt` and `leafIndex` previously emitted
         // `let dbvt = dbvt;` (TDZ on RHS), which the simplifier later stripped
         // to `let dbvt;` — leaving outer-scope reads bound to undefined.
+        //
+        // Post-FunctionArgumentInjector port: simple Identifier args get
+        // substituted directly into the body, so there's no prologue at all.
+        // The shape is just `dbvt.x = leaf;` — which proves the same-name
+        // self-binding bug can't reappear (no `let` exists to rebind).
         const r = inl(`
             /** @inline */
             function ins(dbvt, leaf) { dbvt.x = leaf; }
@@ -131,8 +136,54 @@ describe('InlineFunctions', () => {
         // The inlined block must not contain a same-name self-binding.
         expect(r.code).not.toMatch(/let dbvt\s*=\s*dbvt\b/);
         expect(r.code).not.toMatch(/let leaf\s*=\s*leaf\b/);
-        // Renamed params should appear with the call's args bound through them.
-        expect(r.code).toMatch(/let dbvt\$p\d+_\d+\s*=\s*dbvt\b/);
+        // No alpha-rename leftover when args substitute directly.
+        expect(r.code).not.toMatch(/dbvt__/);
+        // Body uses the outer-scope names directly post-substitution.
+        expect(r.code).toMatch(/dbvt\.x\s*=\s*leaf/);
+    });
+
+    it('substitutes simple-identifier args directly (no prologue temp)', () => {
+        // Closure parity: when arg is an Identifier and the param isn't
+        // reassigned, the body gets the arg substituted in directly. No
+        // `let X = arg;` binding, no wrapper-block-needed-for-prologue.
+        const r = inl(`
+            /** @inline */
+            function empty(out) {
+                out[0] = 1; out[1] = 2; out[2] = 3;
+                out[3] = 4; out[4] = 5; out[5] = 6;
+            }
+            function caller(target) { empty(target); }
+        `);
+        expect(r.succeeded).toBe(1);
+        // No `let out = target;` prologue.
+        expect(r.code).not.toMatch(/let out\b/);
+        // All six writes must appear with `target` substituted in.
+        expect(r.code).toMatch(/target\[0\]\s*=\s*1/);
+        expect(r.code).toMatch(/target\[5\]\s*=\s*6/);
+    });
+
+    it('keeps a temp for impure args even when used once', () => {
+        // `getX()` must run exactly once even though `x` is used twice.
+        // Arg doesn't reference `x` as a free var → no param rename → the
+        // prologue uses the original param name.
+        const r = inl(`
+            /** @inline */
+            function dbl(x) { sink(x); sink(x); }
+            function caller() { dbl(getX()); }
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toMatch(/let x\s*=\s*getX\(\)/);
+    });
+
+    it('keeps a temp for object-literal args (fresh-state semantics)', () => {
+        // Substituting `{}` directly would create a new object per use.
+        const r = inl(`
+            /** @inline */
+            function use(o) { sink(o); sink(o); }
+            function caller() { use({}); }
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toMatch(/let o\s*=\s*\{\s*\}/);
     });
 
     it('falls back to BLOCK when DIRECT side-effect arg used twice', () => {
@@ -141,8 +192,29 @@ describe('InlineFunctions', () => {
             function dbl(x) { return x + x; }
             var v = dbl(getX());
         `);
-        // DIRECT would re-execute getX(); BLOCK binds it to a temp.
+        // DIRECT would re-execute getX(); BLOCK binds it to a temp. With the
+        // hasReturnAtExit optimization the trailing `return x + x` is rewritten
+        // as `v = x + x;` (no break) so no label wrapper is emitted.
         expect(r.succeeded).toBe(1);
-        expect(r.code).toContain('_inline_0');
+        expect(r.code).toMatch(/let x\s*=\s*getX\(\)/);
+        expect(r.code).toMatch(/v\s*=\s*x\s*\+\s*x/);
+        expect(r.code).not.toContain('_compilecat_inline_label_dbl_0');
+    });
+
+    it('renames param when an arg references it as a free var', () => {
+        // The shadow class: arg `x.method()` references the same name as the
+        // param `x`. Without rename, splice would emit `let x = x.method();`
+        // where the RHS resolves to the new inner binding (TDZ on let). The
+        // injector detects this and renames the param.
+        const r = inl(`
+            /** @inline */
+            function inner(x) { sink(x); sink(x); }
+            function outer(x) { inner(x.method()); }
+        `);
+        expect(r.succeeded).toBe(1);
+        // Param `x` renamed to `x__inner`; arg's `x.method()` reads outer x.
+        expect(r.code).toMatch(/let x__inner\s*=\s*x\.method\(\)/);
+        // No same-name self-binding leaked through.
+        expect(r.code).not.toMatch(/let x\s*=\s*x\.method/);
     });
 });

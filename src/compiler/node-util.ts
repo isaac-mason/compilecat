@@ -104,6 +104,90 @@ export function getFunctionBody(fn: t.Function): t.BlockStatement | t.Expression
 }
 
 /**
+ * Port of NodeUtil.isStatementBlock (NodeUtil.java:2170):
+ *   return n.isRoot() || n.isScript() || n.isBlock() || n.isModuleBody();
+ *
+ * Babel has no ROOT or MODULE_BODY token — Program covers both.
+ */
+export function isStatementBlock(n: t.Node): boolean {
+    return t.isProgram(n) || t.isBlockStatement(n);
+}
+
+/**
+ * Port of NodeUtil.canMergeBlock (NodeUtil.java:2516):
+ *
+ *   for (Node c = block.getFirstChild(); c != null; c = c.getNext()) {
+ *     switch (c.getToken()) {
+ *       case LABEL -> {
+ *         if (canMergeBlock(c)) continue; else return false;
+ *       }
+ *       case CONST, LET, CLASS, FUNCTION -> { return false; }
+ *       default -> { continue; }
+ *     }
+ *   }
+ *   return true;
+ *
+ * Babel mapping:
+ *   LABEL    → LabeledStatement
+ *   CONST    → VariableDeclaration with kind === 'const'
+ *   LET      → VariableDeclaration with kind === 'let'
+ *   CLASS    → ClassDeclaration
+ *   FUNCTION → FunctionDeclaration
+ *
+ * Closure's recursive `canMergeBlock(c)` on a LABEL iterates the LABEL's
+ * children — label name (NAME, default branch) plus the labeled statement
+ * (which falls into one of the cases). The LabeledStatement node in Babel
+ * has a single body slot; we replicate the same semantics by inspecting it.
+ */
+export function canMergeBlock(block: t.BlockStatement): boolean {
+    for (const c of block.body) {
+        if (!canMergeBlockChild(c)) return false;
+    }
+    return true;
+}
+
+function canMergeBlockChild(c: t.Node): boolean {
+    if (t.isLabeledStatement(c)) {
+        // Closure recurses into the LABEL — its children are the label name
+        // (always safe) and the labeled statement (must itself be safe).
+        return canMergeBlockChild(c.body);
+    }
+    if (t.isVariableDeclaration(c) && (c.kind === 'const' || c.kind === 'let')) return false;
+    if (t.isClassDeclaration(c)) return false;
+    if (t.isFunctionDeclaration(c)) return false;
+    return true;
+}
+
+/**
+ * Port of NodeUtil.tryMergeBlock (NodeUtil.java:2490):
+ *
+ *   boolean canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
+ *   if (isStatementBlock(parent) && canMerge) {
+ *     // splice block's children up into parent in-place; detach block
+ *     return true;
+ *   }
+ *   return false;
+ *
+ * Babel doesn't expose Closure's child-pointer API, so the caller passes the
+ * parent statement array and the index of the block within it; we splice
+ * directly. Returns the number of statements spliced in (== the block's
+ * child count) when the merge happened, or 0 when it was rejected.
+ */
+export function tryMergeBlock(
+    block: t.BlockStatement,
+    parentBody: t.Statement[],
+    indexInParent: number,
+    parent: t.Node,
+    ignoreBlockScopedDeclarations: boolean,
+): number {
+    const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
+    if (!isStatementBlock(parent) || !canMerge) return 0;
+    const inserted = block.body.length;
+    parentBody.splice(indexInParent, 1, ...block.body);
+    return inserted;
+}
+
+/**
  * Closure's `isLiteralValue` — recognises primitive literal nodes used by
  * dataflow / fold passes. The `includeFunctions` flag matches Closure's
  * second-arg convention.
@@ -139,6 +223,140 @@ export function isName(node: t.Node): node is t.Identifier {
 /** Convenience: true if node is `undefined` keyword usage (an Identifier). */
 export function isUndefined(node: t.Node): boolean {
     return t.isIdentifier(node) && node.name === 'undefined';
+}
+
+// ---------------------------------------------------------------------------
+// Operator precedence (mirrors Closure's NodeUtil.precedence). Higher is
+// tighter binding. Used by MinimizedCondition cost estimation and by the
+// peephole `if(c)foo()` → `c&&foo()` decision (we only do the rewrite when
+// the parens cost is favourable).
+
+export const AND_PRECEDENCE = 6;
+export const OR_PRECEDENCE = 5;
+
+export function precedence(node: t.Node): number {
+    if (t.isSequenceExpression(node)) return 1;
+    if (t.isAssignmentExpression(node) || t.isYieldExpression(node)) return 2;
+    if (t.isConditionalExpression(node)) return 3;
+    if (t.isLogicalExpression(node)) {
+        switch (node.operator) {
+            case '??': return 4;
+            case '||': return 5;
+            case '&&': return 6;
+        }
+    }
+    if (t.isBinaryExpression(node)) {
+        switch (node.operator) {
+            case '|': return 7;
+            case '^': return 8;
+            case '&': return 9;
+            case '==': case '!=': case '===': case '!==': return 10;
+            case '<': case '<=': case '>': case '>=': case 'in': case 'instanceof': return 11;
+            case '<<': case '>>': case '>>>': return 12;
+            case '+': case '-': return 13;
+            case '*': case '/': case '%': return 14;
+            case '**': return 15;
+        }
+    }
+    if (t.isUnaryExpression(node)) return 16;
+    if (t.isUpdateExpression(node)) return node.prefix ? 16 : 17;
+    if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) return 18;
+    if (
+        t.isMemberExpression(node) ||
+        t.isOptionalMemberExpression(node) ||
+        t.isNewExpression(node)
+    ) return 19;
+    return 20;
+}
+
+// ---------------------------------------------------------------------------
+// Structural AST equality (subset). Mirrors Closure's `isEquivalentTo` /
+// `areNodesEqualForInlining` enough for peephole decisions: identifier name,
+// literal value, and recursive structural compare across the node types our
+// passes touch. Returns false for anything we don't recognize — conservative.
+
+export function areNodesEqual(a: t.Node, b: t.Node): boolean {
+    if (a.type !== b.type) return false;
+    if (t.isIdentifier(a) && t.isIdentifier(b)) return a.name === b.name;
+    if (t.isNumericLiteral(a) && t.isNumericLiteral(b)) return a.value === b.value;
+    if (t.isStringLiteral(a) && t.isStringLiteral(b)) return a.value === b.value;
+    if (t.isBooleanLiteral(a) && t.isBooleanLiteral(b)) return a.value === b.value;
+    if (t.isNullLiteral(a) && t.isNullLiteral(b)) return true;
+    if (t.isThisExpression(a) && t.isThisExpression(b)) return true;
+    if (t.isReturnStatement(a) && t.isReturnStatement(b)) {
+        const ax = a.argument;
+        const bx = (b as t.ReturnStatement).argument;
+        if (ax === null && bx === null) return true;
+        if (ax === null || bx === null) return false;
+        if (ax === undefined && bx === undefined) return true;
+        if (ax === undefined || bx === undefined) return false;
+        return areNodesEqual(ax, bx);
+    }
+    if (t.isThrowStatement(a) && t.isThrowStatement(b)) {
+        return areNodesEqual(a.argument, (b as t.ThrowStatement).argument);
+    }
+    if (t.isExpressionStatement(a) && t.isExpressionStatement(b)) {
+        return areNodesEqual(a.expression, (b as t.ExpressionStatement).expression);
+    }
+    if (t.isBreakStatement(a) && t.isBreakStatement(b)) {
+        const al = a.label;
+        const bl = (b as t.BreakStatement).label;
+        if (!al && !bl) return true;
+        if (!al || !bl) return false;
+        return al.name === bl.name;
+    }
+    if (t.isContinueStatement(a) && t.isContinueStatement(b)) {
+        const al = a.label;
+        const bl = (b as t.ContinueStatement).label;
+        if (!al && !bl) return true;
+        if (!al || !bl) return false;
+        return al.name === bl.name;
+    }
+    if (t.isBlockStatement(a) && t.isBlockStatement(b)) {
+        const bb = b as t.BlockStatement;
+        if (a.body.length !== bb.body.length) return false;
+        for (let i = 0; i < a.body.length; i++) {
+            if (!areNodesEqual(a.body[i], bb.body[i])) return false;
+        }
+        return true;
+    }
+    if (t.isMemberExpression(a) && t.isMemberExpression(b)) {
+        if (a.computed !== b.computed) return false;
+        return areNodesEqual(a.object, b.object) && areNodesEqual(a.property, b.property);
+    }
+    if (t.isBinaryExpression(a) && t.isBinaryExpression(b)) {
+        if (a.operator !== b.operator) return false;
+        if (t.isPrivateName(a.left) || t.isPrivateName(b.left)) return false;
+        return areNodesEqual(a.left, b.left) && areNodesEqual(a.right, b.right);
+    }
+    if (t.isLogicalExpression(a) && t.isLogicalExpression(b)) {
+        if (a.operator !== b.operator) return false;
+        return areNodesEqual(a.left, b.left) && areNodesEqual(a.right, b.right);
+    }
+    if (t.isUnaryExpression(a) && t.isUnaryExpression(b)) {
+        if (a.operator !== b.operator) return false;
+        return areNodesEqual(a.argument, b.argument);
+    }
+    if (t.isConditionalExpression(a) && t.isConditionalExpression(b)) {
+        return (
+            areNodesEqual(a.test, b.test) &&
+            areNodesEqual(a.consequent, b.consequent) &&
+            areNodesEqual(a.alternate, b.alternate)
+        );
+    }
+    if (t.isCallExpression(a) && t.isCallExpression(b)) {
+        if (a.arguments.length !== b.arguments.length) return false;
+        if (!t.isExpression(a.callee) || !t.isExpression(b.callee)) return false;
+        if (!areNodesEqual(a.callee, b.callee)) return false;
+        for (let i = 0; i < a.arguments.length; i++) {
+            const aa = a.arguments[i];
+            const bb = b.arguments[i];
+            if (!t.isExpression(aa) || !t.isExpression(bb)) return false;
+            if (!areNodesEqual(aa, bb)) return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------

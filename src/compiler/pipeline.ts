@@ -16,6 +16,7 @@ import type { FileCache } from './file-index';
 import { inlineFunctions } from './inline-functions';
 import { inlineVariables } from './inline-variables';
 import { unrollLoops } from './loop-unroller';
+import { makeDeclaredNamesUnique } from './normalize';
 import { removeUnusedCode } from './remove-unused-code';
 import type { FileReader } from './resolve';
 import { applySroa } from './scalar-replace-aggregates';
@@ -65,6 +66,10 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
     });
     const unr = unrollLoops(ast);
     const sroa = applySroa(ast);
+    // Normalize before the simplifier fixpoint. Closure runs Normalize before
+    // its optimization pass group; passes downstream (block flatten, let→var
+    // lowering) check `isASTNormalized()` to relax safety conditions.
+    makeDeclaredNamesUnique(ast);
     const simp = simplifyAll(ast);
     const ivar = inlineVariables(ast);
     const ruc = removeUnusedCode(ast);
