@@ -29,7 +29,7 @@
 //   - DAE bails entire functions with nested closures — Closure does too.
 
 import type { Binding, NodePath, Scope } from '@babel/traverse';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 
 export type LocalVariableTable = {
     /** Resolve an identifier-use site to its lattice slot. Returns undefined
@@ -52,9 +52,7 @@ export type LocalVariableTable = {
     scopeNodeOfSlot: (slot: number) => t.Node | undefined;
 };
 
-export function buildLocalVariableTable(
-    fnPath: NodePath<t.Function>,
-): LocalVariableTable {
+export function buildLocalVariableTable(fnPath: NodePath<t.Function>): LocalVariableTable {
     // Refresh scope so bindings reflect the current AST. Per-iteration the
     // simplifier mutates the body — Babel's scope cache must be rebuilt.
     fnPath.scope.crawl();

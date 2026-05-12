@@ -72,7 +72,6 @@ function unrollPass(root: t.Node): number {
                     continue;
                 }
                 stripUnrollComments(s);
-                continue;
             }
         }
     });
@@ -97,11 +96,7 @@ function expandFor(node: t.ForStatement): t.Statement[] | null {
     return out;
 }
 
-function iterationStmts(
-    body: t.Statement,
-    varName: string,
-    replacement: t.Expression,
-): t.Statement[] {
+function iterationStmts(body: t.Statement, varName: string, replacement: t.Expression): t.Statement[] {
     // Each iteration becomes its own BlockStatement so per-iteration
     // let/const/class/fn-decl bindings stay isolated. The simplifier's
     // demand-driven α-rename (see normalize.renameForFlatten) renames
@@ -204,9 +199,7 @@ function hasUnrollAnnotation(n: t.Node): boolean {
 
 function stripUnrollComments(n: t.Node): void {
     if (!n.leadingComments) return;
-    n.leadingComments = n.leadingComments.filter(
-        (c: t.Comment) => !DIRECTIVE_PATTERNS.unroll.test(c.value),
-    );
+    n.leadingComments = n.leadingComments.filter((c: t.Comment) => !DIRECTIVE_PATTERNS.unroll.test(c.value));
 }
 
 // ---------------------------------------------------------------------------
@@ -255,22 +248,13 @@ function bodyHasUnsafeControlFlow(body: t.Statement): boolean {
 // Substitution. Walks a clone of the statement and replaces reads of varName
 // with `replacement`, skipping declaration IDs and shadowed scopes.
 
-function cloneAndSubstitute(
-    stmt: t.Statement,
-    varName: string,
-    replacement: t.Expression,
-): t.Statement {
+function cloneAndSubstitute(stmt: t.Statement, varName: string, replacement: t.Expression): t.Statement {
     const cloned = t.cloneNode(stmt, true, true);
     substitute(cloned, varName, replacement, false);
     return cloned;
 }
 
-function substitute(
-    n: t.Node,
-    varName: string,
-    replacement: t.Expression,
-    shadowed: boolean,
-): void {
+function substitute(n: t.Node, varName: string, replacement: t.Expression, shadowed: boolean): void {
     if (shadowed) {
         // Still descend in case a deeper scope un-shadows. (JS doesn't, but
         // keep it general.)
@@ -296,12 +280,7 @@ function substitute(
     descend(n, varName, replacement, shadowed);
 }
 
-function descend(
-    n: t.Node,
-    varName: string,
-    replacement: t.Expression,
-    shadowed: boolean,
-): void {
+function descend(n: t.Node, varName: string, replacement: t.Expression, shadowed: boolean): void {
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
         const child = getSlot(n, k);
         if (child === null || child === undefined) continue;
@@ -309,24 +288,14 @@ function descend(
             for (let i = 0; i < child.length; i++) {
                 const c = child[i];
                 if (!c) continue;
-                if (
-                    !shadowed &&
-                    t.isIdentifier(c) &&
-                    c.name === varName &&
-                    isReadContext(n, k, c)
-                ) {
+                if (!shadowed && t.isIdentifier(c) && c.name === varName && isReadContext(n, k, c)) {
                     child[i] = t.cloneNode(replacement, true);
                 } else {
                     substitute(c, varName, replacement, shadowed);
                 }
             }
         } else {
-            if (
-                !shadowed &&
-                t.isIdentifier(child) &&
-                child.name === varName &&
-                isReadContext(n, k, child)
-            ) {
+            if (!shadowed && t.isIdentifier(child) && child.name === varName && isReadContext(n, k, child)) {
                 setSlot(n, k, undefined, t.cloneNode(replacement, true));
             } else {
                 substitute(child, varName, replacement, shadowed);
@@ -391,10 +360,7 @@ function blockDeclaresName(b: t.BlockStatement, name: string): boolean {
 // Statement-list traversal — invokes `cb` for every Block/Program body so the
 // caller can splice in place.
 
-function walkStatementLists(
-    root: t.Node,
-    cb: (body: t.Statement[], inOptimize: boolean) => void,
-): void {
+function walkStatementLists(root: t.Node, cb: (body: t.Statement[], inOptimize: boolean) => void): void {
     const optimizeStack: boolean[] = [false];
     const visit = (n: t.Node | null | undefined): void => {
         if (n == null) return;

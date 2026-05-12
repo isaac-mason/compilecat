@@ -40,13 +40,7 @@ export function runPeepholeFoldConstants(root: t.Node): FoldResult {
 
 type Ctx = { folded: number };
 
-function walk(
-    n: t.Node,
-    parent: t.Node | null,
-    key: string,
-    index: number | undefined,
-    ctx: Ctx,
-): void {
+function walk(n: t.Node, parent: t.Node | null, key: string, index: number | undefined, ctx: Ctx): void {
     // Bottom-up: recurse first.
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
         const child = getSlot(n, k);
@@ -100,11 +94,7 @@ function foldUnary(n: t.UnaryExpression): t.Node | null {
             return null;
         }
         // -(-x) on literals → x
-        if (
-            t.isUnaryExpression(n.argument) &&
-            n.argument.operator === '-' &&
-            t.isNumericLiteral(n.argument.argument)
-        ) {
+        if (t.isUnaryExpression(n.argument) && n.argument.operator === '-' && t.isNumericLiteral(n.argument.argument)) {
             return t.numericLiteral(n.argument.argument.value);
         }
         return null;
@@ -192,17 +182,12 @@ function foldLogical(n: t.LogicalExpression): t.Node | null {
     }
     if (n.operator === '??') {
         if (t.isNullLiteral(n.left)) return n.right;
-        if (
-            t.isIdentifier(n.left) &&
-            n.left.name === 'undefined'
-        ) {
+        if (t.isIdentifier(n.left) && n.left.name === 'undefined') {
             return n.right;
         }
         // Any non-null/undefined literal short-circuits to the LHS.
         if (
-            (t.isNumericLiteral(n.left) ||
-                t.isStringLiteral(n.left) ||
-                t.isBooleanLiteral(n.left)) &&
+            (t.isNumericLiteral(n.left) || t.isStringLiteral(n.left) || t.isBooleanLiteral(n.left)) &&
             !mayHaveSideEffects(n.left)
         ) {
             return n.left;
@@ -216,11 +201,7 @@ function foldLogical(n: t.LogicalExpression): t.Node | null {
 
 function asNumeric(node: t.Node): number | null {
     if (t.isNumericLiteral(node)) return node.value;
-    if (
-        t.isUnaryExpression(node) &&
-        node.operator === '-' &&
-        t.isNumericLiteral(node.argument)
-    ) {
+    if (t.isUnaryExpression(node) && node.operator === '-' && t.isNumericLiteral(node.argument)) {
         return -node.argument.value;
     }
     return null;
@@ -254,19 +235,33 @@ function numericLiteral(value: number): t.Expression {
 
 function evalNumericBinary(op: string, l: number, r: number): number | null {
     switch (op) {
-        case '+': return l + r;
-        case '-': return l - r;
-        case '*': return l * r;
-        case '/': if (r === 0) return null; return l / r;
-        case '%': if (r === 0) return null; return l % r;
-        case '**': return l ** r;
-        case '&': return toInt32(l) & toInt32(r);
-        case '|': return toInt32(l) | toInt32(r);
-        case '^': return toInt32(l) ^ toInt32(r);
+        case '+':
+            return l + r;
+        case '-':
+            return l - r;
+        case '*':
+            return l * r;
+        case '/':
+            if (r === 0) return null;
+            return l / r;
+        case '%':
+            if (r === 0) return null;
+            return l % r;
+        case '**':
+            return l ** r;
+        case '&':
+            return toInt32(l) & toInt32(r);
+        case '|':
+            return toInt32(l) | toInt32(r);
+        case '^':
+            return toInt32(l) ^ toInt32(r);
         // Shift counts: JS masks the RHS to 5 bits — we let the engine do it.
-        case '<<': return toInt32(l) << toInt32(r);
-        case '>>': return toInt32(l) >> toInt32(r);
-        case '>>>': return toUint32(l) >>> toInt32(r);
+        case '<<':
+            return toInt32(l) << toInt32(r);
+        case '>>':
+            return toInt32(l) >> toInt32(r);
+        case '>>>':
+            return toUint32(l) >>> toInt32(r);
     }
     return null;
 }
@@ -296,34 +291,56 @@ function evalComparison(op: string, left: t.Node, right: t.Node): boolean | null
     const rv = asNumeric(right);
     if (lv !== null && rv !== null) {
         switch (op) {
-            case '<': return lv < rv;
-            case '<=': return lv <= rv;
-            case '>': return lv > rv;
-            case '>=': return lv >= rv;
-            case '==': return lv == rv;
-            case '!=': return lv != rv;
-            case '===': return lv === rv;
-            case '!==': return lv !== rv;
+            case '<':
+                return lv < rv;
+            case '<=':
+                return lv <= rv;
+            case '>':
+                return lv > rv;
+            case '>=':
+                return lv >= rv;
+            case '==':
+                // biome-ignore lint/suspicious/noDoubleEquals: intentional
+                return lv == rv;
+            case '!=':
+                // biome-ignore lint/suspicious/noDoubleEquals: intentional
+                return lv != rv;
+            case '===':
+                return lv === rv;
+            case '!==':
+                return lv !== rv;
         }
     }
     if (t.isStringLiteral(left) && t.isStringLiteral(right)) {
         switch (op) {
-            case '==': return left.value === right.value;
-            case '!=': return left.value !== right.value;
-            case '===': return left.value === right.value;
-            case '!==': return left.value !== right.value;
-            case '<': return left.value < right.value;
-            case '<=': return left.value <= right.value;
-            case '>': return left.value > right.value;
-            case '>=': return left.value >= right.value;
+            case '==':
+                return left.value === right.value;
+            case '!=':
+                return left.value !== right.value;
+            case '===':
+                return left.value === right.value;
+            case '!==':
+                return left.value !== right.value;
+            case '<':
+                return left.value < right.value;
+            case '<=':
+                return left.value <= right.value;
+            case '>':
+                return left.value > right.value;
+            case '>=':
+                return left.value >= right.value;
         }
     }
     if (t.isBooleanLiteral(left) && t.isBooleanLiteral(right)) {
         switch (op) {
-            case '==': return left.value === right.value;
-            case '!=': return left.value !== right.value;
-            case '===': return left.value === right.value;
-            case '!==': return left.value !== right.value;
+            case '==':
+                return left.value === right.value;
+            case '!=':
+                return left.value !== right.value;
+            case '===':
+                return left.value === right.value;
+            case '!==':
+                return left.value !== right.value;
         }
     }
     return null;

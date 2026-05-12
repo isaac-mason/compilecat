@@ -14,12 +14,7 @@ import * as t from '@babel/types';
  * slot is empty.
  */
 export function getConditionExpression(node: t.Node): t.Expression | null {
-    if (
-        t.isIfStatement(node) ||
-        t.isWhileStatement(node) ||
-        t.isDoWhileStatement(node) ||
-        t.isConditionalExpression(node)
-    ) {
+    if (t.isIfStatement(node) || t.isWhileStatement(node) || t.isDoWhileStatement(node) || t.isConditionalExpression(node)) {
         return node.test;
     }
     if (t.isForStatement(node)) {
@@ -246,32 +241,53 @@ export function precedence(node: t.Node): number {
     if (t.isConditionalExpression(node)) return 3;
     if (t.isLogicalExpression(node)) {
         switch (node.operator) {
-            case '??': return 4;
-            case '||': return 5;
-            case '&&': return 6;
+            case '??':
+                return 4;
+            case '||':
+                return 5;
+            case '&&':
+                return 6;
         }
     }
     if (t.isBinaryExpression(node)) {
         switch (node.operator) {
-            case '|': return 7;
-            case '^': return 8;
-            case '&': return 9;
-            case '==': case '!=': case '===': case '!==': return 10;
-            case '<': case '<=': case '>': case '>=': case 'in': case 'instanceof': return 11;
-            case '<<': case '>>': case '>>>': return 12;
-            case '+': case '-': return 13;
-            case '*': case '/': case '%': return 14;
-            case '**': return 15;
+            case '|':
+                return 7;
+            case '^':
+                return 8;
+            case '&':
+                return 9;
+            case '==':
+            case '!=':
+            case '===':
+            case '!==':
+                return 10;
+            case '<':
+            case '<=':
+            case '>':
+            case '>=':
+            case 'in':
+            case 'instanceof':
+                return 11;
+            case '<<':
+            case '>>':
+            case '>>>':
+                return 12;
+            case '+':
+            case '-':
+                return 13;
+            case '*':
+            case '/':
+            case '%':
+                return 14;
+            case '**':
+                return 15;
         }
     }
     if (t.isUnaryExpression(node)) return 16;
     if (t.isUpdateExpression(node)) return node.prefix ? 16 : 17;
     if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) return 18;
-    if (
-        t.isMemberExpression(node) ||
-        t.isOptionalMemberExpression(node) ||
-        t.isNewExpression(node)
-    ) return 19;
+    if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node) || t.isNewExpression(node)) return 19;
     return 20;
 }
 
@@ -345,9 +361,7 @@ export function areNodesEqual(a: t.Node, b: t.Node): boolean {
     }
     if (t.isConditionalExpression(a) && t.isConditionalExpression(b)) {
         return (
-            areNodesEqual(a.test, b.test) &&
-            areNodesEqual(a.consequent, b.consequent) &&
-            areNodesEqual(a.alternate, b.alternate)
+            areNodesEqual(a.test, b.test) && areNodesEqual(a.consequent, b.consequent) && areNodesEqual(a.alternate, b.alternate)
         );
     }
     if (t.isCallExpression(a) && t.isCallExpression(b)) {
@@ -461,12 +475,7 @@ function unwrapTypeAssertion(n: t.Node): t.Node {
 }
 
 /** Write `parent[key]` (or `parent[key][index]` if `index` provided). */
-export function setSlot(
-    parent: t.Node,
-    key: string,
-    index: number | undefined,
-    value: t.Node | null,
-): void {
+export function setSlot(parent: t.Node, key: string, index: number | undefined, value: t.Node | null): void {
     const obj = parent as unknown as Record<string, t.Node | (t.Node | null)[] | null>;
     if (index !== undefined) (obj[key] as (t.Node | null)[])[index] = value;
     else obj[key] = value;

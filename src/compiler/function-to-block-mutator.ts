@@ -26,11 +26,7 @@
 
 import * as t from '@babel/types';
 
-import {
-    gatherCallArgumentsNeedingTemps,
-    gatherModifiedParameters,
-    injectArguments,
-} from './function-argument-injector';
+import { gatherCallArgumentsNeedingTemps, gatherModifiedParameters, injectArguments } from './function-argument-injector';
 import { getSlot, setSlot } from './node-util';
 
 export type BlockMutateInput = {
@@ -91,11 +87,7 @@ export function mutateForBlockInline(input: BlockMutateInput): BlockMutateOutput
     for (let i = 0; i < params.length; i++) {
         const name = params[i];
         if (!needsTemp.has(name)) continue;
-        prologue.push(
-            t.variableDeclaration('let', [
-                t.variableDeclarator(t.identifier(name), argsForClassify[i]),
-            ]),
-        );
+        prologue.push(t.variableDeclaration('let', [t.variableDeclarator(t.identifier(name), argsForClassify[i])]));
     }
 
     // 4. Closure's `replaceReturns` (FunctionToBlockMutator.java:408) special-
@@ -115,12 +107,7 @@ export function mutateForBlockInline(input: BlockMutateInput): BlockMutateOutput
 
     if (hasReturnAtExit) {
         const last = body.body[body.body.length - 1] as t.ReturnStatement;
-        const replacement = makeTrailingReturnReplacement(
-            last.argument,
-            resultName,
-            needsResult,
-            onWrite,
-        );
+        const replacement = makeTrailingReturnReplacement(last.argument, resultName, needsResult, onWrite);
         body.body.splice(body.body.length - 1, 1, ...replacement);
     }
 
@@ -130,11 +117,7 @@ export function mutateForBlockInline(input: BlockMutateInput): BlockMutateOutput
     // this, downstream reads of `_r` could observe a previous BLOCK-inline's
     // value when the function falls off the end.
     if (needsResult && !hasReturnAtExit) {
-        body.body.push(
-            t.expressionStatement(
-                t.assignmentExpression('=', t.identifier(resultName), undefinedExpr()),
-            ),
-        );
+        body.body.push(t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), undefinedExpr())));
         hasResultWrite = true;
     }
 
@@ -198,11 +181,7 @@ function makeTrailingReturnReplacement(
     if (needsResult) {
         const rhs = arg ?? undefinedExpr();
         onWrite();
-        return [
-            t.expressionStatement(
-                t.assignmentExpression('=', t.identifier(resultName), rhs),
-            ),
-        ];
+        return [t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), rhs))];
     }
     if (arg && hasSideEffects(arg)) return [t.expressionStatement(arg)];
     return [];
@@ -216,13 +195,7 @@ function makeTrailingReturnReplacement(
 //   needsResult=true:   `{ _r = X; break LABEL; }` (or just `break LABEL;` if X is undefined)
 //   needsResult=false:  `break LABEL;`
 
-function rewriteReturns(
-    root: t.Node,
-    label: string,
-    resultName: string,
-    needsResult: boolean,
-    onWrite: () => void,
-): void {
+function rewriteReturns(root: t.Node, label: string, resultName: string, needsResult: boolean, onWrite: () => void): void {
     const walk = (n: t.Node, parent: t.Node, key: string, index?: number): void => {
         // Don't descend into nested functions — their returns belong to them.
         if (t.isFunction(n) || t.isClassBody(n)) return;
@@ -242,13 +215,7 @@ function rewriteReturns(
         }
 
         if (t.isReturnStatement(n)) {
-            const replacement = makeReturnReplacement(
-                n.argument,
-                label,
-                resultName,
-                needsResult,
-                onWrite,
-            );
+            const replacement = makeReturnReplacement(n.argument, label, resultName, needsResult, onWrite);
             if (index !== undefined) {
                 const arr = getSlot(parent, key) as t.Statement[];
                 arr.splice(index, 1, ...replacement);
@@ -284,11 +251,7 @@ function makeReturnReplacement(
     const out: t.Statement[] = [];
     if (needsResult) {
         const rhs = arg ?? undefinedExpr();
-        out.push(
-            t.expressionStatement(
-                t.assignmentExpression('=', t.identifier(resultName), rhs),
-            ),
-        );
+        out.push(t.expressionStatement(t.assignmentExpression('=', t.identifier(resultName), rhs)));
         onWrite();
     } else if (arg && hasSideEffects(arg)) {
         // Result discarded but expression has side effects — keep them.

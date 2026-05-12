@@ -54,23 +54,14 @@ function getNodeOrFail<N, E>(graph: DiGraph<N, E>, value: N): DiGraphNode<N, E> 
  * `connect(N, E, N)` — does NOT dedupe; multiple edges between the same pair
  * are allowed.
  */
-export function connect<N, E>(
-    graph: DiGraph<N, E>,
-    srcValue: N,
-    edgeValue: E,
-    destValue: N,
-): DiGraphEdge<N, E> {
+export function connect<N, E>(graph: DiGraph<N, E>, srcValue: N, edgeValue: E, destValue: N): DiGraphEdge<N, E> {
     const src = getNodeOrFail(graph, srcValue);
     const dest = getNodeOrFail(graph, destValue);
     return connectNodes(src, edgeValue, dest);
 }
 
 /** Direct-node variant; preferred when callers already hold the nodes. */
-export function connectNodes<N, E>(
-    src: DiGraphNode<N, E>,
-    edgeValue: E,
-    dest: DiGraphNode<N, E>,
-): DiGraphEdge<N, E> {
+export function connectNodes<N, E>(src: DiGraphNode<N, E>, edgeValue: E, dest: DiGraphNode<N, E>): DiGraphEdge<N, E> {
     const edge: DiGraphEdge<N, E> = {
         source: src,
         destination: dest,
@@ -86,12 +77,7 @@ export function connectNodes<N, E>(
  * Like connect, but only adds an edge if one doesn't already exist (matching
  * by edgeValue) between the two nodes. Creates nodes if absent.
  */
-export function connectIfNotConnectedInDirection<N, E>(
-    graph: DiGraph<N, E>,
-    srcValue: N,
-    edgeValue: E,
-    destValue: N,
-): void {
+export function connectIfNotConnectedInDirection<N, E>(graph: DiGraph<N, E>, srcValue: N, edgeValue: E, destValue: N): void {
     const src = createNode(graph, srcValue);
     const dest = createNode(graph, destValue);
     if (!isConnectedInDirection(src, dest, (v) => v === edgeValue)) {
@@ -132,11 +118,7 @@ export function getInEdges<N, E>(graph: DiGraph<N, E>, value: N): DiGraphEdge<N,
 }
 
 /** All edges from `n1` to `n2` (one direction only). */
-export function getEdgesInDirection<N, E>(
-    graph: DiGraph<N, E>,
-    n1: N,
-    n2: N,
-): DiGraphEdge<N, E>[] {
+export function getEdgesInDirection<N, E>(graph: DiGraph<N, E>, n1: N, n2: N): DiGraphEdge<N, E>[] {
     const a = getNodeOrFail(graph, n1);
     const b = getNodeOrFail(graph, n2);
     const out: DiGraphEdge<N, E>[] = [];

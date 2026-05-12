@@ -51,35 +51,27 @@ describe('DeadAssignmentsElimination', () => {
     });
 
     it('keeps a store that is read on at least one branch', () => {
-        const r = runDae(
-            'function f(cond) { var x = 1; if (cond) { x = 2; } return x; }',
-        );
+        const r = runDae('function f(cond) { var x = 1; if (cond) { x = 2; } return x; }');
         // x = 2 is live-out via the join with the else-branch pass-through.
         expect(r.code).toMatch(/x = 2/);
     });
 
     it('preserves an impure RHS by hoisting it for var inits (effects retained)', () => {
-        const r = runDae(
-            'function f() { var x = sideEffect(); }',
-        );
+        const r = runDae('function f() { var x = sideEffect(); }');
         // x is dead, but sideEffect() must still run. Closure hoists into a
         // sibling expr stmt — we do the same.
         expect(r.code).toContain('sideEffect()');
     });
 
     it('drops dead stores inside a loop body', () => {
-        const r = runDae(
-            'function f() { for (var i = 0; i < 10; i++) { var t = compute(i); } }',
-        );
+        const r = runDae('function f() { for (var i = 0; i < 10; i++) { var t = compute(i); } }');
         // `var t = compute(i);` — t is dead. compute(i) must remain.
         expect(r.code).toContain('compute(i)');
     });
 
     it('does not eliminate stores when a closure escapes the variable', () => {
         // Closure capture → DAE bails the whole function.
-        const r = runDae(
-            'function f() { var x = 1; x = 2; return function() { return x; }; }',
-        );
+        const r = runDae('function f() { var x = 1; x = 2; return function() { return x; }; }');
         expect(r.ran).toBe(false);
         expect(r.code).toMatch(/x = 2/);
     });
@@ -91,9 +83,7 @@ describe('DeadAssignmentsElimination', () => {
     });
 
     it('skips functions that contain a try/catch (CFG bails)', () => {
-        const r = runDae(
-            'function f() { var x = 1; try { x = 2; } catch (e) {} return x; }',
-        );
+        const r = runDae('function f() { var x = 1; try { x = 2; } catch (e) {} return x; }');
         expect(r.ran).toBe(false);
     });
 
@@ -124,9 +114,7 @@ describe('DeadAssignmentsElimination', () => {
         // killing redefinition, and (incorrectly) delete the outer init.
         // Binding-keyed analysis treats them as distinct slots, so the outer
         // `x` stays alive into `use(x)`.
-        const r = runDae(
-            'function f() { let x = a(); { let x = b(); x = c(); use(x); } use(x); }',
-        );
+        const r = runDae('function f() { let x = a(); { let x = b(); x = c(); use(x); } use(x); }');
         expect(r.code).toContain('a()');
         expect(r.code).toContain('b()');
         expect(r.code).toContain('c()');

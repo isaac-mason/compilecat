@@ -1,11 +1,10 @@
 import _generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { removeUnusedCode } from '../src/compiler/remove-unused-code';
 
-// biome-ignore lint/suspicious/noExplicitAny: babel CJS interop
 const generate: typeof _generate = (_generate as any).default ?? _generate;
 
 function run(code: string): { out: string; stats: ReturnType<typeof removeUnusedCode> } {

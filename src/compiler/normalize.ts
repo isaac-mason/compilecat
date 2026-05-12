@@ -276,9 +276,7 @@ function normalizeStatementList(list: t.Statement[]): void {
         const s = list[i];
         if (!t.isVariableDeclaration(s)) continue;
         if (s.declarations.length <= 1) continue;
-        const split: t.VariableDeclaration[] = s.declarations.map((d) =>
-            t.variableDeclaration(s.kind, [d]),
-        );
+        const split: t.VariableDeclaration[] = s.declarations.map((d) => t.variableDeclaration(s.kind, [d]));
         list.splice(i, 1, ...split);
         i += split.length - 1;
     }
@@ -305,9 +303,7 @@ function extractForInitializer(loop: t.ForStatement): t.Statement | null {
 /** Port of Normalize.java:566-602 (FOR_IN/FOR_OF case). Only handles
  *  `for (var x in/of y)` → `var x; for (x in/of y);`. Returns the new
  *  statement, or null if no extraction. Mutates `loop.left`. */
-function extractForInOfInitializer(
-    loop: t.ForInStatement | t.ForOfStatement,
-): t.Statement | null {
+function extractForInOfInitializer(loop: t.ForInStatement | t.ForOfStatement): t.Statement | null {
     const left = loop.left;
     if (!t.isVariableDeclaration(left)) return null;
     if (left.kind !== 'var') return null;

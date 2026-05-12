@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { runMinimizeExitPoints } from '../src/compiler/minimize-exit-points';
@@ -8,9 +8,7 @@ import { runMinimizeExitPoints } from '../src/compiler/minimize-exit-points';
 function mep(code: string): { code: string; minimized: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = runMinimizeExitPoints(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, minimized: r.minimized };
 }
 

@@ -15,7 +15,7 @@
 // that uses Scope/ScopeCreator; we'll port that on demand later when an
 // analysis actually needs it.
 
-import { Branch } from './control-flow-graph';
+import type { Branch } from './control-flow-graph';
 import type { ControlFlowGraph, CfgNode } from './control-flow-graph';
 import type { DiGraphEdge, DiGraphNode } from './graph/di-graph';
 import type { LatticeElement } from './graph/lattice-element';
@@ -55,10 +55,7 @@ export type LinearFlowState<L> = {
 /** Run the analysis to fixpoint. Mutates `cfg` annotations:
  *   - Each node.annotation becomes a LinearFlowState<L>.
  *   - For branched analyses, each edge.annotation becomes the per-edge L. */
-export function analyze<L extends LatticeElement>(
-    cfg: ControlFlowGraph,
-    config: DataFlowConfig<L>,
-): void {
+export function analyze<L extends LatticeElement>(cfg: ControlFlowGraph, config: DataFlowConfig<L>): void {
     if (config.branched && config.direction !== 'forward') {
         throw new Error('Dataflow: branched analysis must be forward.');
     }
@@ -84,9 +81,7 @@ export function analyze<L extends LatticeElement>(
 
         if (flow(config, cur)) {
             const next =
-                config.direction === 'forward'
-                    ? cur.outEdges.map((e) => e.destination)
-                    : cur.inEdges.map((e) => e.source);
+                config.direction === 'forward' ? cur.outEdges.map((e) => e.destination) : cur.inEdges.map((e) => e.source);
             for (const n of next) {
                 if (n !== cfg.implicitReturn) queue.add(n);
             }
@@ -100,10 +95,7 @@ export function analyze<L extends LatticeElement>(
 
 // --- internals ---
 
-function initialize<L extends LatticeElement>(
-    cfg: ControlFlowGraph,
-    config: DataFlowConfig<L>,
-): void {
+function initialize<L extends LatticeElement>(cfg: ControlFlowGraph, config: DataFlowConfig<L>): void {
     for (const node of cfg.nodes.values()) {
         const state: LinearFlowState<L> = {
             in: config.bottom(),
@@ -121,11 +113,7 @@ function initialize<L extends LatticeElement>(
     }
 }
 
-function joinInputs<L extends LatticeElement>(
-    cfg: ControlFlowGraph,
-    config: DataFlowConfig<L>,
-    node: CfgNode,
-): void {
+function joinInputs<L extends LatticeElement>(cfg: ControlFlowGraph, config: DataFlowConfig<L>, node: CfgNode): void {
     const state = node.annotation as LinearFlowState<L>;
     if (config.direction === 'forward' && node === cfg.entry) {
         state.in = config.entry();
@@ -170,10 +158,7 @@ function getInputFromEdge<L extends LatticeElement>(
     return (dstState as LinearFlowState<L>).in;
 }
 
-function flow<L extends LatticeElement>(
-    config: DataFlowConfig<L>,
-    node: CfgNode,
-): boolean {
+function flow<L extends LatticeElement>(config: DataFlowConfig<L>, node: CfgNode): boolean {
     const state = node.annotation as LinearFlowState<L>;
     if (config.direction === 'forward') {
         const before = state.out;

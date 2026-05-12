@@ -1,15 +1,10 @@
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { buildControlFlowGraph } from '../src/compiler/control-flow-analysis';
 import { IMPLICIT_RETURN } from '../src/compiler/control-flow-graph';
-import {
-    analyze,
-    type DataFlowConfig,
-    type LinearFlowState,
-    MAX_STEPS_PER_NODE,
-} from '../src/compiler/data-flow-analysis';
+import { analyze, type DataFlowConfig, type LinearFlowState, MAX_STEPS_PER_NODE } from '../src/compiler/data-flow-analysis';
 
 function fnBody(code: string): t.Node {
     const file = parse(code, { plugins: ['typescript'] });

@@ -19,9 +19,7 @@ export const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline|flatten|sroa|unroll|optimize)
 
 export function commentIsInlineDirective(value: string): boolean {
     return (
-        DIRECTIVE_PATTERNS.inline.test(value) ||
-        DIRECTIVE_PATTERNS.flatten.test(value) ||
-        DIRECTIVE_PATTERNS.optimize.test(value)
+        DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS.flatten.test(value) || DIRECTIVE_PATTERNS.optimize.test(value)
     );
 }
 
@@ -42,11 +40,7 @@ export function isExportWrapper(n: t.Node | null): boolean {
 // declaration. `hasLeadingDirective` checks the node's own leadingComments and
 // falls back to the wrapping parent's, so authored `@inline`/`@optimize`/etc.
 // on the export node still counts.
-export function hasLeadingDirective(
-    n: t.Node,
-    parent: t.Node | null,
-    pred: (commentValue: string) => boolean,
-): boolean {
+export function hasLeadingDirective(n: t.Node, parent: t.Node | null, pred: (commentValue: string) => boolean): boolean {
     if (matchLeadingComment(n, pred)) return true;
     if (isExportWrapper(parent) && matchLeadingComment(parent as t.Node, pred)) return true;
     return false;

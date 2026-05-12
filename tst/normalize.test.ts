@@ -1,21 +1,15 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
 import traverse, { type NodePath } from '@babel/traverse';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
-import {
-    isFileNormalized,
-    makeDeclaredNamesUnique,
-    renameForFlatten,
-} from '../src/compiler/normalize';
+import { isFileNormalized, makeDeclaredNamesUnique, renameForFlatten } from '../src/compiler/normalize';
 
 function run(code: string): { code: string; renamed: number; normalized: boolean } {
     const file = parse(code, { sourceType: 'module', plugins: ['typescript'] });
     const r = makeDeclaredNamesUnique(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, renamed: r.renamed, normalized: isFileNormalized(file) };
 }
 
@@ -30,9 +24,7 @@ function runRename(code: string): { code: string; renamed: number } {
             },
         },
     });
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, renamed: totalRenamed };
 }
 
@@ -53,9 +45,7 @@ describe('Normalize.makeDeclaredNamesUnique', () => {
     it('leaves cross-function name reuse alone (distinct scopes)', () => {
         // The whole point of demand-driven rename: cross-function `i`
         // never collides, so both stay as authored.
-        const r = run(
-            'function a() { var i = 0; return i; } function b() { var i = 1; return i; }',
-        );
+        const r = run('function a() { var i = 0; return i; } function b() { var i = 1; return i; }');
         expect(r.code).toMatch(/function a\(\)\s*\{\s*var i = 0/);
         expect(r.code).toMatch(/function b\(\)\s*\{\s*var i = 1/);
         expect(r.code).not.toMatch(/i__\d+/);
@@ -71,9 +61,7 @@ describe('Normalize.renameForFlatten', () => {
     });
 
     it('renames inner let that shadows function-scope var', () => {
-        const r = runRename(
-            'function f() { var x = 1; { let x = 2; sink(x); } return x; }',
-        );
+        const r = runRename('function f() { var x = 1; { let x = 2; sink(x); } return x; }');
         expect(r.code).toMatch(/var x = 1/);
         expect(r.code).toMatch(/let x__1 = 2/);
         expect(r.code).toMatch(/sink\(x__1\)/);
@@ -82,9 +70,7 @@ describe('Normalize.renameForFlatten', () => {
     });
 
     it('renames sibling-block let bindings to a unique name per function', () => {
-        const r = runRename(
-            'function f() { { let i = 1; sink(i); } { let i = 2; sink(i); } }',
-        );
+        const r = runRename('function f() { { let i = 1; sink(i); } { let i = 2; sink(i); } }');
         // ContextualRenamer-style: every nested binding inside the function
         // is uniquified so `tryMergeBlock(ignoreBlockScopedDeclarations=true)`
         // can splice blindly without sibling-collision checks.
@@ -95,9 +81,7 @@ describe('Normalize.renameForFlatten', () => {
     });
 
     it('renames inner function-declarations that collide with an outer var', () => {
-        const r = runRename(
-            'function outer() { var k = 1; { function k() {} sink(k); } }',
-        );
+        const r = runRename('function outer() { var k = 1; { function k() {} sink(k); } }');
         expect(r.code).toMatch(/var k = 1/);
         expect(r.code).toMatch(/function k__1\(\)/);
         expect(r.code).toMatch(/sink\(k__1\)/);
@@ -106,9 +90,7 @@ describe('Normalize.renameForFlatten', () => {
     it('does not cross function boundaries', () => {
         // Inner function `f` declares its own `i`; outer's renameForFlatten
         // must skip it entirely (the inner function gets its own pass).
-        const r = runRename(
-            'function outer() { var i = 1; function inner() { var i = 2; return i; } return i; }',
-        );
+        const r = runRename('function outer() { var i = 1; function inner() { var i = 2; return i; } return i; }');
         // Inner's own pass runs and finds no collision within `inner`.
         expect(r.code).toMatch(/function inner\(\)\s*\{\s*var i = 2/);
         expect(r.code).toMatch(/return i;\s*\}\s*return i;/);
@@ -130,9 +112,7 @@ describe('Normalize structural — splitVarDeclarations', () => {
     });
 
     it('splits multi-declarator let and const', () => {
-        const r = run(
-            'function f() { let a = 1, b = 2; const x = 3, y = 4; sink(a + b + x + y); }',
-        );
+        const r = run('function f() { let a = 1, b = 2; const x = 3, y = 4; sink(a + b + x + y); }');
         expect(r.code).toMatch(/let a = 1; let b = 2/);
         expect(r.code).toMatch(/const x = 3; const y = 4/);
     });

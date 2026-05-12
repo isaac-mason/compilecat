@@ -117,11 +117,7 @@ export type MustReachResult = {
     getDef: (id: t.Identifier, cfgNode: CfgNode) => Definition | null | undefined;
 };
 
-export function runMustReachingDef(
-    fn: t.Function,
-    cfg: ControlFlowGraph,
-    table: LocalVariableTable,
-): MustReachResult {
+export function runMustReachingDef(fn: t.Function, cfg: ControlFlowGraph, table: LocalVariableTable): MustReachResult {
     const config: DataFlowConfig<MustDef> = {
         direction: 'forward',
         flowThrough: (node, input) => flowThrough(fn, node, input, table),
@@ -158,12 +154,7 @@ export function runMustReachingDef(
 // ---------------------------------------------------------------------------
 // flowThrough
 
-function flowThrough(
-    fn: t.Function,
-    cfgNode: CfgNode,
-    input: MustDef,
-    table: LocalVariableTable,
-): MustDef {
+function flowThrough(fn: t.Function, cfgNode: CfgNode, input: MustDef, table: LocalVariableTable): MustDef {
     const output = cloneMustDef(input);
     const value = cfgNode.value;
     if (typeof value !== 'symbol') {

@@ -79,10 +79,7 @@ export type LiveVariablesResult = {
  * (per DataFlowAnalysis convention). Returns null if we bailed (too many
  * variables in the function).
  */
-export function runLiveVariablesAnalysis(
-    cfg: ControlFlowGraph,
-    table: LocalVariableTable,
-): LiveVariablesResult {
+export function runLiveVariablesAnalysis(cfg: ControlFlowGraph, table: LocalVariableTable): LiveVariablesResult {
     if (table.size > MAX_VARIABLES_TO_ANALYZE) {
         return { table, ran: false };
     }
@@ -113,11 +110,7 @@ export function runLiveVariablesAnalysis(
 // ---------------------------------------------------------------------------
 // flowThrough — compute GEN/KILL for `node`, then L_in = (L_out − KILL) | GEN
 
-function flowThrough(
-    node: CfgNode,
-    out: LiveVariableLattice,
-    table: LocalVariableTable,
-): LiveVariableLattice {
+function flowThrough(node: CfgNode, out: LiveVariableLattice, table: LocalVariableTable): LiveVariableLattice {
     const gen = newLattice(table);
     const kill = newLattice(table);
     const value = node.value;
@@ -146,20 +139,11 @@ function computeGenKill(
     conditional: boolean,
 ): void {
     // Container nodes — Closure returns immediately for SCRIPT/ROOT/FUNCTION/BLOCK.
-    if (
-        t.isProgram(n) ||
-        t.isFile(n) ||
-        t.isFunction(n) ||
-        t.isBlockStatement(n)
-    ) {
+    if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) {
         return;
     }
 
-    if (
-        t.isWhileStatement(n) ||
-        t.isDoWhileStatement(n) ||
-        t.isIfStatement(n)
-    ) {
+    if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
         computeGenKill(n.test, table, gen, kill, conditional);
         return;
     }
@@ -275,11 +259,7 @@ function computeGenKill(
     }
 }
 
-function addBindingsToKill(
-    pattern: t.Node,
-    table: LocalVariableTable,
-    kill: LiveVariableLattice,
-): void {
+function addBindingsToKill(pattern: t.Node, table: LocalVariableTable, kill: LiveVariableLattice): void {
     const visit = (n: t.Node) => {
         if (t.isIdentifier(n)) {
             const slot = table.resolve(n);

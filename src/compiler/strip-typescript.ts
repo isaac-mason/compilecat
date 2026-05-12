@@ -55,9 +55,7 @@ export function stripTypeScript(ast: t.File): void {
                 body.splice(i, 1);
                 continue;
             }
-            stmt.specifiers = stmt.specifiers.filter(
-                (s) => !(t.isImportSpecifier(s) && s.importKind === 'type'),
-            );
+            stmt.specifiers = stmt.specifiers.filter((s) => !(t.isImportSpecifier(s) && s.importKind === 'type'));
             if (stmt.specifiers.length === 0) {
                 body.splice(i, 1);
                 continue;
@@ -69,9 +67,7 @@ export function stripTypeScript(ast: t.File): void {
                 body.splice(i, 1);
                 continue;
             }
-            stmt.specifiers = stmt.specifiers.filter(
-                (s) => !(t.isExportSpecifier(s) && s.exportKind === 'type'),
-            );
+            stmt.specifiers = stmt.specifiers.filter((s) => !(t.isExportSpecifier(s) && s.exportKind === 'type'));
             if (
                 stmt.declaration &&
                 (t.isTSInterfaceDeclaration(stmt.declaration) ||
@@ -90,7 +86,6 @@ export function stripTypeScript(ast: t.File): void {
                 stmt.declaration = null;
                 if (stmt.specifiers.length === 0 && !stmt.source) {
                     body.splice(i, 1);
-                    continue;
                 }
             }
         }
@@ -119,11 +114,7 @@ function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
     let nextNumeric: number | null = 0;
 
     for (const m of decl.members) {
-        const keyName = t.isIdentifier(m.id)
-            ? m.id.name
-            : t.isStringLiteral(m.id)
-              ? m.id.value
-              : null;
+        const keyName = t.isIdentifier(m.id) ? m.id.name : t.isStringLiteral(m.id) ? m.id.value : null;
         if (keyName === null) return null;
 
         let value: t.NumericLiteral | t.StringLiteral;
@@ -132,11 +123,7 @@ function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
             if (t.isNumericLiteral(init)) {
                 value = t.numericLiteral(init.value);
                 nextNumeric = init.value + 1;
-            } else if (
-                t.isUnaryExpression(init) &&
-                init.operator === '-' &&
-                t.isNumericLiteral(init.argument)
-            ) {
+            } else if (t.isUnaryExpression(init) && init.operator === '-' && t.isNumericLiteral(init.argument)) {
                 value = t.numericLiteral(-init.argument.value);
                 nextNumeric = (value.value as number) + 1;
             } else if (t.isStringLiteral(init)) {
@@ -157,11 +144,7 @@ function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
     const bodyStmts: t.Statement[] = resolved.map(({ key, value }) => {
         if (t.isStringLiteral(value)) {
             return t.expressionStatement(
-                t.assignmentExpression(
-                    '=',
-                    t.memberExpression(idRef(), t.stringLiteral(key), true),
-                    value,
-                ),
+                t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value),
             );
         }
         return t.expressionStatement(
@@ -169,11 +152,7 @@ function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
                 '=',
                 t.memberExpression(
                     idRef(),
-                    t.assignmentExpression(
-                        '=',
-                        t.memberExpression(idRef(), t.stringLiteral(key), true),
-                        value,
-                    ),
+                    t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value),
                     true,
                 ),
                 t.stringLiteral(key),
@@ -182,16 +161,9 @@ function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
     });
 
     const iife = t.expressionStatement(
-        t.callExpression(
-            t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)),
-            [
-                t.logicalExpression(
-                    '||',
-                    idRef(),
-                    t.assignmentExpression('=', idRef(), t.objectExpression([])),
-                ),
-            ],
-        ),
+        t.callExpression(t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)), [
+            t.logicalExpression('||', idRef(), t.assignmentExpression('=', idRef(), t.objectExpression([]))),
+        ]),
     );
 
     return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];

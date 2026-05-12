@@ -122,9 +122,7 @@ describe('FlowSensitiveInlineVariables', () => {
         // could (depending on impl) wrongly fold the outer RHS into the
         // inner read, producing `sink(p + 1)`. With slot-keyed identity the
         // inner read isn't a use of the outer slot, so no inline happens.
-        const r = run(
-            'function f(p) { var x = p + 1; { let x = 7; sink(x); } return x; }',
-        );
+        const r = run('function f(p) { var x = p + 1; { let x = 7; sink(x); } return x; }');
         // The inner sink must read 7, not p + 1.
         expect(r.code).toContain('sink(7)');
     });

@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { simplifyAll } from '../src/compiler/simplifier';
@@ -8,9 +8,7 @@ import { simplifyAll } from '../src/compiler/simplifier';
 function simp(code: string): { code: string; iters: number; folded: number; inlined: number; removed: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const s = simplifyAll(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, iters: s.iterations, folded: s.folded, inlined: s.inlined, removed: s.removed };
 }
 

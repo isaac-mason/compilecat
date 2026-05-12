@@ -9,8 +9,8 @@
 //   4. Run simplifyAll across the program.
 //   5. Generate code (and optional sourcemap).
 
-import { parse, type ParserOptions } from '@babel/parser';
-import * as t from '@babel/types';
+import { type ParserOptions, parse } from '@babel/parser';
+import type * as t from '@babel/types';
 
 import { generate } from './babel-interop';
 import { inlineFunctions } from './inline-functions';
@@ -32,7 +32,6 @@ export type TransformOptions = {
 
 export type TransformResult = {
     code: string;
-    // biome-ignore lint/suspicious/noExplicitAny: babel sourcemap shape
     map: any;
     stats: {
         inlined: number;

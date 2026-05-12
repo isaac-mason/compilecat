@@ -55,17 +55,10 @@ function collectCandidates(root: t.Node): Candidate[] {
 
     const sroaScopeStack: boolean[] = [false];
 
-    const walk = (
-        n: t.Node,
-        parent: t.Node | null,
-        _key: string,
-        index: number | undefined,
-        scope: t.Node,
-    ): void => {
+    const walk = (n: t.Node, parent: t.Node | null, _key: string, index: number | undefined, scope: t.Node): void => {
         const enteringFn = t.isFunction(n);
         const enteringScope = enteringFn || t.isProgram(n);
-        const annotated =
-            sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n, parent);
+        const annotated = sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n, parent);
         if (enteringScope) {
             sroaScopeStack.push(annotated);
         }
@@ -79,11 +72,7 @@ function collectCandidates(root: t.Node): Candidate[] {
                 if (!t.isIdentifier(d.id) || !d.init) continue;
                 const init = inferInitializer(d.init);
                 if (!init) continue;
-                if (
-                    parent &&
-                    (t.isBlockStatement(parent) || t.isProgram(parent)) &&
-                    typeof index === 'number'
-                ) {
+                if (parent && (t.isBlockStatement(parent) || t.isProgram(parent)) && typeof index === 'number') {
                     out.push({
                         name: d.id.name,
                         size: init.size,
@@ -118,9 +107,7 @@ function collectCandidates(root: t.Node): Candidate[] {
     return out;
 }
 
-function inferInitializer(
-    init: t.Expression,
-): { size: number; initExprs: t.Expression[] } | null {
+function inferInitializer(init: t.Expression): { size: number; initExprs: t.Expression[] } | null {
     if (!t.isArrayExpression(init)) return null;
     const size = init.elements.length;
     if (size < MIN_FIELDS || size > MAX_FIELDS) return null;
@@ -145,11 +132,7 @@ function hasSroaAnnotation(n: t.Node, parent: t.Node | null = null): boolean {
 function passesEscapeAnalysis(c: Candidate): boolean {
     let safe = true;
 
-    const visit = (
-        n: t.Node | null | undefined,
-        parent: t.Node | null,
-        key: string,
-    ): void => {
+    const visit = (n: t.Node | null | undefined, parent: t.Node | null, key: string): void => {
         if (!safe || !n) return;
 
         if (t.isIdentifier(n) && n.name === c.name) {
@@ -222,9 +205,7 @@ function rewriteDeclarations(safe: Candidate[]): void {
         for (let i = 0; i < c.size; i++) {
             const scalar = `${c.name}_${i}`;
             const init = c.initExprs[i] ?? t.identifier('undefined');
-            newDecls.push(
-                t.variableDeclarator(t.identifier(scalar), t.cloneNode(init, true, false)),
-            );
+            newDecls.push(t.variableDeclarator(t.identifier(scalar), t.cloneNode(init, true, false)));
         }
 
         const idx = c.declStmt.declarations.indexOf(c.declarator);
@@ -258,12 +239,7 @@ function rewriteAccesses(root: t.Node, safe: Candidate[]): void {
     // Walk; track current "active scope" stack.
     const scopeStack: t.Node[] = [];
 
-    const visit = (
-        n: t.Node | null | undefined,
-        parent: t.Node | null,
-        key: string,
-        index: number | undefined,
-    ): void => {
+    const visit = (n: t.Node | null | undefined, parent: t.Node | null, key: string, index: number | undefined): void => {
         if (!n) return;
 
         const opensScope = byScope.has(n);

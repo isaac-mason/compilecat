@@ -44,10 +44,7 @@ export type RemoveOptions = {
     normalized?: boolean;
 };
 
-export function runPeepholeRemoveDeadCode(
-    root: t.Node,
-    options: RemoveOptions = {},
-): RemoveResult {
+export function runPeepholeRemoveDeadCode(root: t.Node, options: RemoveOptions = {}): RemoveResult {
     const ctx: Ctx = { removed: 0, normalized: options.normalized === true };
     walk(root, null, '', undefined, ctx);
     return { removed: ctx.removed };
@@ -55,13 +52,7 @@ export function runPeepholeRemoveDeadCode(
 
 type Ctx = { removed: number; normalized: boolean };
 
-function walk(
-    n: t.Node,
-    parent: t.Node | null,
-    key: string,
-    index: number | undefined,
-    ctx: Ctx,
-): void {
+function walk(n: t.Node, parent: t.Node | null, key: string, index: number | undefined, ctx: Ctx): void {
     // Bottom-up.
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
         const child = getSlot(n, k);
@@ -141,11 +132,7 @@ function foldLabel(n: t.LabeledStatement): t.Node | null | undefined {
     // a single-stmt block.
     if (t.isBlockStatement(stmt) && stmt.body.length === 1) {
         const only = stmt.body[0];
-        if (
-            t.isBreakStatement(only) &&
-            only.label != null &&
-            only.label.name === labelName
-        ) {
+        if (t.isBreakStatement(only) && only.label != null && only.label.name === labelName) {
             return null;
         }
     }
@@ -156,11 +143,7 @@ function isLabelReferenced(labelName: string, root: t.Node): boolean {
     let found = false;
     const visit = (n: t.Node): void => {
         if (found) return;
-        if (
-            (t.isBreakStatement(n) || t.isContinueStatement(n)) &&
-            n.label != null &&
-            n.label.name === labelName
-        ) {
+        if ((t.isBreakStatement(n) || t.isContinueStatement(n)) && n.label != null && n.label.name === labelName) {
             found = true;
             return;
         }
@@ -366,12 +349,7 @@ function cleanBlockBody(n: t.BlockStatement | t.Program, ctx: Ctx): void {
 }
 
 function isTerminator(s: t.Statement): boolean {
-    return (
-        t.isReturnStatement(s) ||
-        t.isThrowStatement(s) ||
-        t.isBreakStatement(s) ||
-        t.isContinueStatement(s)
-    );
+    return t.isReturnStatement(s) || t.isThrowStatement(s) || t.isBreakStatement(s) || t.isContinueStatement(s);
 }
 
 function containsVarDeclaration(s: t.Statement): boolean {
@@ -419,10 +397,7 @@ function asBoolean(node: t.Node): boolean | null {
 //
 // Returns true when the condition was replaced.
 
-function tryOptimizeConditionalAfterAssign(
-    assignStmt: t.Statement,
-    conditionalStmt: t.Statement,
-): boolean {
+function tryOptimizeConditionalAfterAssign(assignStmt: t.Statement, conditionalStmt: t.Statement): boolean {
     const lhsName = simpleAssignmentLhsName(assignStmt);
     if (lhsName === null) return false;
     const rhs = simpleAssignmentRhs(assignStmt);
@@ -508,10 +483,7 @@ function conditionalRoot(s: t.Statement): ConditionalRoot | null {
                 },
             };
         }
-        if (
-            t.isLogicalExpression(e) &&
-            (e.operator === '&&' || e.operator === '||' || e.operator === '??')
-        ) {
+        if (t.isLogicalExpression(e) && (e.operator === '&&' || e.operator === '||' || e.operator === '??')) {
             return {
                 root: e,
                 replaceCondition(r) {

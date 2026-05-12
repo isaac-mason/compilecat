@@ -95,12 +95,7 @@ function bodyReadsThisOrArguments(body: t.BlockStatement): boolean {
 
 function bodyHasUnsupportedConstruct(body: t.BlockStatement): boolean {
     return t.traverseFast(body, (n) => {
-        if (
-            t.isTryStatement(n) ||
-            t.isWithStatement(n) ||
-            t.isYieldExpression(n) ||
-            t.isAwaitExpression(n)
-        ) {
+        if (t.isTryStatement(n) || t.isWithStatement(n) || t.isYieldExpression(n) || t.isAwaitExpression(n)) {
             return t.traverseFast.stop;
         }
         // Don't descend into nested functions — their try/yield is fine.
@@ -134,10 +129,7 @@ export type CallSite = {
 // Replace the CallExpression with a substituted clone of the callee's
 // return-expression. Argument substitution is by α-rename in the cloned body.
 
-export function inlineDirect(
-    callee: Callee,
-    site: CallSite,
-): boolean {
+export function inlineDirect(callee: Callee, site: CallSite): boolean {
     const fn = callee.fn;
     const args = site.call.arguments;
     if (!allArgsExpressions(args)) return false;
@@ -215,10 +207,7 @@ type CallsiteShape =
 
 function recognizeCallsite(site: CallSite): CallsiteShape {
     // statement: `foo();`
-    if (
-        t.isExpressionStatement(site.callParent) &&
-        site.callParent === site.enclosingStatement
-    ) {
+    if (t.isExpressionStatement(site.callParent) && site.callParent === site.enclosingStatement) {
         return { kind: 'statement' };
     }
 
@@ -262,11 +251,7 @@ function recognizeCallsite(site: CallSite): CallsiteShape {
 // ---------------------------------------------------------------------------
 // Splice — BLOCK.
 
-export function inlineBlock(
-    callee: Callee,
-    site: CallSite,
-    options: InjectorOptions,
-): boolean {
+export function inlineBlock(callee: Callee, site: CallSite, options: InjectorOptions): boolean {
     const fn = callee.fn;
     if (!t.isBlockStatement(fn.body)) return false;
     const args = site.call.arguments;
@@ -275,9 +260,7 @@ export function inlineBlock(
 
     const id = options.nextId();
     const cn = calleeName(callee.fn);
-    const label = cn === null
-        ? `_compilecat_inline_label_${id}`
-        : `_compilecat_inline_label_${cn}_${id}`;
+    const label = cn === null ? `_compilecat_inline_label_${id}` : `_compilecat_inline_label_${cn}_${id}`;
 
     // Clone body and args. Strip TS-only annotations from the cloned body so
     // the inlined block doesn't carry `: T` markers from the (TS) donor into
@@ -287,11 +270,7 @@ export function inlineBlock(
     const clonedArgs: t.Expression[] = [];
     for (let i = 0; i < callee.paramNames.length; i++) {
         const a = args[i];
-        clonedArgs.push(
-            a === undefined
-                ? t.identifier('undefined')
-                : t.cloneNode(a as t.Expression, true),
-        );
+        clonedArgs.push(a === undefined ? t.identifier('undefined') : t.cloneNode(a as t.Expression, true));
     }
 
     // Conditional alpha-rename. Rename a param P only when some arg references
@@ -329,8 +308,7 @@ export function inlineBlock(
     // reads of that name — those would resolve to the consumer's variable
     // instead of the donor module's, changing semantics. Demote to expression
     // shape in that case.
-    if ((shape.kind === 'init' || shape.kind === 'assign') &&
-        bodyHasFreeRefTo(clonedBody, shape.name, freshParams)) {
+    if ((shape.kind === 'init' || shape.kind === 'assign') && bodyHasFreeRefTo(clonedBody, shape.name, freshParams)) {
         shape = { kind: 'expression' };
     }
 
@@ -339,9 +317,7 @@ export function inlineBlock(
     // X" in the bundle. Anonymous callee → `_result_<n>`. The result temp is
     // local to one function; we don't need the `_compilecat_` global prefix
     // that the label carries.
-    const fallbackResult = cn === null
-        ? `_result_${id}`
-        : `_${cn}__result_${id}`;
+    const fallbackResult = cn === null ? `_result_${id}` : `_${cn}__result_${id}`;
     let resultName: string;
     let needsResult: boolean;
     switch (shape.kind) {
@@ -401,9 +377,7 @@ export function inlineBlock(
             // Hoist `let _<callee>__result_<n>;` and the labeled
             // block before the enclosing statement; replace the call with the
             // result temp.
-            const tempDecl = t.variableDeclaration('let', [
-                t.variableDeclarator(t.identifier(resultName)),
-            ]);
+            const tempDecl = t.variableDeclaration('let', [t.variableDeclarator(t.identifier(resultName))]);
             tagInlined(tempDecl, breadcrumb);
             const inserts: t.Statement[] = [tempDecl, out.block];
             replaceCall(site, t.identifier(resultName));
@@ -449,7 +423,17 @@ function collectIdentifierNames(expr: t.Node, out: Set<string>): void {
         }
 
         for (const k of Object.keys(n)) {
-            if (k === 'type' || k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments' || k === 'extra') continue;
+            if (
+                k === 'type' ||
+                k === 'loc' ||
+                k === 'start' ||
+                k === 'end' ||
+                k === 'leadingComments' ||
+                k === 'trailingComments' ||
+                k === 'innerComments' ||
+                k === 'extra'
+            )
+                continue;
             const v = (n as unknown as Record<string, unknown>)[k];
             if (Array.isArray(v)) {
                 for (const item of v) walk(item as t.Node, n, k);
@@ -464,11 +448,7 @@ function collectIdentifierNames(expr: t.Node, out: Set<string>): void {
 // True iff `name` appears as a free read in `body` (not shadowed by a nested
 // scope, not in a write/key context, not equal to one of the post-rename param
 // names — those have been renamed and won't collide).
-function bodyHasFreeRefTo(
-    body: t.BlockStatement,
-    name: string,
-    paramNames: string[],
-): boolean {
+function bodyHasFreeRefTo(body: t.BlockStatement, name: string, paramNames: string[]): boolean {
     if (paramNames.includes(name)) return false; // shouldn't happen post-rename
     let found = false;
 
@@ -499,10 +479,7 @@ function bodyHasFreeRefTo(
                     for (const d of s.declarations) {
                         if (t.isIdentifier(d.id) && d.id.name === name) blockShadow = true;
                     }
-                } else if (
-                    (t.isFunctionDeclaration(s) || t.isClassDeclaration(s)) &&
-                    s.id?.name === name
-                ) {
+                } else if ((t.isFunctionDeclaration(s) || t.isClassDeclaration(s)) && s.id?.name === name) {
                     blockShadow = true;
                 }
             }
@@ -510,13 +487,7 @@ function bodyHasFreeRefTo(
             return;
         }
 
-        if (
-            !shadowed &&
-            t.isIdentifier(n) &&
-            n.name === name &&
-            parent !== null &&
-            isReferenceContext(parent, key)
-        ) {
+        if (!shadowed && t.isIdentifier(n) && n.name === name && parent !== null && isReferenceContext(parent, key)) {
             found = true;
             return;
         }
@@ -545,9 +516,7 @@ function bodyHasFreeRefTo(
 // ---------------------------------------------------------------------------
 // Helpers.
 
-function allArgsExpressions(
-    args: (t.Expression | t.SpreadElement | t.ArgumentPlaceholder)[],
-): args is t.Expression[] {
+function allArgsExpressions(args: (t.Expression | t.SpreadElement | t.ArgumentPlaceholder)[]): args is t.Expression[] {
     for (const a of args) {
         if (t.isSpreadElement(a) || t.isArgumentPlaceholder(a)) return false;
     }
@@ -636,10 +605,7 @@ function collectParamNames(p: t.Node, drop: (name: string) => void): void {
     else if (t.isRestElement(p)) collectParamNames(p.argument, drop);
 }
 
-function filterByBlockDecls(
-    active: Map<string, string>,
-    block: t.BlockStatement,
-): Map<string, string> {
+function filterByBlockDecls(active: Map<string, string>, block: t.BlockStatement): Map<string, string> {
     let filtered: Map<string, string> | null = null;
     for (const s of block.body) {
         if (t.isVariableDeclaration(s)) {
@@ -675,18 +641,10 @@ function isReferenceContext(parent: t.Node, key: string): boolean {
     return true;
 }
 
-function substituteIdentifiers(
-    root: t.Expression,
-    subs: Map<string, t.Expression>,
-): t.Expression {
+function substituteIdentifiers(root: t.Expression, subs: Map<string, t.Expression>): t.Expression {
     let rootReplacement: t.Expression | null = null;
 
-    const visit = (
-        n: t.Node,
-        parent: t.Node | null,
-        key: string,
-        index: number | undefined,
-    ): void => {
+    const visit = (n: t.Node, parent: t.Node | null, key: string, index: number | undefined): void => {
         if (t.isFunction(n)) return; // shadowed
         if (t.isIdentifier(n) && subs.has(n.name)) {
             // Skip Identifier in write contexts. For root expression

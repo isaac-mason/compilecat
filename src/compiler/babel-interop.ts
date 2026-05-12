@@ -6,7 +6,6 @@
 import _generate from '@babel/generator';
 import _traverse from '@babel/traverse';
 
-// biome-ignore lint/suspicious/noExplicitAny: interop shim
 const unwrap = <T>(mod: T): T => (mod as any).default ?? mod;
 
 export const generate: typeof _generate = unwrap(_generate);

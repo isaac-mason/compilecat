@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { runPeepholeFoldConstants } from '../src/compiler/peephole-fold-constants';
@@ -8,9 +8,7 @@ import { runPeepholeFoldConstants } from '../src/compiler/peephole-fold-constant
 function fold(code: string): { code: string; folded: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = runPeepholeFoldConstants(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, folded: r.folded };
 }
 

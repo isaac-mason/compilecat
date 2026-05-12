@@ -15,12 +15,7 @@
 // caller's pre-existing annotations survive the walk.
 
 import type { DiGraph, DiGraphEdge, DiGraphNode } from './di-graph';
-import {
-    popEdgeAnnotations,
-    popNodeAnnotations,
-    pushEdgeAnnotations,
-    pushNodeAnnotations,
-} from './linked-directed-graph';
+import { popEdgeAnnotations, popNodeAnnotations, pushEdgeAnnotations, pushNodeAnnotations } from './linked-directed-graph';
 
 // Sentinel annotation values. Distinct object identities — checked by ===.
 const BACK_EDGE: object = { tag: 'BACK_EDGE' };
@@ -53,9 +48,7 @@ export type CheckPathsBetweenNodesOptions<N, E> = {
 
 /** True iff every non-looping path from start to end has at least one node
  *  satisfying nodePredicate. */
-export function allPathsSatisfyPredicate<N, E>(
-    opts: CheckPathsBetweenNodesOptions<N, E>,
-): boolean {
+export function allPathsSatisfyPredicate<N, E>(opts: CheckPathsBetweenNodesOptions<N, E>): boolean {
     const state: State<N, E> = {
         graph: opts.graph,
         start: opts.start,
@@ -74,9 +67,7 @@ export function allPathsSatisfyPredicate<N, E>(
 
 /** True iff at least one non-looping path from start to end has a node
  *  satisfying nodePredicate. */
-export function somePathsSatisfyPredicate<N, E>(
-    opts: CheckPathsBetweenNodesOptions<N, E>,
-): boolean {
+export function somePathsSatisfyPredicate<N, E>(opts: CheckPathsBetweenNodesOptions<N, E>): boolean {
     const state: State<N, E> = {
         graph: opts.graph,
         start: opts.start,
@@ -126,10 +117,7 @@ function isExcluded<N, E>(s: State<N, E>, n: DiGraphNode<N, E>): boolean {
     return !s.inclusive && (n === s.start || n === s.end);
 }
 
-function checkAllPathsWithoutBackEdges<N, E>(
-    s: State<N, E>,
-    a: DiGraphNode<N, E>,
-): boolean {
+function checkAllPathsWithoutBackEdges<N, E>(s: State<N, E>, a: DiGraphNode<N, E>): boolean {
     if (s.nodePredicate(a.value) && !isExcluded(s, a)) return true;
     if (a === s.end) return false;
     for (const e of a.outEdges) {
@@ -142,10 +130,7 @@ function checkAllPathsWithoutBackEdges<N, E>(
     return true;
 }
 
-function checkSomePathsWithoutBackEdges<N, E>(
-    s: State<N, E>,
-    a: DiGraphNode<N, E>,
-): boolean {
+function checkSomePathsWithoutBackEdges<N, E>(s: State<N, E>, a: DiGraphNode<N, E>): boolean {
     if (s.nodePredicate(a.value) && !isExcluded(s, a)) return true;
     if (a === s.end) return false;
     for (const e of a.outEdges) {

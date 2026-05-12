@@ -17,9 +17,8 @@
 //     `x++` itself can be observed by an outer expression).
 
 import * as t from '@babel/types';
-
-import { isEnteringNewCfgNode } from './control-flow-graph';
 import type { ControlFlowGraph } from './control-flow-graph';
+import { isEnteringNewCfgNode } from './control-flow-graph';
 import type { LinearFlowState } from './data-flow-analysis';
 import type { LiveVariableLattice, LiveVariablesResult } from './live-variables-analysis';
 import { isLive } from './live-variables-analysis';
@@ -113,12 +112,7 @@ function pickTarget(n: t.Node): t.Node | null {
 // live within this sub-expression after we kill it here?" we walk siblings
 // up to exprRoot.
 
-function tryRemoveAssignment(
-    ctx: Ctx,
-    n: t.Node,
-    exprRoot: t.Node,
-    state: LinearFlowState<LiveVariableLattice>,
-): void {
+function tryRemoveAssignment(ctx: Ctx, n: t.Node, exprRoot: t.Node, state: LinearFlowState<LiveVariableLattice>): void {
     if (t.isAssignmentExpression(n)) {
         if (t.isIdentifier(n.left)) {
             // Recurse into RHS first (handles `dead_x = dead_y = 1` → drop
@@ -184,11 +178,7 @@ function handleAssignment(
     if (ctx.table.escaped.has(slot)) return;
 
     // Identity assign `a = a` — always remove.
-    if (
-        n.operator === '=' &&
-        t.isIdentifier(n.right) &&
-        n.right.name === lhs.name
-    ) {
+    if (n.operator === '=' && t.isIdentifier(n.right) && n.right.name === lhs.name) {
         replaceInParent(ctx, n, n.right);
         ctx.removed++;
         return;
@@ -196,10 +186,7 @@ function handleAssignment(
 
     if (isLive(state.out, slot)) return;
 
-    if (
-        isLive(state.in, slot) &&
-        isVariableStillLiveWithinExpression(ctx, n, exprRoot, slot)
-    ) {
+    if (isLive(state.in, slot) && isVariableStillLiveWithinExpression(ctx, n, exprRoot, slot)) {
         // Live-in but live-out is false: this is the killing assignment, but
         // there's still a use to its right within the same expression. We
         // can't remove it without finer-grained analysis.
@@ -221,12 +208,7 @@ function handleAssignment(
 // ---------------------------------------------------------------------------
 // handleUpdate — `x++` / `--x`.
 
-function handleUpdate(
-    ctx: Ctx,
-    n: t.UpdateExpression,
-    _exprRoot: t.Node,
-    state: LinearFlowState<LiveVariableLattice>,
-): void {
+function handleUpdate(ctx: Ctx, n: t.UpdateExpression, _exprRoot: t.Node, state: LinearFlowState<LiveVariableLattice>): void {
     const arg = n.argument as t.Identifier;
     const slot = ctx.table.resolve(arg);
     if (slot === undefined) return;
@@ -243,14 +225,9 @@ function handleUpdate(
         ctx.removed++;
         return;
     }
-    if (
-        t.isForStatement(parent) &&
-        getConditionExpression(parent) !== n &&
-        parent.update === n
-    ) {
+    if (t.isForStatement(parent) && getConditionExpression(parent) !== n && parent.update === n) {
         // for(;; x++) — replace update with empty (drops it).
         // We can't insert a real "empty" so just null the slot.
-        // biome-ignore lint/suspicious/noExplicitAny: ForStatement.update is nullable
         (parent as any).update = null;
         ctx.removed++;
         return;
@@ -277,10 +254,7 @@ function handleVarInit(
         // `for (var x = init; ...)` — no safe place to put the side-effects.
         return;
     }
-    if (
-        declParentInfo &&
-        (t.isForInStatement(declParentInfo.parent) || t.isForOfStatement(declParentInfo.parent))
-    ) {
+    if (declParentInfo && (t.isForInStatement(declParentInfo.parent) || t.isForOfStatement(declParentInfo.parent))) {
         return;
     }
 
@@ -290,20 +264,14 @@ function handleVarInit(
 
     // Identity init `var a = a;` is meaningless and rare; treat as standard
     // assignment.
-    if (
-        t.isIdentifier(d.init) &&
-        ctx.table.resolve(d.init) === slot
-    ) {
+    if (t.isIdentifier(d.init) && ctx.table.resolve(d.init) === slot) {
         d.init = null;
         ctx.removed++;
         return;
     }
 
     if (isLive(state.out, slot)) return;
-    if (
-        isLive(state.in, slot) &&
-        isVariableStillLiveWithinExpression(ctx, decl, exprRoot, slot)
-    ) {
+    if (isLive(state.in, slot) && isVariableStillLiveWithinExpression(ctx, decl, exprRoot, slot)) {
         return;
     }
 
@@ -321,18 +289,13 @@ function handleVarInit(
 // `n` up to `exprRoot`, asking "is there a READ of `variable` to the right
 // of n before any KILL?". Direct port of Closure's algorithm.
 
-const enum VLive {
+enum VLive {
     MAYBE_LIVE = 0,
     READ = 1,
     KILL = 2,
 }
 
-function isVariableStillLiveWithinExpression(
-    ctx: Ctx,
-    n: t.Node,
-    exprRoot: t.Node,
-    slot: number,
-): boolean {
+function isVariableStillLiveWithinExpression(ctx: Ctx, n: t.Node, exprRoot: t.Node, slot: number): boolean {
     let cur: t.Node = n;
     while (cur !== exprRoot) {
         const info = ctx.parents.get(cur);
@@ -409,12 +372,7 @@ function isVariableReadBeforeKill(n: t.Node, slot: number, ctx: Ctx): VLive {
     return VLive.MAYBE_LIVE;
 }
 
-function checkHookBranchReadBeforeKill(
-    a: t.Node,
-    b: t.Node,
-    slot: number,
-    ctx: Ctx,
-): VLive {
+function checkHookBranchReadBeforeKill(a: t.Node, b: t.Node, slot: number, ctx: Ctx): VLive {
     const v1 = isVariableReadBeforeKill(a, slot, ctx);
     const v2 = isVariableReadBeforeKill(b, slot, ctx);
     if (v1 === VLive.READ || v2 === VLive.READ) return VLive.READ;
@@ -504,13 +462,7 @@ function buildParentMap(root: t.Node): ParentMap {
     return map;
 }
 
-function populateParents(
-    n: t.Node,
-    parent: t.Node,
-    key: string,
-    index: number | undefined,
-    map: ParentMap,
-): void {
+function populateParents(n: t.Node, parent: t.Node, key: string, index: number | undefined, map: ParentMap): void {
     map.set(n, { parent, key, index });
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
         const child = getSlot(n, k);

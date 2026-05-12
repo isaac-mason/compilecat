@@ -2,10 +2,7 @@ import { parse } from '@babel/parser';
 import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
-import {
-    buildControlFlowGraph,
-    computeFallThrough,
-} from '../src/compiler/control-flow-analysis';
+import { buildControlFlowGraph, computeFallThrough } from '../src/compiler/control-flow-analysis';
 import { Branch, IMPLICIT_RETURN } from '../src/compiler/control-flow-graph';
 import type { CfgNode, ControlFlowGraph } from '../src/compiler/control-flow-graph';
 
@@ -23,7 +20,7 @@ function buildFor(code: string): ControlFlowGraph {
     return cfg;
 }
 
-function succsOf(cfg: ControlFlowGraph, node: CfgNode): Array<[t.Node | typeof IMPLICIT_RETURN, Branch]> {
+function succsOf(_cfg: ControlFlowGraph, node: CfgNode): Array<[t.Node | typeof IMPLICIT_RETURN, Branch]> {
     return node.outEdges.map((e) => [e.destination.value as t.Node | typeof IMPLICIT_RETURN, e.value]);
 }
 
@@ -46,9 +43,18 @@ describe('ControlFlowAnalysis', () => {
 
     it('linearises a straight-line block', () => {
         const cfg = buildFor('function f() { a; b; c; }');
-        const a = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a');
-        const b = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'b');
-        const c = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'c');
+        const a = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a',
+        );
+        const b = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'b',
+        );
+        const c = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'c',
+        );
         expect(succsOf(cfg, a).some(([n, br]) => n === b.value && br === Branch.UNCOND)).toBe(true);
         expect(succsOf(cfg, b).some(([n, br]) => n === c.value && br === Branch.UNCOND)).toBe(true);
         expect(succsOf(cfg, c).some(([n, br]) => n === IMPLICIT_RETURN && br === Branch.UNCOND)).toBe(true);
@@ -81,8 +87,14 @@ describe('ControlFlowAnalysis', () => {
     it('models while as ON_TRUE→body, ON_FALSE→follow, body→while', () => {
         const cfg = buildFor('function f() { while (cond) { a; } b; }');
         const whileNode = findCfgNode(cfg, t.isWhileStatement);
-        const aStmt = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a');
-        const bStmt = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'b');
+        const aStmt = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a',
+        );
+        const bStmt = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'b',
+        );
         const succs = succsOf(cfg, whileNode);
         const onTrue = succs.find(([_, br]) => br === Branch.ON_TRUE);
         const onFalse = succs.find(([_, br]) => br === Branch.ON_FALSE);
@@ -103,7 +115,10 @@ describe('ControlFlowAnalysis', () => {
     it('routes for(init;cond;update){body} through update', () => {
         const cfg = buildFor('function f() { for (var i = 0; i < n; i++) { a; } }');
         const forNode = findCfgNode(cfg, t.isForStatement);
-        const aStmt = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a');
+        const aStmt = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a',
+        );
         // body exit -> update -> for
         const bodyExitTarget = succsOf(cfg, aStmt)[0][0] as t.Node;
         expect(t.isUpdateExpression(bodyExitTarget)).toBe(true);
@@ -120,7 +135,10 @@ describe('ControlFlowAnalysis', () => {
     it('break exits the enclosing loop', () => {
         const cfg = buildFor('function f() { while (cond) { break; } a; }');
         const brk = findCfgNode(cfg, t.isBreakStatement);
-        const aStmt = findCfgNode(cfg, (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a');
+        const aStmt = findCfgNode(
+            cfg,
+            (n) => t.isExpressionStatement(n) && t.isIdentifier(n.expression) && n.expression.name === 'a',
+        );
         expect(succsOf(cfg, brk).some(([n]) => n === aStmt.value)).toBe(true);
     });
 
@@ -164,11 +182,13 @@ describe('ControlFlowAnalysis', () => {
     });
 
     it('bails on async / generator / await / yield', () => {
-        const asyncFn = parse('async function f() { return 1; }', { plugins: ['typescript'] }).program.body[0] as t.FunctionDeclaration;
+        const asyncFn = parse('async function f() { return 1; }', { plugins: ['typescript'] }).program
+            .body[0] as t.FunctionDeclaration;
         expect(buildControlFlowGraph({ root: asyncFn })).toBeNull();
         const gen = parse('function* g() { yield 1; }', { plugins: ['typescript'] }).program.body[0] as t.FunctionDeclaration;
         expect(buildControlFlowGraph({ root: gen })).toBeNull();
-        const withAwait = parse('async function f() { await foo(); }', { plugins: ['typescript'] }).program.body[0] as t.FunctionDeclaration;
+        const withAwait = parse('async function f() { await foo(); }', { plugins: ['typescript'] }).program
+            .body[0] as t.FunctionDeclaration;
         expect(buildControlFlowGraph({ root: withAwait })).toBeNull();
     });
 

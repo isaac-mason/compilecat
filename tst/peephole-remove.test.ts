@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { runPeepholeRemoveDeadCode } from '../src/compiler/peephole-remove-dead-code';
@@ -8,9 +8,7 @@ import { runPeepholeRemoveDeadCode } from '../src/compiler/peephole-remove-dead-
 function rm(code: string): { code: string; removed: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = runPeepholeRemoveDeadCode(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, removed: r.removed };
 }
 

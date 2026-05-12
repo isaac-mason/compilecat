@@ -24,18 +24,8 @@
 
 import * as t from '@babel/types';
 
-import {
-    commentIsFlattenDirective,
-    commentIsInlineDirective,
-    hasLeadingDirective,
-} from './directives';
-import {
-    type CallSite,
-    type Callee,
-    classifyCallee,
-    inlineBlock,
-    inlineDirect,
-} from './function-injector';
+import { commentIsFlattenDirective, commentIsInlineDirective, hasLeadingDirective } from './directives';
+import { type CallSite, type Callee, classifyCallee, inlineBlock, inlineDirect } from './function-injector';
 import { getSlot } from './node-util';
 
 export type InlineResult = {
@@ -112,11 +102,7 @@ function discoverCandidates(root: t.Node, out: Map<string, Candidate>): void {
                 callee: { fn: n, paramNames: params },
                 declAnnotated: annotated,
             };
-            if (
-                parent &&
-                (t.isBlockStatement(parent) || t.isProgram(parent)) &&
-                index !== undefined
-            ) {
+            if (parent && (t.isBlockStatement(parent) || t.isProgram(parent)) && index !== undefined) {
                 c.declRef = { parent: parent as t.BlockStatement | t.Program, index };
             }
             if (!out.has(n.id.name)) out.set(n.id.name, c);
@@ -124,10 +110,7 @@ function discoverCandidates(root: t.Node, out: Map<string, Candidate>): void {
         }
         if (t.isVariableDeclaration(n) && n.declarations.length === 1) {
             const d = n.declarations[0];
-            if (
-                t.isIdentifier(d.id) &&
-                (t.isArrowFunctionExpression(d.init) || t.isFunctionExpression(d.init))
-            ) {
+            if (t.isIdentifier(d.id) && (t.isArrowFunctionExpression(d.init) || t.isFunctionExpression(d.init))) {
                 const params = paramNames(d.init);
                 if (params === null) return;
                 const annotated = hasInlineAnnotation(n, parent) || hasInlineAnnotation(d.init);
@@ -136,11 +119,7 @@ function discoverCandidates(root: t.Node, out: Map<string, Candidate>): void {
                     callee: { fn: d.init, paramNames: params },
                     declAnnotated: annotated,
                 };
-                if (
-                    parent &&
-                    (t.isBlockStatement(parent) || t.isProgram(parent)) &&
-                    index !== undefined
-                ) {
+                if (parent && (t.isBlockStatement(parent) || t.isProgram(parent)) && index !== undefined) {
                     c.declRef = { parent: parent as t.BlockStatement | t.Program, index };
                 }
                 if (!out.has(d.id.name)) out.set(d.id.name, c);
@@ -246,10 +225,7 @@ function collectCallSites(root: t.Node, candidates: Map<string, Candidate>): Sit
     return sites;
 }
 
-function resolveCandidateForCall(
-    call: t.CallExpression,
-    candidates: Map<string, Candidate>,
-): Candidate | null {
+function resolveCandidateForCall(call: t.CallExpression, candidates: Map<string, Candidate>): Candidate | null {
     const callee = call.callee;
     if (t.isIdentifier(callee)) return candidates.get(callee.name) ?? null;
     return null;
@@ -280,33 +256,21 @@ function stripFullyInlinedDecls(candidates: Map<string, Candidate>, sites: Site[
         if (anyResidual) continue;
         c.declRef.parent.body.splice(c.declRef.index, 1);
         for (const other of candidates.values()) {
-            if (
-                other.declRef &&
-                other.declRef.parent === c.declRef.parent &&
-                other.declRef.index > c.declRef.index
-            ) {
+            if (other.declRef && other.declRef.parent === c.declRef.parent && other.declRef.index > c.declRef.index) {
                 other.declRef.index--;
             }
         }
     }
 }
 
-function anyResidualReference(
-    parent: t.BlockStatement | t.Program,
-    name: string,
-    skipIndex: number,
-): boolean {
+function anyResidualReference(parent: t.BlockStatement | t.Program, name: string, skipIndex: number): boolean {
     let found = false;
     for (let i = 0; i < parent.body.length; i++) {
         if (i === skipIndex) continue;
         const stmt = parent.body[i];
         visit(stmt, (n, parentNode, key) => {
             if (found) return;
-            if (
-                t.isIdentifier(n) &&
-                n.name === name &&
-                !isWriteContext(n, parentNode, key)
-            ) {
+            if (t.isIdentifier(n) && n.name === name && !isWriteContext(n, parentNode, key)) {
                 found = true;
             }
         });
@@ -334,10 +298,7 @@ function isWriteContext(n: t.Identifier, parent: t.Node | null, key: string): bo
 // ---------------------------------------------------------------------------
 // Tiny visitor utilities.
 
-function visit(
-    root: t.Node,
-    fn: (n: t.Node, parent: t.Node | null, key: string, index?: number) => void,
-): void {
+function visit(root: t.Node, fn: (n: t.Node, parent: t.Node | null, key: string, index?: number) => void): void {
     const walk = (n: t.Node, parent: t.Node | null, key: string, index?: number): void => {
         fn(n, parent, key, index);
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
@@ -356,9 +317,6 @@ function visit(
     walk(root, null, '');
 }
 
-function visitWithParents(
-    root: t.Node,
-    fn: (n: t.Node, parent: t.Node | null, key: string, index?: number) => void,
-): void {
+function visitWithParents(root: t.Node, fn: (n: t.Node, parent: t.Node | null, key: string, index?: number) => void): void {
     visit(root, fn);
 }

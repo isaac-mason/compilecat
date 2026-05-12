@@ -20,7 +20,7 @@
 // they collide. We keep `let`/`const` as-authored.
 
 import type { NodePath } from '@babel/traverse';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 
 import { traverse } from './babel-interop';
 import { buildControlFlowGraph } from './control-flow-analysis';
@@ -55,10 +55,7 @@ export type SimplifyOptions = {
  * Simplify a single function in place. Caller is responsible for picking
  * which functions to simplify (zone gating happens in the pipeline layer).
  */
-export function simplifyFunction(
-    fnPath: NodePath<t.Function>,
-    _options: SimplifyOptions = {},
-): SimplifyStats {
+export function simplifyFunction(fnPath: NodePath<t.Function>, _options: SimplifyOptions = {}): SimplifyStats {
     const stats: SimplifyStats = {
         iterations: 0,
         folded: 0,

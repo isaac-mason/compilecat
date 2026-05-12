@@ -36,13 +36,7 @@ import {
     willChange,
     withoutNot,
 } from './minimized-condition';
-import {
-    AND_PRECEDENCE,
-    areNodesEqual,
-    getSlot,
-    precedence,
-    setSlot,
-} from './node-util';
+import { AND_PRECEDENCE, areNodesEqual, getSlot, precedence, setSlot } from './node-util';
 import { TRI_FALSE, TRI_TRUE, TRI_UNKNOWN, triToBoolean } from './tri';
 
 export type MinimizeResult = {
@@ -63,13 +57,7 @@ type Ctx = { minimized: number };
 // dispatch so the multi-statement transforms run against fully-rewritten
 // children.
 
-function walk(
-    n: t.Node,
-    parent: t.Node | null,
-    key: string,
-    index: number | undefined,
-    ctx: Ctx,
-): void {
+function walk(n: t.Node, parent: t.Node | null, key: string, index: number | undefined, ctx: Ctx): void {
     for (const k of t.VISITOR_KEYS[n.type] ?? []) {
         const child = getSlot(n, k);
         if (child === null || child === undefined) continue;
@@ -200,11 +188,7 @@ function tryMinimizeHook(n: t.ConditionalExpression, ctx: Ctx): t.Node {
         // Swap consequent/alternate; strip the leading NOT.
         const stripped = withoutNot(m);
         const newCond = buildReplacement(stripped);
-        const flipped = t.conditionalExpression(
-            newCond as t.Expression,
-            n.alternate,
-            n.consequent,
-        );
+        const flipped = t.conditionalExpression(newCond as t.Expression, n.alternate, n.consequent);
         ctx.minimized++;
         return flipped;
     }
@@ -267,20 +251,11 @@ function tryMinimizeIf(n: t.IfStatement, ctx: Ctx): t.Node {
         }
 
         // Try to combine `if (x) { if (y) Z; }` into `if (x && y) Z;`.
-        if (
-            t.isBlockStatement(thenBranch) &&
-            thenBranch.body.length === 1 &&
-            t.isIfStatement(thenBranch.body[0])
-        ) {
+        if (t.isBlockStatement(thenBranch) && thenBranch.body.length === 1 && t.isIfStatement(thenBranch.body[0])) {
             const innerIf = thenBranch.body[0] as t.IfStatement;
             if (innerIf.alternate == null) {
                 const innerCond = innerIf.test;
-                if (
-                    !(
-                        isLowerPrecedenceThan(unnegated, AND_PRECEDENCE) &&
-                        precedence(innerCond) < AND_PRECEDENCE
-                    )
-                ) {
+                if (!(isLowerPrecedenceThan(unnegated, AND_PRECEDENCE) && precedence(innerCond) < AND_PRECEDENCE)) {
                     const newCond = applyMeasured(originalCond, unnegated) as t.Expression;
                     const combined = t.logicalExpression('&&', newCond, innerCond);
                     ctx.minimized++;
@@ -353,12 +328,7 @@ function tryReplaceIfBlock(block: t.BlockStatement | t.Program, ctx: Ctx): void 
         const next = body[i + 1] ?? null;
 
         // (1) if(c) return; if(c2) return ...  →  if(c||c2) return ...
-        if (
-            next !== null &&
-            elseBranch === null &&
-            isReturnBlock(thenBranch) &&
-            t.isIfStatement(next)
-        ) {
+        if (next !== null && elseBranch === null && isReturnBlock(thenBranch) && t.isIfStatement(next)) {
             const nextIf = next as t.IfStatement;
             const nextThen = nextIf.consequent;
             const nextElse = nextIf.alternate ?? null;
@@ -372,11 +342,7 @@ function tryReplaceIfBlock(block: t.BlockStatement | t.Program, ctx: Ctx): void 
                 continue;
             } else if (nextElse !== null && areNodesEqual(thenBranch, nextElse)) {
                 // if(x) return; if(y) foo() else return; → if(!x && y) foo() else return;
-                const newAnd = t.logicalExpression(
-                    '&&',
-                    t.unaryExpression('!', ifNode.test),
-                    nextIf.test,
-                );
+                const newAnd = t.logicalExpression('&&', t.unaryExpression('!', ifNode.test), nextIf.test);
                 const merged = t.ifStatement(newAnd, nextThen, nextElse);
                 body.splice(i, 2, merged);
                 ctx.minimized++;
@@ -474,10 +440,7 @@ function tryRemoveRepeatedStatements(n: t.IfStatement, ctx: Ctx): void {
     while (
         trueBody.length > 0 &&
         falseBody.length > 0 &&
-        areNodesEqual(
-            trueBody[trueBody.length - 1],
-            falseBody[falseBody.length - 1],
-        )
+        areNodesEqual(trueBody[trueBody.length - 1], falseBody[falseBody.length - 1])
     ) {
         const tail = trueBody.pop() as t.Statement;
         falseBody.pop();
@@ -571,17 +534,9 @@ function performConditionSubstitutions(n: t.Node): t.Node {
             // x ? y : false → x && y
             return t.logicalExpression('&&', cond, trueNode as t.Expression);
         }
-        if (
-            !mayHaveSideEffects(cond) &&
-            !mayHaveSideEffects(trueNode) &&
-            areNodesEqual(cond, trueNode)
-        ) {
+        if (!mayHaveSideEffects(cond) && !mayHaveSideEffects(trueNode) && areNodesEqual(cond, trueNode)) {
             // x ? x : y → x || y
-            return t.logicalExpression(
-                '||',
-                trueNode as t.Expression,
-                falseNode as t.Expression,
-            );
+            return t.logicalExpression('||', trueNode as t.Expression, falseNode as t.Expression);
         }
         return n;
     }
@@ -626,10 +581,7 @@ function isFoldableExpressBlock(n: t.Statement): boolean {
         const callee = ex.callee;
         if (t.isMemberExpression(callee)) {
             if (callee.computed) return false;
-            if (
-                t.isIdentifier(callee.property) &&
-                callee.property.name.startsWith('on')
-            ) {
+            if (t.isIdentifier(callee.property) && callee.property.name.startsWith('on')) {
                 return false;
             }
         }
@@ -669,11 +621,5 @@ function consumesDanglingElse(n: t.Statement): boolean {
 }
 
 function isLiteralValue(n: t.Node): boolean {
-    return (
-        t.isBooleanLiteral(n) ||
-        t.isNumericLiteral(n) ||
-        t.isStringLiteral(n) ||
-        t.isNullLiteral(n)
-    );
+    return t.isBooleanLiteral(n) || t.isNumericLiteral(n) || t.isStringLiteral(n) || t.isNullLiteral(n);
 }
-

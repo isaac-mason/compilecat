@@ -1,11 +1,10 @@
 import _generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { inlineVariables } from '../src/compiler/inline-variables';
 
-// biome-ignore lint/suspicious/noExplicitAny: babel CJS interop
 const generate: typeof _generate = (_generate as any).default ?? _generate;
 
 function run(code: string): { out: string; stats: ReturnType<typeof inlineVariables> } {
@@ -44,18 +43,14 @@ describe('inlineVariables', () => {
         // layers.broadphaseLayers += 1; return index;` was rewritten to
         // `layers.broadphaseLayers += 1; return layers.broadphaseLayers;` —
         // observing the post-increment value.
-        const { out, stats } = run(
-            `function f(o) { const i = o.n; o.n += 1; return i; }`,
-        );
+        const { out, stats } = run(`function f(o) { const i = o.n; o.n += 1; return i; }`);
         expect(out).toContain('const i = o.n');
         expect(out).toContain('return i');
         expect(stats.inlined).toBe(0);
     });
 
     it('does not single-use-inline a nested property read', () => {
-        const { out } = run(
-            `function f(o) { const v = o.a.b; o.a.b = 99; return v; }`,
-        );
+        const { out } = run(`function f(o) { const v = o.a.b; o.a.b = 99; return v; }`);
         expect(out).toContain('const v = o.a.b');
         expect(out).toContain('return v');
     });
@@ -323,5 +318,4 @@ describe('inlineVariables', () => {
         expect(out).toMatch(/use\(42\).*use\(42\).*use\(42\)/s);
         expect(stats.inlined).toBeGreaterThanOrEqual(1);
     });
-
 });

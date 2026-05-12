@@ -61,12 +61,7 @@ export function removeUnusedCode(ast: t.File): RemoveUnusedResult {
 }
 
 function sumOf(r: RemoveUnusedResult): number {
-    return (
-        r.removedDeclarators +
-        r.removedFunctionDecls +
-        r.removedImportSpecifiers +
-        r.removedImportDeclarations
-    );
+    return r.removedDeclarators + r.removedFunctionDecls + r.removedImportSpecifiers + r.removedImportDeclarations;
 }
 
 function sweep(ast: t.File): RemoveUnusedResult {
@@ -181,7 +176,7 @@ function sweep(ast: t.File): RemoveUnusedResult {
 function classBodyMayHaveSideEffects(body: t.ClassBody): boolean {
     for (const member of body.body) {
         // Computed keys evaluate at class-definition time.
-        // biome-ignore lint/suspicious/noExplicitAny: union narrowing
+        // union narrowing
         if ((member as any).computed && (member as any).key && mayHaveSideEffects((member as any).key)) {
             return true;
         }

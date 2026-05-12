@@ -74,11 +74,7 @@ function computeMinimizedCondition(n: t.Node): MinimizedCondition {
     if (t.isLogicalExpression(n) && (n.operator === '&&' || n.operator === '||')) {
         // Closure builds a synthetic `complementNode` of the opposite operator,
         // shared by the negative-side cost compare. We mirror that.
-        const complement = t.logicalExpression(
-            n.operator === '&&' ? '||' : '&&',
-            n.left,
-            n.right,
-        );
+        const complement = t.logicalExpression(n.operator === '&&' ? '||' : '&&', n.left, n.right);
         const left = computeMinimizedCondition(n.left);
         const right = computeMinimizedCondition(n.right);
 
@@ -164,10 +160,14 @@ function negate(m: MeasuredNode): MeasuredNode {
     if (m.node === null) return m;
     if (t.isBinaryExpression(m.node)) {
         switch (m.node.operator) {
-            case '==': return updateOperator(m, '!=');
-            case '!=': return updateOperator(m, '==');
-            case '===': return updateOperator(m, '!==');
-            case '!==': return updateOperator(m, '===');
+            case '==':
+                return updateOperator(m, '!=');
+            case '!=':
+                return updateOperator(m, '==');
+            case '===':
+                return updateOperator(m, '!==');
+            case '!==':
+                return updateOperator(m, '===');
         }
     }
     if (t.isUnaryExpression(m.node) && m.node.operator === '!') return withoutNot(m);
@@ -208,11 +208,7 @@ function normalizeChildren(node: t.Node): MeasuredNode[] {
 // Public surface used by PeepholeMinimizeConditions.
 
 export function getMinimized(mc: MinimizedCondition, style: MinimizationStyle): MeasuredNode {
-    if (
-        style === 'PREFER_UNNEGATED' ||
-        isMeasuredNot(mc.positive) ||
-        mc.positive.length <= mc.negative.length
-    ) {
+    if (style === 'PREFER_UNNEGATED' || isMeasuredNot(mc.positive) || mc.positive.length <= mc.negative.length) {
         return mc.positive;
     }
     return addNot(mc.negative);
@@ -246,26 +242,14 @@ function assembleNode(parent: t.Node, kids: t.Node[]): t.Node {
         return t.unaryExpression(parent.operator, kids[0] as t.Expression, parent.prefix);
     }
     if (t.isLogicalExpression(parent)) {
-        return t.logicalExpression(
-            parent.operator,
-            kids[0] as t.Expression,
-            kids[1] as t.Expression,
-        );
+        return t.logicalExpression(parent.operator, kids[0] as t.Expression, kids[1] as t.Expression);
     }
     if (t.isBinaryExpression(parent)) {
         if (t.isPrivateName(parent.left)) return parent;
-        return t.binaryExpression(
-            parent.operator,
-            kids[0] as t.Expression,
-            kids[1] as t.Expression,
-        );
+        return t.binaryExpression(parent.operator, kids[0] as t.Expression, kids[1] as t.Expression);
     }
     if (t.isConditionalExpression(parent)) {
-        return t.conditionalExpression(
-            kids[0] as t.Expression,
-            kids[1] as t.Expression,
-            kids[2] as t.Expression,
-        );
+        return t.conditionalExpression(kids[0] as t.Expression, kids[1] as t.Expression, kids[2] as t.Expression);
     }
     if (t.isSequenceExpression(parent)) {
         return t.sequenceExpression(kids as t.Expression[]);

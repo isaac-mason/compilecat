@@ -46,10 +46,7 @@ import { getSlot, setSlot } from './node-util';
  * destructuring writes. Property writes (`out[0] = ...`, `out.x = ...`) are
  * NOT reassignments — they mutate the referent, not the binding.
  */
-export function gatherModifiedParameters(
-    body: t.BlockStatement,
-    paramNames: ReadonlySet<string>,
-): Set<string> {
+export function gatherModifiedParameters(body: t.BlockStatement, paramNames: ReadonlySet<string>): Set<string> {
     const out = new Set<string>();
     if (paramNames.size === 0) return out;
 
@@ -58,11 +55,7 @@ export function gatherModifiedParameters(
             out.add(n.left.name);
             return;
         }
-        if (
-            t.isUpdateExpression(n) &&
-            t.isIdentifier(n.argument) &&
-            paramNames.has(n.argument.name)
-        ) {
+        if (t.isUpdateExpression(n) && t.isIdentifier(n.argument) && paramNames.has(n.argument.name)) {
             out.add(n.argument.name);
             return;
         }
@@ -167,10 +160,7 @@ function isCheapToDuplicate(arg: t.Expression): boolean {
     return false;
 }
 
-function countParamReferences(
-    body: t.BlockStatement,
-    paramNames: readonly string[],
-): Map<string, number> {
+function countParamReferences(body: t.BlockStatement, paramNames: readonly string[]): Map<string, number> {
     const set = new Set(paramNames);
     const counts = new Map<string, number>();
     for (const n of paramNames) counts.set(n, 0);
@@ -201,10 +191,7 @@ function countParamReferences(
  * FunctionArgumentInjector.inject — declaration-id contexts and nested-scope
  * shadowing are respected.
  */
-export function injectArguments(
-    body: t.BlockStatement,
-    replacements: Map<string, t.Expression>,
-): void {
+export function injectArguments(body: t.BlockStatement, replacements: Map<string, t.Expression>): void {
     if (replacements.size === 0) return;
 
     const visit = (n: t.Node, active: Map<string, t.Expression>): void => {
@@ -241,11 +228,7 @@ export function injectArguments(
                 for (let i = 0; i < child.length; i++) {
                     const c = child[i];
                     if (!c) continue;
-                    if (
-                        t.isIdentifier(c) &&
-                        active.has(c.name) &&
-                        isReferenceContext(n, k)
-                    ) {
+                    if (t.isIdentifier(c) && active.has(c.name) && isReferenceContext(n, k)) {
                         const sub = t.cloneNode(active.get(c.name)!, true);
                         setSlot(n, k, i, sub);
                     } else {
@@ -253,11 +236,7 @@ export function injectArguments(
                     }
                 }
             } else {
-                if (
-                    t.isIdentifier(child) &&
-                    active.has(child.name) &&
-                    isReferenceContext(n, k)
-                ) {
+                if (t.isIdentifier(child) && active.has(child.name) && isReferenceContext(n, k)) {
                     const sub = t.cloneNode(active.get(child.name)!, true);
                     setSlot(n, k, undefined, sub);
                 } else {
@@ -276,10 +255,7 @@ function collectParamNames(p: t.Node, drop: (name: string) => void): void {
     else if (t.isRestElement(p)) collectParamNames(p.argument, drop);
 }
 
-function filterByBlockDecls<V>(
-    active: Map<string, V>,
-    block: t.BlockStatement,
-): Map<string, V> {
+function filterByBlockDecls<V>(active: Map<string, V>, block: t.BlockStatement): Map<string, V> {
     let filtered: Map<string, V> | null = null;
     for (const s of block.body) {
         if (t.isVariableDeclaration(s)) {

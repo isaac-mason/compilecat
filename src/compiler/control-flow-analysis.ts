@@ -24,18 +24,8 @@
 
 import * as t from '@babel/types';
 
-import {
-    Branch,
-    type CfgNode,
-    type CfgNodeValue,
-    type ControlFlowGraph,
-    createControlFlowGraph,
-} from './control-flow-graph';
-import {
-    connect,
-    createNode,
-    isConnectedInDirection,
-} from './graph/linked-directed-graph';
+import { Branch, type CfgNode, type CfgNodeValue, type ControlFlowGraph, createControlFlowGraph } from './control-flow-graph';
+import { connect, createNode, isConnectedInDirection } from './graph/linked-directed-graph';
 import { getSlot, isLoop } from './node-util';
 
 type Cfa = {
@@ -94,12 +84,7 @@ export function buildControlFlowGraph(opts: BuildCfgOptions): ControlFlowGraph |
 function containsBailout(node: t.Node): boolean {
     let bail = false;
     walkBail(node, null, (n) => {
-        if (
-            t.isTryStatement(n) ||
-            t.isWithStatement(n) ||
-            t.isYieldExpression(n) ||
-            t.isAwaitExpression(n)
-        ) {
+        if (t.isTryStatement(n) || t.isWithStatement(n) || t.isYieldExpression(n) || t.isAwaitExpression(n)) {
             bail = true;
             return false;
         }
@@ -123,11 +108,7 @@ function containsBailout(node: t.Node): boolean {
     return bail;
 }
 
-function walkBail(
-    node: t.Node,
-    parent: t.Node | null,
-    visit: (n: t.Node, parent: t.Node | null) => boolean,
-): void {
+function walkBail(node: t.Node, parent: t.Node | null, visit: (n: t.Node, parent: t.Node | null) => boolean): void {
     if (!visit(node, parent)) return;
     for (const key of t.VISITOR_KEYS[node.type] ?? []) {
         const child = getSlot(node, key);
@@ -192,11 +173,7 @@ function shouldTraverseIntoChildren(cfa: Cfa, n: t.Node, parent: t.Node | null):
     if (parent === null) return true;
 
     // Mirrors Closure's shouldTraverseIntoChildren switch on parent.token.
-    if (
-        t.isForStatement(parent) ||
-        t.isForInStatement(parent) ||
-        t.isForOfStatement(parent)
-    ) {
+    if (t.isForStatement(parent) || t.isForInStatement(parent) || t.isForOfStatement(parent)) {
         // Only descend into the body.
         return n === parent.body;
     }
@@ -204,12 +181,7 @@ function shouldTraverseIntoChildren(cfa: Cfa, n: t.Node, parent: t.Node | null):
         // Don't descend into the test; only the body.
         return n === parent.body;
     }
-    if (
-        t.isIfStatement(parent) ||
-        t.isWhileStatement(parent) ||
-        t.isWithStatement(parent) ||
-        t.isSwitchStatement(parent)
-    ) {
+    if (t.isIfStatement(parent) || t.isWhileStatement(parent) || t.isWithStatement(parent) || t.isSwitchStatement(parent)) {
         // Skip the condition; descend into anything that's NOT the test.
         if (t.isIfStatement(parent)) return n !== parent.test;
         if (t.isWhileStatement(parent)) return n !== parent.test;
@@ -392,9 +364,7 @@ function handleSwitch(cfa: Cfa, node: t.SwitchStatement): void {
         const dflt = node.cases.find((c) => c.test === null);
         if (dflt) {
             const target =
-                dflt.consequent.length > 0
-                    ? computeFallThrough(dflt.consequent[0])
-                    : computeFollowNode(cfa, node, node);
+                dflt.consequent.length > 0 ? computeFallThrough(dflt.consequent[0]) : computeFollowNode(cfa, node, node);
             createEdge(cfa, node, Branch.UNCOND, target);
         } else {
             createEdge(cfa, node, Branch.UNCOND, computeFollowNode(cfa, node, node));
@@ -508,11 +478,7 @@ function handleStmt(cfa: Cfa, node: t.Statement): void {
 // ---------------------------------------------------------------------------
 // computeFollowNode / computeFallThrough — direct ports.
 
-function computeFollowNode(
-    cfa: Cfa,
-    fromNode: t.Node,
-    node: t.Node,
-): t.Node | null {
+function computeFollowNode(cfa: Cfa, fromNode: t.Node, node: t.Node): t.Node | null {
     const parent = parentOf(cfa, node);
     if (parent === null || t.isFunction(parent) || node === cfa.root) return null;
 
@@ -541,12 +507,7 @@ function computeFollowNode(
         // After body, go to update; if no update, back to the for itself.
         return parent.update ?? parent;
     }
-    if (
-        t.isWhileStatement(parent) ||
-        t.isDoWhileStatement(parent) ||
-        t.isForInStatement(parent) ||
-        t.isForOfStatement(parent)
-    ) {
+    if (t.isWhileStatement(parent) || t.isDoWhileStatement(parent) || t.isForInStatement(parent) || t.isForOfStatement(parent)) {
         return parent;
     }
     if (t.isLabeledStatement(parent)) {
@@ -594,10 +555,7 @@ export function computeFallThrough(n: t.Node): t.Node {
 
 function createEdge(cfa: Cfa, fromNode: t.Node, branch: Branch, toNode: t.Node | null): void {
     const from = createNode(cfa.cfg, fromNode);
-    const to =
-        toNode === null
-            ? cfa.cfg.implicitReturn
-            : createNode(cfa.cfg, toNode);
+    const to = toNode === null ? cfa.cfg.implicitReturn : createNode(cfa.cfg, toNode);
     if (!isConnectedInDirection(from, to, (b) => b === branch)) {
         connect(cfa.cfg, from.value, branch, to.value);
     }
@@ -677,11 +635,7 @@ function prioritize(cfa: Cfa): void {
     cfa.cfg.implicitReturn.priority = ++counter;
 }
 
-function prioritizeFromEntry(
-    cfa: Cfa,
-    entry: CfgNode,
-    setPriority: (n: CfgNode) => void,
-): void {
+function prioritizeFromEntry(cfa: Cfa, entry: CfgNode, setPriority: (n: CfgNode) => void): void {
     // Closure uses a min-priority-queue keyed by AST position. We approximate
     // by collecting reachable nodes, sorting by ast position, and stamping.
     const reached: CfgNode[] = [];

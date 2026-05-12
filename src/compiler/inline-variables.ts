@@ -230,9 +230,7 @@ function tryAliasInline(
 //   - Import binding: yes, read-only at module load.
 //   - const/let/var: yes only if init is present at the decl AND no
 //     constantViolations.
-function isWellDefinedAssignedOnce(
-    binding: NonNullable<ReturnType<NodePath['scope']['getBinding']>>,
-): boolean {
+function isWellDefinedAssignedOnce(binding: NonNullable<ReturnType<NodePath['scope']['getBinding']>>): boolean {
     if (binding.constantViolations.length > 0) return false;
 
     const kind = binding.kind;
@@ -266,9 +264,17 @@ function isPlainRead(refPath: NodePath): boolean {
     // update expression target (++/--)
     if (t.isUpdateExpression(parent)) return false;
     // function/class declaration name
-    if ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent) || t.isClassDeclaration(parent) || t.isClassExpression(parent)) && parent.id === refPath.node) return false;
+    if (
+        (t.isFunctionDeclaration(parent) ||
+            t.isFunctionExpression(parent) ||
+            t.isClassDeclaration(parent) ||
+            t.isClassExpression(parent)) &&
+        parent.id === refPath.node
+    )
+        return false;
     // parameter binding
-    if (t.isFunction(parent) && Array.isArray(parent.params) && parent.params.includes(refPath.node as t.Identifier)) return false;
+    if (t.isFunction(parent) && Array.isArray(parent.params) && parent.params.includes(refPath.node as t.Identifier))
+        return false;
     // export specifier — `local` must remain an Identifier; substituting a
     // literal there would violate the AST spec. Common in bundle-mode where
     // a chunk may carry `export { K }` after `const K = 42`.
@@ -310,8 +316,11 @@ function crossesAsyncBoundary(defPath: NodePath, usePath: NodePath): boolean {
     let p: NodePath | null = usePath;
     while (p && p.node !== defFn.node) {
         if (
-            (t.isFunction(p.node) || t.isFunctionDeclaration(p.node) || t.isFunctionExpression(p.node) || t.isArrowFunctionExpression(p.node)) &&
-            // biome-ignore lint/suspicious/noExplicitAny: union narrowing
+            (t.isFunction(p.node) ||
+                t.isFunctionDeclaration(p.node) ||
+                t.isFunctionExpression(p.node) ||
+                t.isArrowFunctionExpression(p.node)) &&
+            // union narrowing
             ((p.node as any).async === true || (p.node as any).generator === true)
         ) {
             return true;
@@ -327,7 +336,7 @@ function crossesAsyncBoundary(defPath: NodePath, usePath: NodePath): boolean {
 function containsPropertyRead(node: t.Node): boolean {
     if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) return true;
     let found = false;
-    // biome-ignore lint/suspicious/noExplicitAny: structural walk
+    // structural walk
     const walk = (n: any) => {
         if (found || n === null || typeof n !== 'object') return;
         if (Array.isArray(n)) {
@@ -340,7 +349,15 @@ function containsPropertyRead(node: t.Node): boolean {
             return;
         }
         for (const k of Object.keys(n)) {
-            if (k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments') continue;
+            if (
+                k === 'loc' ||
+                k === 'start' ||
+                k === 'end' ||
+                k === 'leadingComments' ||
+                k === 'trailingComments' ||
+                k === 'innerComments'
+            )
+                continue;
             walk(n[k]);
         }
     };
@@ -352,13 +369,7 @@ function containsPropertyRead(node: t.Node): boolean {
 // side effect, value identity is the value itself). Safe to inline into a
 // loop body.
 function isPrimitiveLiteral(n: t.Expression): boolean {
-    if (
-        t.isNumericLiteral(n) ||
-        t.isStringLiteral(n) ||
-        t.isBooleanLiteral(n) ||
-        t.isNullLiteral(n) ||
-        t.isBigIntLiteral(n)
-    ) {
+    if (t.isNumericLiteral(n) || t.isStringLiteral(n) || t.isBooleanLiteral(n) || t.isNullLiteral(n) || t.isBigIntLiteral(n)) {
         return true;
     }
     if (t.isIdentifier(n) && n.name === 'undefined') return true;

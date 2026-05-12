@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { unrollLoops } from '../src/compiler/loop-unroller';
@@ -8,9 +8,7 @@ import { unrollLoops } from '../src/compiler/loop-unroller';
 function un(code: string): { code: string; unrolled: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = unrollLoops(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, unrolled: r.unrolled };
 }
 

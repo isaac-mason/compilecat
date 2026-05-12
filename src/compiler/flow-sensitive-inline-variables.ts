@@ -29,17 +29,9 @@ import { isEnteringNewCfgNode } from './control-flow-graph';
 import type { CfgNode, ControlFlowGraph } from './control-flow-graph';
 import { mayHaveSideEffects } from './ast-analyzer';
 import { getSlot, setSlot } from './node-util';
-import {
-    allPathsSatisfyPredicate,
-    somePathsSatisfyPredicate,
-} from './graph/check-paths-between-nodes';
+import { allPathsSatisfyPredicate, somePathsSatisfyPredicate } from './graph/check-paths-between-nodes';
 import { runMaybeReachingUse } from './maybe-reaching-variable-use';
-import {
-    type Definition,
-    dependsOnOuterScopeVars,
-    type MustDef,
-    runMustReachingDef,
-} from './must-be-reaching-variable-def';
+import { type Definition, dependsOnOuterScopeVars, type MustDef, runMustReachingDef } from './must-be-reaching-variable-def';
 import type { LocalVariableTable } from './local-variable-table';
 
 // Suppress unused-import warning while keeping the doc-comment reference.
@@ -200,12 +192,7 @@ function canInline(
  * if they were visible at the def site, they're visible at any sibling/use
  * inside the same function.
  */
-function rhsIdentifiersInScopeAt(
-    rhs: t.Expression,
-    useSite: t.Node,
-    table: LocalVariableTable,
-    parents: ParentMap,
-): boolean {
+function rhsIdentifiersInScopeAt(rhs: t.Expression, useSite: t.Node, table: LocalVariableTable, parents: ParentMap): boolean {
     const useAncestors = collectAncestorNodes(useSite, parents);
     let ok = true;
     t.traverseFast(rhs, (n) => {
@@ -263,34 +250,19 @@ type DefLoc =
     | { kind: 'var'; expr: t.VariableDeclarator; rhs: t.Expression; decl: t.VariableDeclaration }
     | { kind: 'assign'; expr: t.AssignmentExpression; rhs: t.Expression; topLevel: boolean };
 
-function locateDefExpr(
-    def: Definition,
-    slot: number,
-    table: LocalVariableTable,
-    parents: ParentMap,
-): DefLoc | null {
+function locateDefExpr(def: Definition, slot: number, table: LocalVariableTable, parents: ParentMap): DefLoc | null {
     let result: DefLoc | null = null;
     const visit = (n: t.Node, parent: t.Node | null) => {
         if (result !== null) return;
         if (parent !== null && isEnteringNewCfgNode(n, parent)) return;
-        if (
-            t.isVariableDeclarator(n) &&
-            t.isIdentifier(n.id) &&
-            table.resolve(n.id) === slot &&
-            n.init
-        ) {
+        if (t.isVariableDeclarator(n) && t.isIdentifier(n.id) && table.resolve(n.id) === slot && n.init) {
             const declInfo = parents.get(n);
             if (declInfo && t.isVariableDeclaration(declInfo.parent)) {
                 result = { kind: 'var', expr: n, rhs: n.init, decl: declInfo.parent };
                 return;
             }
         }
-        if (
-            t.isAssignmentExpression(n) &&
-            n.operator === '=' &&
-            t.isIdentifier(n.left) &&
-            table.resolve(n.left) === slot
-        ) {
+        if (t.isAssignmentExpression(n) && n.operator === '=' && t.isIdentifier(n.left) && table.resolve(n.left) === slot) {
             // top-level iff parent is an ExpressionStatement (ignoring labels).
             let p: t.Node | null = parents.get(n)?.parent ?? null;
             while (p !== null && t.isLabeledStatement(p)) {
@@ -402,11 +374,7 @@ function subtreeHasInterferingEffect(
     let yes = false;
     const visit = (m: t.Node) => {
         if (yes) return;
-        if (
-            t.isCallExpression(m) ||
-            t.isOptionalCallExpression(m) ||
-            t.isNewExpression(m)
-        ) {
+        if (t.isCallExpression(m) || t.isOptionalCallExpression(m) || t.isNewExpression(m)) {
             yes = true;
             return;
         }
@@ -458,11 +426,7 @@ function nodeHasInterferingEffect(
 // ---------------------------------------------------------------------------
 // Identifier-read traversal (used to find candidate uses).
 
-function forEachIdentifierRead(
-    root: t.Node,
-    parents: ParentMap,
-    visit: (id: t.Identifier) => void,
-): void {
+function forEachIdentifierRead(root: t.Node, parents: ParentMap, visit: (id: t.Identifier) => void): void {
     const walk = (n: t.Node, parent: t.Node | null) => {
         if (parent !== null && isEnteringNewCfgNode(n, parent)) return;
         if (t.isIdentifier(n) && parent !== null && !isWriteContext(n, parent)) {
@@ -499,21 +463,12 @@ function isWriteContext(id: t.Identifier, parent: t.Node): boolean {
     if (t.isBreakStatement(parent) && parent.label === id) return true;
     if (t.isContinueStatement(parent) && parent.label === id) return true;
     if (t.isMemberExpression(parent) && parent.property === id && !parent.computed) return true;
-    if (
-        t.isOptionalMemberExpression(parent) &&
-        parent.property === id &&
-        !parent.computed
-    ) return true;
+    if (t.isOptionalMemberExpression(parent) && parent.property === id && !parent.computed) return true;
     if (t.isObjectProperty(parent) && parent.key === id && !parent.computed) return true;
     return false;
 }
 
-function countSlotUsesInCfgNode(
-    cfgValue: t.Node,
-    slot: number,
-    table: LocalVariableTable,
-    parents: ParentMap,
-): number {
+function countSlotUsesInCfgNode(cfgValue: t.Node, slot: number, table: LocalVariableTable, parents: ParentMap): number {
     let count = 0;
     forEachIdentifierRead(cfgValue, parents, (id) => {
         if (table.resolve(id) === slot) count++;
@@ -545,11 +500,7 @@ function isWithinLoop(node: t.Node, fn: t.Function, parents: ParentMap): boolean
 // areAdjacentSiblings — Closure's "skip path-check when def and use are
 // immediate neighbors in the same statement list."
 
-function areAdjacentSiblings(
-    defNode: t.Node,
-    useNode: t.Node,
-    parents: ParentMap,
-): boolean {
+function areAdjacentSiblings(defNode: t.Node, useNode: t.Node, parents: ParentMap): boolean {
     const di = parents.get(defNode);
     const ui = parents.get(useNode);
     if (di === undefined || ui === undefined) return false;

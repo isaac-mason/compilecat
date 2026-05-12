@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { runPeepholeMinimizeConditions } from '../src/compiler/peephole-minimize-conditions';
@@ -8,9 +8,7 @@ import { runPeepholeMinimizeConditions } from '../src/compiler/peephole-minimize
 function mn(code: string): { code: string; minimized: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = runPeepholeMinimizeConditions(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, minimized: r.minimized };
 }
 

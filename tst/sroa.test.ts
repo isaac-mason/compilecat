@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { applySroa } from '../src/compiler/scalar-replace-aggregates';
@@ -8,9 +8,7 @@ import { applySroa } from '../src/compiler/scalar-replace-aggregates';
 function sroa(code: string): { code: string; sroad: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = applySroa(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, sroad: r.sroad };
 }
 

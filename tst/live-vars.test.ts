@@ -8,11 +8,7 @@ import { buildControlFlowGraph } from '../src/compiler/control-flow-analysis';
 import type { ControlFlowGraph } from '../src/compiler/control-flow-graph';
 import { IMPLICIT_RETURN } from '../src/compiler/control-flow-graph';
 import type { LinearFlowState } from '../src/compiler/data-flow-analysis';
-import {
-    isLive,
-    type LiveVariableLattice,
-    runLiveVariablesAnalysis,
-} from '../src/compiler/live-variables-analysis';
+import { isLive, type LiveVariableLattice, runLiveVariablesAnalysis } from '../src/compiler/live-variables-analysis';
 import { buildLocalVariableTable } from '../src/compiler/local-variable-table';
 
 function parseFn(code: string): { fn: t.Function; path: NodePath<t.Function> } {
@@ -42,7 +38,12 @@ function setup(code: string): {
     return { fn, cfg, table };
 }
 
-function liveAt(cfg: ControlFlowGraph, table: ReturnType<typeof buildLocalVariableTable>, pred: (n: t.Node) => boolean, side: 'in' | 'out'): Set<string> {
+function liveAt(
+    cfg: ControlFlowGraph,
+    table: ReturnType<typeof buildLocalVariableTable>,
+    pred: (n: t.Node) => boolean,
+    side: 'in' | 'out',
+): Set<string> {
     for (const node of cfg.nodes.values()) {
         if (node.value === IMPLICIT_RETURN) continue;
         if (pred(node.value as t.Node)) {
@@ -65,37 +66,28 @@ describe('LiveVariablesAnalysis', () => {
         const r = runLiveVariablesAnalysis(cfg, table);
         expect(r.ran).toBe(true);
         // After the var decl, x is not live.
-        const out = liveAt(
-            cfg,
-            table,
-            (n) => t.isVariableDeclaration(n),
-            'out',
-        );
+        const out = liveAt(cfg, table, (n) => t.isVariableDeclaration(n), 'out');
         expect(out.has('x')).toBe(false);
     });
 
     it('keeps a variable alive across a use', () => {
         const { cfg, table } = setup('function f() { var x = 1; use(x); }');
         runLiveVariablesAnalysis(cfg, table);
-        const out = liveAt(
-            cfg,
-            table,
-            (n) => t.isVariableDeclaration(n),
-            'out',
-        );
+        const out = liveAt(cfg, table, (n) => t.isVariableDeclaration(n), 'out');
         expect(out.has('x')).toBe(true);
     });
 
     it('joins live sets across branches', () => {
-        const { cfg, table } = setup(
-            'function f() { var x = 1; var y = 2; if (cond) { use(x); } else { use(y); } }',
-        );
+        const { cfg, table } = setup('function f() { var x = 1; var y = 2; if (cond) { use(x); } else { use(y); } }');
         runLiveVariablesAnalysis(cfg, table);
         // After `var y = 2;` both x and y must be live (each used in one branch).
         const out = liveAt(
             cfg,
             table,
-            (n) => t.isVariableDeclaration(n) && n.declarations[0]?.id.type === 'Identifier' && (n.declarations[0].id as t.Identifier).name === 'y',
+            (n) =>
+                t.isVariableDeclaration(n) &&
+                n.declarations[0]?.id.type === 'Identifier' &&
+                (n.declarations[0].id as t.Identifier).name === 'y',
             'out',
         );
         expect(out.has('x')).toBe(true);
@@ -103,9 +95,7 @@ describe('LiveVariablesAnalysis', () => {
     });
 
     it('treats escaped (closure-captured) locals as live-out at function end', () => {
-        const { cfg, table } = setup(
-            'function f() { var x = 1; return function() { return x; }; }',
-        );
+        const { cfg, table } = setup('function f() { var x = 1; return function() { return x; }; }');
         const r = runLiveVariablesAnalysis(cfg, table);
         expect(r.ran).toBe(true);
         const xSlots = table.slotsByName('x');
@@ -125,9 +115,7 @@ describe('LiveVariablesAnalysis', () => {
         // the inner-block `let x` as killing the outer `x`, then conclude the
         // outer `x` is dead before `use(x)`. Slot-keyed liveness keeps them
         // distinct.
-        const { cfg, table } = setup(
-            'function f() { var x = 1; { let x = 2; sink(x); } use(x); }',
-        );
+        const { cfg, table } = setup('function f() { var x = 1; { let x = 2; sink(x); } use(x); }');
         const r = runLiveVariablesAnalysis(cfg, table);
         expect(r.ran).toBe(true);
         // Find the OUTER `var x = 1;` declaration and check its OUT-set.
@@ -152,9 +140,7 @@ describe('LiveVariablesAnalysis', () => {
         // After `x += 2;`, x is dead. Before that statement, x is live (the
         // += reads it).
         const stmt = (n: t.Node) =>
-            t.isExpressionStatement(n) &&
-            t.isAssignmentExpression(n.expression) &&
-            n.expression.operator === '+=';
+            t.isExpressionStatement(n) && t.isAssignmentExpression(n.expression) && n.expression.operator === '+=';
         const inSet = liveAt(cfg, table, stmt, 'in');
         const outSet = liveAt(cfg, table, stmt, 'out');
         expect(inSet.has('x')).toBe(true);

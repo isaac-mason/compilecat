@@ -66,12 +66,7 @@ function walk(n: t.Node, ctx: Ctx): void {
         tryMinimizeExits(n.body, 'break', n.label.name, ctx);
         return;
     }
-    if (
-        t.isWhileStatement(n) ||
-        t.isForStatement(n) ||
-        t.isForInStatement(n) ||
-        t.isForOfStatement(n)
-    ) {
+    if (t.isWhileStatement(n) || t.isForStatement(n) || t.isForInStatement(n) || t.isForOfStatement(n)) {
         tryMinimizeExits(n.body, 'continue', null, ctx);
         return;
     }
@@ -96,12 +91,7 @@ type ExitKind = 'break' | 'continue' | 'return';
 // ---------------------------------------------------------------------------
 // Core: identify trailing exits and convert them to implicit fall-through.
 
-function tryMinimizeExits(
-    n: t.Statement,
-    exitType: ExitKind,
-    labelName: string | null,
-    ctx: Ctx,
-): void {
+function tryMinimizeExits(n: t.Statement, exitType: ExitKind, labelName: string | null, ctx: Ctx): void {
     // Direct match: the node itself is an exit of the right kind.
     if (matchingExitNode(n, exitType, labelName)) {
         // Remove it from its parent. The caller (block iteration) handles
@@ -164,12 +154,7 @@ function tryMinimizeExits(
     }
 }
 
-function tryMinimizeSwitchExits(
-    n: t.SwitchStatement,
-    exitType: ExitKind,
-    labelName: string | null,
-    ctx: Ctx,
-): void {
+function tryMinimizeSwitchExits(n: t.SwitchStatement, exitType: ExitKind, labelName: string | null, ctx: Ctx): void {
     for (let i = 0; i < n.cases.length; i++) {
         const c = n.cases[i];
         if (i !== n.cases.length - 1) {
@@ -181,12 +166,7 @@ function tryMinimizeSwitchExits(
     }
 }
 
-function tryMinimizeSwitchCaseExits(
-    c: t.SwitchCase,
-    exitType: ExitKind,
-    labelName: string | null,
-    ctx: Ctx,
-): void {
+function tryMinimizeSwitchCaseExits(c: t.SwitchCase, exitType: ExitKind, labelName: string | null, ctx: Ctx): void {
     const body = c.consequent;
     const last = body[body.length - 1];
     if (!t.isBreakStatement(last) || last.label !== null) return;
@@ -223,7 +203,7 @@ function tryMinimizeIfBlockExits(
 ): void {
     const srcBlock = workingOnConsequent ? ifNode.consequent : ifNode.alternate;
     if (srcBlock === null || srcBlock === undefined) return;
-    const destBlock = workingOnConsequent ? ifNode.alternate ?? null : ifNode.consequent;
+    const destBlock = workingOnConsequent ? (ifNode.alternate ?? null) : ifNode.consequent;
 
     let exitNode: t.Statement | null = null;
     let removeFromBlock: t.BlockStatement | null = null;
@@ -292,10 +272,7 @@ function tryMinimizeIfBlockExits(
 
 function matchingExitNode(n: t.Node, type: ExitKind, labelName: string | null): boolean {
     if (type === 'return') {
-        return (
-            t.isReturnStatement(n) &&
-            (n.argument === null || n.argument === undefined)
-        );
+        return t.isReturnStatement(n) && (n.argument === null || n.argument === undefined);
     }
     if (type === 'break') {
         if (!t.isBreakStatement(n)) return false;
@@ -309,4 +286,3 @@ function matchingExitNode(n: t.Node, type: ExitKind, labelName: string | null): 
     }
     return false;
 }
-

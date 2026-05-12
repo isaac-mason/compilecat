@@ -1,6 +1,6 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
 import { inlineFunctions } from '../src/compiler/inline-functions';
@@ -8,9 +8,7 @@ import { inlineFunctions } from '../src/compiler/inline-functions';
 function inl(code: string): { code: string; succeeded: number; calls: number } {
     const file = parse(code, { plugins: ['typescript'] });
     const r = inlineFunctions(file);
-    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
-        .replace(/\s+/g, ' ')
-        .trim();
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code.replace(/\s+/g, ' ').trim();
     return { code: out, succeeded: r.succeeded, calls: r.calls };
 }
 

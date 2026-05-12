@@ -74,10 +74,7 @@ export type MaybeReachResult = {
     getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => Set<t.Node>;
 };
 
-export function runMaybeReachingUse(
-    cfg: ControlFlowGraph,
-    table: LocalVariableTable,
-): MaybeReachResult {
+export function runMaybeReachingUse(cfg: ControlFlowGraph, table: LocalVariableTable): MaybeReachResult {
     const config: DataFlowConfig<ReachingUses> = {
         direction: 'backward',
         flowThrough: (node, output) => flowThrough(node, output, table),
@@ -119,11 +116,7 @@ export function runMaybeReachingUse(
 // process in reverse evaluation order so writes (that kill) and reads (that
 // add) land in their correct relative order.
 
-function flowThrough(
-    cfgNode: CfgNode,
-    out: ReachingUses,
-    table: LocalVariableTable,
-): ReachingUses {
+function flowThrough(cfgNode: CfgNode, out: ReachingUses, table: LocalVariableTable): ReachingUses {
     const result = cloneReachingUses(out);
     const value = cfgNode.value;
     if (typeof value !== 'symbol') {
@@ -132,12 +125,7 @@ function flowThrough(
     return result;
 }
 
-function computeMayUse(
-    n: t.Node,
-    out: ReachingUses,
-    conditional: boolean,
-    table: LocalVariableTable,
-): void {
+function computeMayUse(n: t.Node, out: ReachingUses, conditional: boolean, table: LocalVariableTable): void {
     if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) return;
 
     if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
