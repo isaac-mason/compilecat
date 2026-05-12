@@ -15,7 +15,7 @@
 
 A JavaScript/TypeScript compiler plugin for hot-path optimizations — function inlining, scalar-replacement of aggregates (SROA), and loop unrolling — driven by opt-in annotations.
 
-Built with Babel, packaged with [unplugin](https://unplugin.unjs.io/) to work with rollup, vite, webpack, esbuild, and rolldown.
+Built with Babel. Ships as a rollup-family plugin that runs in **bundle mode** via `renderChunk` — after the bundler has tree-shaken and concatenated modules, compilecat sees the chunk as a single program, so every `@inline` target is directly in scope without any cross-file resolver.
 
 ## Usage
 
@@ -28,7 +28,7 @@ export default {
 };
 ```
 
-Swap the subpath for other bundlers: `compilecat/vite`, `compilecat/webpack`, `compilecat/esbuild`, `compilecat/rolldown`.
+Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compilecat/rolldown`. esbuild and webpack are not supported in bundle mode.
 
 ## Directives
 
@@ -36,7 +36,7 @@ All optimizations are opt-in via `/* @* */` block comments.
 
 ### `@inline` — inline at the call site
 
-On a function declaration, every call within the file (and cross-file, for callers that import it) is replaced with the function body:
+On a function declaration, every call within the chunk is replaced with the function body. In bundle mode the chunk is the whole tree-shaken program, so callers from other source files reach the annotated function naturally — no cross-file resolver involved.
 
 ```ts
 /* @inline */
@@ -60,7 +60,7 @@ function step(result: Vec3, v1: Vec3, v2: Vec3) {
 }
 ```
 
-On a call site, inlines just that call — useful when the callee is in a library you don't control:
+On a call site, inlines just that call — useful for one-off forcing of a particular call:
 
 ```ts
 import { vec3 } from 'mathcat';
@@ -70,7 +70,7 @@ function step(out: Vec3, v: Vec3) {
 }
 ```
 
-Library (`node_modules`) inlining happens only at explicitly annotated call sites — compilecat never eagerly scans `node_modules`.
+Library code from `node_modules` is eligible for inlining whenever it ends up in the chunk and carries (or is targeted by) a directive — the resolver isn't doing anything special for libraries because bundling already pulled the body in.
 
 ### `@flatten` — inline every call inside this function
 
@@ -143,17 +143,24 @@ function step(out: Vec3, v: Vec3, dt: number) {
 
 ## Pipeline
 
-Each matched file runs through:
+Each chunk that contains a compilecat directive runs through:
 
 ```
 parse
-  → inline (function inlining, DIRECT + BLOCK)
-  → unroll
-  → sroa
-  → simplify (fixpoint: peephole-fold-constants, peephole-remove-dead-code,
-              flow-sensitive-inline-variables, dead-assignments-elimination,
-              peephole-minimize-conditions)
-  → inline-variables
+  → strip-typescript        (drop TS-only syntax so downstream passes see plain JS)
+  → inline-functions        (DIRECT + BLOCK inlining, FunctionArgumentInjector)
+  → loop-unroller
+  → inline-variables (pre)  (collapse alias temps so SROA sees direct `name[i]` uses)
+  → scalar-replace-aggregates
+  → normalize               (MakeDeclaredNamesUnique — flips `isASTNormalized`)
+  → simplify (per-function fixpoint):
+      peephole-fold-constants
+      minimize-exit-points
+      peephole-minimize-conditions
+      peephole-remove-dead-code
+      flow-sensitive-inline-variables
+      dead-assignments-elimination
+  → inline-variables (post)
   → remove-unused-code
   → regenerate
 ```
@@ -166,10 +173,7 @@ corresponding `jscomp/*.java` files from Google Closure Compiler. See
 
 ```ts
 compilecat({
-    debug?: boolean,          // log each transformed file. default false
-    crossFile?: boolean,      // resolve @inline across relative imports. default true
-    libraryInline?: boolean,  // permit callsite-annotated inlines from node_modules. default false
-    fileReader?: FileReader,  // override cross-file reader (default: node:fs)
+    debug?: boolean,          // log each transformed chunk. default false
 })
 ```
 
@@ -179,14 +183,16 @@ compilecat({
 import { transform } from 'compilecat';
 
 const { code, map, stats } = transform(source, {
-    filename: absolutePath,
+    filename: chunkFileName,
     sourceMaps: true,
-    allowLibraryInline: true,
+    inputSourceMap,             // chain through an upstream map if you have one
 });
 ```
 
-For multi-file builds where cross-file `@inline` resolution is needed, share
-a `FileCache` across calls (re-exported from the package as `createFileCache`).
+`transform` operates on a single program — typically a rollup chunk. There's no
+cross-file or multi-pass coordination to set up; if you're driving compilecat
+yourself outside of a bundler, hand it the concatenated source you want
+optimized.
 
 ## Acknowledgements
 
