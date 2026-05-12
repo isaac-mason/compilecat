@@ -248,37 +248,22 @@ function tryMinimizeIf(n: t.IfStatement, ctx: Ctx): t.Node {
 
     if (elseBranch === null) {
         // No else.
+        //
+        // Closure's tryMinimizeIf rewrites `if (x) foo();` → `x && foo();` and
+        // `if (!x) bar();` → `x || bar();` here. The rewrite is a pure code-size
+        // win (gzip-equivalent semantically, identical bytecode after V8 tiers
+        // up). compilecat's output is consumed by a downstream
+        // bundler/minifier, and its design goal is *readable* intermediate
+        // code, so we skip the if→&& / if→|| fold. We still let condition
+        // minimization run on the test slot below. See conversation note —
+        // intentional Closure deviation.
         if (isFoldableExpressBlock(thenBranch)) {
-            const expr = getBlockExpression(thenBranch); // ExpressionStatement
-            const inner = expr.expression;
-
-            if (isMeasuredNot(shortCond)) {
-                // if(!x)bar(); → x||bar();
-                const stripped = withoutNot(shortCond);
-                const newCond = buildReplacement(stripped) as t.Expression;
+            const replaced = applyMeasured(originalCond, unnegated);
+            if (replaced !== originalCond) {
+                n.test = replaced as t.Expression;
                 ctx.minimized++;
-                return t.expressionStatement(t.logicalExpression('||', newCond, inner));
             }
-
-            // if(x)foo(); → x&&foo();
-            // Parens cost gate: only do the rewrite when it doesn't introduce
-            // an extra pair of parens on both sides.
-            const newCond = applyMeasured(originalCond, shortCond);
-            if (
-                isLowerPrecedenceThan(shortCond, AND_PRECEDENCE) &&
-                precedence(inner) < AND_PRECEDENCE
-            ) {
-                // Just minimize the cond, don't fold to &&.
-                if (newCond !== originalCond) {
-                    n.test = newCond as t.Expression;
-                    ctx.minimized++;
-                }
-                return n;
-            }
-            ctx.minimized++;
-            return t.expressionStatement(
-                t.logicalExpression('&&', newCond as t.Expression, inner),
-            );
+            return n;
         }
 
         // Try to combine `if (x) { if (y) Z; }` into `if (x && y) Z;`.
@@ -325,107 +310,21 @@ function tryMinimizeIf(n: t.IfStatement, ctx: Ctx): t.Node {
         return swapped;
     }
 
-    // if(c)return X; else return Y; → return c ? X : Y;
-    if (isReturnExpressBlock(thenBranch) && isReturnExpressBlock(elseBranch)) {
-        const thenExpr = getBlockReturnExpression(thenBranch);
-        const elseExpr = getBlockReturnExpression(elseBranch);
-        const newCond = applyMeasured(originalCond, shortCond) as t.Expression;
-        ctx.minimized++;
-        return t.returnStatement(t.conditionalExpression(newCond, thenExpr, elseExpr));
-    }
-
-    const thenExpr = isFoldableExpressBlock(thenBranch);
-    const elseExpr = isFoldableExpressBlock(elseBranch);
-
-    if (thenExpr && elseExpr) {
-        const thenOp = getBlockExpression(thenBranch).expression;
-        const elseOp = getBlockExpression(elseBranch).expression;
-
-        // if(x) a=1; else a=2; → a = x ? 1 : 2;
-        if (
-            t.isAssignmentExpression(thenOp) &&
-            t.isAssignmentExpression(elseOp) &&
-            thenOp.operator === elseOp.operator &&
-            areNodesEqual(thenOp.left as t.Node, elseOp.left as t.Node) &&
-            !mayEffectMutableState(thenOp.left as t.Node) &&
-            (!mayHaveSideEffects(originalCond) ||
-                (thenOp.operator === '=' && t.isIdentifier(thenOp.left)))
-        ) {
-            const newCond = applyMeasured(originalCond, shortCond) as t.Expression;
-            const hook = t.conditionalExpression(newCond, thenOp.right, elseOp.right);
-            ctx.minimized++;
-            return t.expressionStatement(
-                t.assignmentExpression(
-                    thenOp.operator,
-                    thenOp.left,
-                    hook,
-                ),
-            );
-        }
-
-        // if(x) foo(); else bar(); → x ? foo() : bar();
-        const newCond = applyMeasured(originalCond, shortCond) as t.Expression;
-        ctx.minimized++;
-        return t.expressionStatement(
-            t.conditionalExpression(newCond, thenOp, elseOp),
-        );
-    }
-
-    // if(x) var y=1; else y=2  →  var y = x?1:2;
-    const thenVar = getSingleVarDecl(thenBranch);
-    const elseAssignOp =
-        elseExpr ? getBlockExpression(elseBranch).expression : null;
-    if (
-        thenVar !== null &&
-        elseAssignOp !== null &&
-        t.isAssignmentExpression(elseAssignOp) &&
-        elseAssignOp.operator === '=' &&
-        t.isIdentifier(elseAssignOp.left) &&
-        thenVar.declarations.length === 1 &&
-        t.isIdentifier(thenVar.declarations[0].id) &&
-        thenVar.declarations[0].init !== null &&
-        thenVar.declarations[0].init !== undefined &&
-        thenVar.declarations[0].id.name === elseAssignOp.left.name
-    ) {
-        const newCond = applyMeasured(originalCond, shortCond) as t.Expression;
-        const hook = t.conditionalExpression(
-            newCond,
-            thenVar.declarations[0].init,
-            elseAssignOp.right,
-        );
-        ctx.minimized++;
-        return t.variableDeclaration(thenVar.kind, [
-            t.variableDeclarator(thenVar.declarations[0].id, hook),
-        ]);
-    }
-
-    // if(x) y=1; else var y=2 → var y = x?1:2; (mirror case)
-    const elseVar = getSingleVarDecl(elseBranch);
-    const thenAssignOp =
-        thenExpr ? getBlockExpression(thenBranch).expression : null;
-    if (
-        elseVar !== null &&
-        thenAssignOp !== null &&
-        t.isAssignmentExpression(thenAssignOp) &&
-        thenAssignOp.operator === '=' &&
-        t.isIdentifier(thenAssignOp.left) &&
-        elseVar.declarations.length === 1 &&
-        t.isIdentifier(elseVar.declarations[0].id) &&
-        elseVar.declarations[0].init !== null &&
-        elseVar.declarations[0].init !== undefined &&
-        elseVar.declarations[0].id.name === thenAssignOp.left.name
-    ) {
-        const newCond = applyMeasured(originalCond, shortCond) as t.Expression;
-        const hook = t.conditionalExpression(
-            newCond,
-            thenAssignOp.right,
-            elseVar.declarations[0].init,
-        );
-        ctx.minimized++;
-        return t.variableDeclaration(elseVar.kind, [
-            t.variableDeclarator(elseVar.declarations[0].id, hook),
-        ]);
-    }
+    // Closure's `tryMinimizeIfBlockExits` / `tryMinimizeCondition` collapse
+    // if/else pairs into ternary expressions in five shapes:
+    //
+    //   - if(c) return X; else return Y;           → return c ? X : Y;
+    //   - if(c) a = 1;   else a = 2;               → a = c ? 1 : 2;
+    //   - if(c) foo();   else bar();               → c ? foo() : bar();
+    //   - if(c) var y=1; else y=2;                 → var y = c ? 1 : 2;
+    //   - if(c) y=1;     else var y=2;             → var y = c ? 1 : 2;
+    //
+    // Disabled — these are code-size wins, not perf wins, and they cascade:
+    // a chain of `if (a) jv = ...; else if (b) jv = -...; else jv = 0;` folds
+    // into a nested ternary `jv = a ? ... : b ? -... : 0;` that's strictly
+    // less readable than the authored if/else chain. compilecat targets
+    // readable intermediate code; ternary collapsing is the downstream
+    // bundler/minifier's job. The condition itself is still minimized below.
 
     // Default: minimize cond only.
     const replaced = applyMeasured(originalCond, unnegated);
@@ -485,29 +384,10 @@ function tryReplaceIfBlock(block: t.BlockStatement | t.Program, ctx: Ctx): void 
             }
         }
 
-        // (2) if(c) return X; (no else) followed by return Y; → return c?X:Y;
-        if (
-            next !== null &&
-            elseBranch === null &&
-            isReturnBlock(thenBranch) &&
-            t.isReturnStatement(next)
-        ) {
-            let thenExpr: t.Expression;
-            if (isReturnExpressBlock(thenBranch)) {
-                thenExpr = getBlockReturnExpression(thenBranch);
-            } else {
-                thenExpr = t.identifier('undefined');
-            }
-            const elseExpr = next.argument ?? t.identifier('undefined');
-            const ret = t.returnStatement(
-                t.conditionalExpression(ifNode.test, thenExpr, elseExpr),
-            );
-            body.splice(i, 2, ret);
-            ctx.minimized++;
-            // Everything after a return is dead — peephole-remove-dead-code
-            // will drop the rest in a later pass.
-            continue;
-        }
+        // (2) `if(c) return X;` followed by `return Y;` → `return c?X:Y;`.
+        // Disabled — same readability rationale as the expr-level
+        // if/else→ternary collapses above. The authored two-statement form
+        // reads cleanly; ternary collapsing is the bundler's job.
 
         // (3) if(c) { ...exit; } else X; → if(c){...exit;} X; (hoist else)
         if (elseBranch !== null && statementMustExitParent(thenBranch)) {
@@ -757,32 +637,8 @@ function isFoldableExpressBlock(n: t.Statement): boolean {
     return true;
 }
 
-function getBlockExpression(n: t.Statement): t.ExpressionStatement {
-    return unwrapSingle(n) as t.ExpressionStatement;
-}
-
 function isReturnBlock(n: t.Statement): boolean {
     return t.isReturnStatement(unwrapSingle(n));
-}
-
-function isReturnExpressBlock(n: t.Statement): boolean {
-    const inner = unwrapSingle(n);
-    return (
-        t.isReturnStatement(inner) &&
-        inner.argument !== null &&
-        inner.argument !== undefined
-    );
-}
-
-function getBlockReturnExpression(n: t.Statement): t.Expression {
-    return (unwrapSingle(n) as t.ReturnStatement).argument as t.Expression;
-}
-
-function getSingleVarDecl(n: t.Statement): t.VariableDeclaration | null {
-    const inner = unwrapSingle(n);
-    if (!t.isVariableDeclaration(inner)) return null;
-    if (inner.declarations.length !== 1) return null;
-    return inner;
 }
 
 function consumesDanglingElse(n: t.Statement): boolean {
@@ -821,12 +677,3 @@ function isLiteralValue(n: t.Node): boolean {
     );
 }
 
-function mayEffectMutableState(n: t.Node): boolean {
-    // For our purposes: a property write target is mutable, an identifier is
-    // not. Used to gate the assignment-collapse case in tryMinimizeIf — if the
-    // LHS is `o.p`, evaluating it twice is unsafe.
-    if (t.isMemberExpression(n) || t.isOptionalMemberExpression(n)) return true;
-    if (t.isCallExpression(n)) return true;
-    if (t.isAssignmentExpression(n) || t.isUpdateExpression(n)) return true;
-    return false;
-}

@@ -29,7 +29,7 @@ import { runFlowSensitiveInlineVariables } from './flow-sensitive-inline-variabl
 import { runLiveVariablesAnalysis } from './live-variables-analysis';
 import { buildLocalVariableTable } from './local-variable-table';
 import { runMinimizeExitPoints } from './minimize-exit-points';
-import { isFileNormalized } from './normalize';
+import { renameForFlatten } from './normalize';
 import { runPeepholeFoldConstants } from './peephole-fold-constants';
 import { runPeepholeMinimizeConditions } from './peephole-minimize-conditions';
 import { runPeepholeRemoveDeadCode } from './peephole-remove-dead-code';
@@ -46,9 +46,8 @@ export type SimplifyStats = {
 const MAX_ITERATIONS = 16;
 
 export type SimplifyOptions = {
-    /** Mirrors Closure's `isASTNormalized()` flag. Threaded into the
-     *  PeepholeRemoveDeadCode block-merge step. Set when the caller has run
-     *  `makeDeclaredNamesUnique` on the file. */
+    /** Retained for source compatibility with callers; ignored. Block-merge
+     *  safety is now established per-function by `renameForFlatten`. */
     normalized?: boolean;
 };
 
@@ -58,7 +57,7 @@ export type SimplifyOptions = {
  */
 export function simplifyFunction(
     fnPath: NodePath<t.Function>,
-    options: SimplifyOptions = {},
+    _options: SimplifyOptions = {},
 ): SimplifyStats {
     const stats: SimplifyStats = {
         iterations: 0,
@@ -70,6 +69,13 @@ export function simplifyFunction(
     };
 
     const fn = fnPath.node;
+
+    // Rename nested-block bindings that would collide on flatten. After this
+    // pass, every let/const/class/function-declaration inside `fn` is uniquely
+    // named within the function, so `PeepholeRemoveDeadCode` can splice nested
+    // blocks into their parents with `ignoreBlockScopedDeclarations=true`.
+    renameForFlatten(fnPath);
+    const normalized = true;
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
         let changed = false;
@@ -95,7 +101,7 @@ export function simplifyFunction(
             stats.minimized += min.minimized;
         }
 
-        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized: options.normalized });
+        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized });
         if (dead.removed > 0) {
             changed = true;
             stats.removed += dead.removed;
@@ -146,7 +152,11 @@ export function simplifyFunction(
  * the already-cleaned inner shape.
  */
 export function simplifyAll(root: t.Node): SimplifyStats {
-    const normalized = isFileNormalized(root);
+    // Top-level rename is intentionally not performed — we only uniquify
+    // names within each function (see `simplifyFunction`). At the program
+    // level we leave `normalized=false` so PeepholeRemoveDeadCode keeps the
+    // conservative block-merge check for any top-level inner blocks.
+    const normalized = false;
     const total: SimplifyStats = {
         iterations: 0,
         folded: 0,

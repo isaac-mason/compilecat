@@ -59,11 +59,15 @@ export type IndexedFunction = {
     moduleVarRefs: Set<string>;
     functionRefs: Set<string>;
     importRefs: Set<string>;
+    /** Program-scope identifiers we can't classify (e.g. TS enums, classes).
+     *  Their presence means the body cannot be safely spliced cross-file —
+     *  the hoister wouldn't know how to bring the dependency along. */
+    unresolvedRefs: Set<string>;
 };
 
 export type ModuleVar = {
     name: string;
-    declaration: t.VariableDeclaration;
+    declaration: t.VariableDeclaration | t.TSEnumDeclaration;
     isExported: boolean;
 };
 
@@ -104,13 +108,8 @@ export function indexFile(absolutePath: string, ast: t.File): FileIndex {
         );
     }
 
-    const topLevelNames = new Set<string>([
-        ...functions.keys(),
-        ...moduleVars.keys(),
-        ...imports.keys(),
-    ]);
     for (const fn of functions.values()) {
-        analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast);
+        analyzeFreeRefs(fn, functions, moduleVars, imports, ast);
     }
 
     return { absolutePath, ast, functions, moduleVars, imports, namespaceReexports };
@@ -176,6 +175,10 @@ function collectStatement(
         );
         return;
     }
+    if (t.isTSEnumDeclaration(stmt)) {
+        moduleVars.set(stmt.id.name, { name: stmt.id.name, declaration: stmt, isExported: false });
+        return;
+    }
     if (t.isVariableDeclaration(stmt)) {
         for (const decl of stmt.declarations) {
             if (!t.isIdentifier(decl.id)) continue;
@@ -229,6 +232,7 @@ function buildFunctionEntry(
         moduleVarRefs: new Set(),
         functionRefs: new Set(),
         importRefs: new Set(),
+        unresolvedRefs: new Set(),
     };
 }
 
@@ -279,7 +283,6 @@ function recordImports(
 
 function analyzeFreeRefs(
     fn: IndexedFunction,
-    topLevelNames: Set<string>,
     functions: Map<string, IndexedFunction>,
     moduleVars: Map<string, ModuleVar>,
     imports: Map<string, ImportBinding>,
@@ -321,17 +324,21 @@ function analyzeFreeRefs(
     if (!rootPath) return;
     const safePath = rootPath as NodePath<t.Function>;
 
+    // Babel's scope plugin doesn't bind TSEnumDeclaration (and a few other TS-only
+    // forms), so `getBinding` is `null` for valid top-level enum refs. When the
+    // scope is silent, fall back to the top-level index — `getBinding` would have
+    // returned a *non-Program* binding if any inner local shadowed the name, so a
+    // null result is safe to resolve against module-scope.
     safePath.traverse({
         Identifier(innerPath) {
             const name = innerPath.node.name;
-            if (!topLevelNames.has(name)) return;
             if (!innerPath.isReferencedIdentifier()) return;
             const scopeBinding = innerPath.scope.getBinding(name);
-            if (!scopeBinding) return;
-            if (scopeBinding.scope.block.type !== 'Program') return;
+            if (scopeBinding && scopeBinding.scope.block.type !== 'Program') return;
             if (functions.has(name)) fn.functionRefs.add(name);
             else if (moduleVars.has(name)) fn.moduleVarRefs.add(name);
             else if (imports.has(name)) fn.importRefs.add(name);
+            else if (scopeBinding) fn.unresolvedRefs.add(name);
         },
     });
 }

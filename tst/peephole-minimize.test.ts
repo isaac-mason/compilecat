@@ -46,27 +46,40 @@ describe('PeepholeMinimizeConditions', () => {
         expect(mn('var x = c ? true : false;').code).toContain('var x = !!c');
     });
 
-    it('collapses if/else with return', () => {
+    // Closure's PeepholeMinimizeConditions collapses if/else pairs into
+    // ternaries (return-fold, same-target-assign-fold, expr-stmt-fold,
+    // var-decl-fold). We've intentionally disabled all of those — they're
+    // code-size wins, not perf wins, and cascading them produces nested
+    // `a ? ... : b ? ... : 0` chains that read worse than the authored
+    // if/else. The downstream bundler/minifier handles ternary collapsing
+    // when shipping. The tests below assert that compilecat preserves the
+    // authored shape.
+
+    it('preserves if/else with return (does not collapse to ternary)', () => {
         const r = mn('function f(c) { if (c) return 1; else return 2; }');
-        expect(r.code).toContain('return c ? 1 : 2');
+        expect(r.code).not.toContain('? 1 : 2');
+        expect(r.code).toContain('if (c)');
     });
 
-    it('collapses if/return + tail return into ternary', () => {
+    it('preserves if + tail-return shape', () => {
         const r = mn('function f(c) { if (c) return 1; return 2; }');
-        expect(r.code).toContain('return c ? 1 : 2');
+        expect(r.code).not.toContain('? 1 : 2');
+        expect(r.code).toContain('if (c)');
+        expect(r.code).toContain('return 2');
     });
 
-    it('collapses if/else assigning same target', () => {
+    it('preserves if/else same-target assignment as authored', () => {
         const r = mn('function f(c) { if (c) x = 1; else x = 2; }');
-        expect(r.code).toContain('x = c ? 1 : 2');
+        expect(r.code).not.toContain('? 1 : 2');
+        expect(r.code).toContain('if (c)');
+        expect(r.code).toMatch(/x = 1/);
+        expect(r.code).toMatch(/x = 2/);
     });
 
-    it('collapses if/else with unrelated expression statements via HOOK', () => {
-        // Closure: any two expression-statement branches → `cond ? a : b`.
-        // We follow.
+    it('preserves if/else with unrelated expression statements', () => {
         const r = mn('function f(c) { if (c) x = 1; else y = 2; }');
-        expect(r.minimized).toBeGreaterThan(0);
-        expect(r.code).toContain('c ? x = 1 : y = 2');
+        expect(r.code).not.toMatch(/\?\s*x = 1\s*:\s*y = 2/);
+        expect(r.code).toContain('if (c)');
     });
 
     it('substitutes x ? true : y → x || y in boolean context', () => {

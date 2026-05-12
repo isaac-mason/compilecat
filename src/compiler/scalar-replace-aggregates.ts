@@ -11,7 +11,7 @@
 
 import * as t from '@babel/types';
 
-import { DIRECTIVE_PATTERNS } from './directives';
+import { commentIsSroaDirective, hasLeadingDirective } from './directives';
 import { getSlot, setSlot } from './node-util';
 
 const MIN_FIELDS = 2;
@@ -65,7 +65,7 @@ function collectCandidates(root: t.Node): Candidate[] {
         const enteringFn = t.isFunction(n);
         const enteringScope = enteringFn || t.isProgram(n);
         const annotated =
-            sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n);
+            sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n, parent);
         if (enteringScope) {
             sroaScopeStack.push(annotated);
         }
@@ -73,7 +73,7 @@ function collectCandidates(root: t.Node): Candidate[] {
         const nextScope = enteringScope ? n : scope;
 
         if (t.isVariableDeclaration(n) && parent && index !== undefined) {
-            const declAnnot = annotated || hasSroaAnnotation(n);
+            const declAnnot = annotated || hasSroaAnnotation(n, parent);
             for (const d of n.declarations) {
                 if (!declAnnot && !hasSroaAnnotation(d)) continue;
                 if (!t.isIdentifier(d.id) || !d.init) continue;
@@ -132,13 +132,8 @@ function inferInitializer(
     return { size, initExprs: exprs };
 }
 
-function hasSroaAnnotation(n: t.Node): boolean {
-    const cs = (n.leadingComments ?? []) as t.Comment[];
-    for (const c of cs) {
-        if (DIRECTIVE_PATTERNS.sroa.test(c.value)) return true;
-        if (DIRECTIVE_PATTERNS.optimize.test(c.value)) return true;
-    }
-    return false;
+function hasSroaAnnotation(n: t.Node, parent: t.Node | null = null): boolean {
+    return hasLeadingDirective(n, parent, commentIsSroaDirective);
 }
 
 // ---------------------------------------------------------------------------

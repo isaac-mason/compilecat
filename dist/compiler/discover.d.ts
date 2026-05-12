@@ -18,10 +18,14 @@ export type IndexedFunction = {
     moduleVarRefs: Set<string>;
     functionRefs: Set<string>;
     importRefs: Set<string>;
+    /** Program-scope identifiers we can't classify (e.g. TS enums, classes).
+     *  Their presence means the body cannot be safely spliced cross-file —
+     *  the hoister wouldn't know how to bring the dependency along. */
+    unresolvedRefs: Set<string>;
 };
 export type ModuleVar = {
     name: string;
-    declaration: t.VariableDeclaration;
+    declaration: t.VariableDeclaration | t.TSEnumDeclaration;
     isExported: boolean;
 };
 export type ImportStyle = 'named' | 'default' | 'namespace';

@@ -1,9 +1,14 @@
 import generate from '@babel/generator';
 import { parse } from '@babel/parser';
+import traverse, { type NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
 import { describe, expect, it } from 'vitest';
 
-import { isFileNormalized, makeDeclaredNamesUnique } from '../src/compiler/normalize';
+import {
+    isFileNormalized,
+    makeDeclaredNamesUnique,
+    renameForFlatten,
+} from '../src/compiler/normalize';
 
 function run(code: string): { code: string; renamed: number; normalized: boolean } {
     const file = parse(code, { sourceType: 'module', plugins: ['typescript'] });
@@ -14,8 +19,25 @@ function run(code: string): { code: string; renamed: number; normalized: boolean
     return { code: out, renamed: r.renamed, normalized: isFileNormalized(file) };
 }
 
+function runRename(code: string): { code: string; renamed: number } {
+    const file = parse(code, { sourceType: 'module', plugins: ['typescript'] });
+    makeDeclaredNamesUnique(file);
+    let totalRenamed = 0;
+    (traverse as unknown as (n: t.Node, v: object) => void)(file, {
+        Function: {
+            exit(path: NodePath<t.Function>) {
+                totalRenamed += renameForFlatten(path);
+            },
+        },
+    });
+    const out = (generate as unknown as (n: t.Node) => { code: string })(file).code
+        .replace(/\s+/g, ' ')
+        .trim();
+    return { code: out, renamed: totalRenamed };
+}
+
 describe('Normalize.makeDeclaredNamesUnique', () => {
-    it('leaves global names unchanged', () => {
+    it('does not rename — just structurally normalizes + marks file', () => {
         const r = run('var foo = 1; function bar() {}');
         expect(r.code).toContain('var foo = 1');
         expect(r.code).toContain('function bar()');
@@ -23,60 +45,80 @@ describe('Normalize.makeDeclaredNamesUnique', () => {
         expect(r.normalized).toBe(true);
     });
 
-    it('renames a local that shadows a global', () => {
-        const r = run('var x = 1; function f() { var x = 2; return x; }');
-        expect(r.code).toContain('var x = 1');
-        // Inner x must have been renamed to x__1.
-        expect(r.code).toMatch(/var x__1\s*=\s*2/);
-        expect(r.code).toMatch(/return x__1/);
-        expect(r.renamed).toBe(1);
-    });
-
-    it('renames the second of two same-named locals across functions', () => {
-        const r = run(
-            'function a() { var i = 0; return i; } function b() { var i = 1; return i; }',
-        );
-        // First-seen `i` keeps the name; second is suffixed.
-        expect(r.code).toMatch(/var i\s*=\s*0/);
-        expect(r.code).toMatch(/var i__1\s*=\s*1/);
-        expect(r.renamed).toBe(1);
-    });
-
-    it('renames let/const/function-decl uniformly across scopes', () => {
-        const r = run(
-            `var k = 0;
-             function f() {
-               let k = 1;
-               { const k = 2; sink(k); }
-               return k;
-             }
-             function g() { function k() {} return k; }`,
-        );
-        // Four total `k` decls (global var, f's let, f's inner const, g's
-        // inner function). First wins the bare name; the other three each
-        // get a distinct __N suffix.
-        const ks = new Set(r.code.match(/\bk__\d+/g) ?? []);
-        expect(ks.size).toBe(3);
-    });
-
     it('marks the file as normalized', () => {
         const r = run('var x = 1;');
         expect(r.normalized).toBe(true);
     });
 
-    it('preserves references after rename (locals in nested scopes)', () => {
+    it('leaves cross-function name reuse alone (distinct scopes)', () => {
+        // The whole point of demand-driven rename: cross-function `i`
+        // never collides, so both stay as authored.
         const r = run(
-            `function f() {
-               var dup = 1;
-               { let dup = 2; sink(dup); }
-               return dup;
-             }`,
+            'function a() { var i = 0; return i; } function b() { var i = 1; return i; }',
         );
-        // Inner `let dup` becomes dup__N; outer `var dup` keeps name.
-        expect(r.code).toMatch(/var dup\s*=\s*1/);
-        expect(r.code).toMatch(/let dup__1\s*=\s*2/);
-        expect(r.code).toMatch(/sink\(dup__1\)/);
-        expect(r.code).toMatch(/return dup/); // outer still readable as `dup`
+        expect(r.code).toMatch(/function a\(\)\s*\{\s*var i = 0/);
+        expect(r.code).toMatch(/function b\(\)\s*\{\s*var i = 1/);
+        expect(r.code).not.toMatch(/i__\d+/);
+    });
+});
+
+describe('Normalize.renameForFlatten', () => {
+    it('does not rename when no nested-scope collision exists', () => {
+        const r = runRename('function f() { var x = 1; return x; }');
+        expect(r.code).toMatch(/var x = 1/);
+        expect(r.code).not.toMatch(/x__\d+/);
+        expect(r.renamed).toBe(0);
+    });
+
+    it('renames inner let that shadows function-scope var', () => {
+        const r = runRename(
+            'function f() { var x = 1; { let x = 2; sink(x); } return x; }',
+        );
+        expect(r.code).toMatch(/var x = 1/);
+        expect(r.code).toMatch(/let x__1 = 2/);
+        expect(r.code).toMatch(/sink\(x__1\)/);
+        expect(r.code).toMatch(/return x/);
+        expect(r.renamed).toBe(1);
+    });
+
+    it('leaves sibling-block let bindings alone (no ancestor collision)', () => {
+        const r = runRename(
+            'function f() { { let i = 1; sink(i); } { let i = 2; sink(i); } }',
+        );
+        // Sibling block scopes never see each other's bindings, so renaming
+        // for readability's sake would just add noise. Block-merge safety is
+        // enforced at merge time by `tryMergeBlock`'s sibling-collision guard.
+        expect(r.code).toMatch(/let i = 1/);
+        expect(r.code).toMatch(/let i = 2/);
+        expect(r.code).not.toMatch(/i__\d+/);
+    });
+
+    it('renames inner function-declarations that collide with an outer var', () => {
+        const r = runRename(
+            'function outer() { var k = 1; { function k() {} sink(k); } }',
+        );
+        expect(r.code).toMatch(/var k = 1/);
+        expect(r.code).toMatch(/function k__1\(\)/);
+        expect(r.code).toMatch(/sink\(k__1\)/);
+    });
+
+    it('does not cross function boundaries', () => {
+        // Inner function `f` declares its own `i`; outer's renameForFlatten
+        // must skip it entirely (the inner function gets its own pass).
+        const r = runRename(
+            'function outer() { var i = 1; function inner() { var i = 2; return i; } return i; }',
+        );
+        // Inner's own pass runs and finds no collision within `inner`.
+        expect(r.code).toMatch(/function inner\(\)\s*\{\s*var i = 2/);
+        expect(r.code).toMatch(/return i;\s*\}\s*return i;/);
+        expect(r.code).not.toMatch(/i__\d+/);
+    });
+
+    it('leaves params alone', () => {
+        const r = runRename('function f(x) { { let x = 2; sink(x); } return x; }');
+        // Inner `let x` collides with param `x` — inner gets suffixed.
+        expect(r.code).toMatch(/function f\(x\)/);
+        expect(r.code).toMatch(/let x__1 = 2/);
     });
 });
 

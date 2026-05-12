@@ -1,7 +1,7 @@
 // Port of jscomp/Normalize.java + jscomp/MakeDeclaredNamesUnique.java
-// (ContextualRenamer subset).
+// (InlineRenamer-style subset).
 //
-// Two-stage pass mirroring Closure's NormalizeStatements + ContextualRenamer:
+// Two stages:
 //
 //   1. Structural normalizations (Closure NormalizeStatements):
 //      - Rewrite blockless arrow function bodies to block-with-return
@@ -16,44 +16,33 @@
 //        for-init liveness. Skipped for `let`/`const`/`class`/`function`
 //        per-iteration block-scoped semantics.
 //
-//   2. Renaming (ContextualRenamer):
-//      Every locally-declared name is uniquified across the whole program.
-//      After this pass, downstream passes (block-flatten, let→var lowering)
-//      can act on the assumption that hoisting a binding out of an inner
-//      block can never collide with another binding — the assumption Closure
-//      encodes via NodeUtil.tryMergeBlock's `ignoreBlockScopedDeclarations`
-//      flag passed as `isASTNormalized()`.
+//   2. Demand-driven α-rename (`renameForFlatten`, run per-function from the
+//      simplifier — not from this file's entry):
+//      Models Closure's InlineRenamer (MakeDeclaredNamesUnique.java:497-562):
+//      rename only where a collision is actually possible. Closure's
+//      ContextualRenamer (file-wide eager rename) sprays `__N` suffixes
+//      across every function that happens to share a name with any other
+//      function's locals — even when those names will never end up in the
+//      same scope. The output noise (`cp__3`, `i__7`) makes the intermediate
+//      code we ship to a bundler much harder to read.
 //
-// Algorithm (mirrors ContextualRenamer in MakeDeclaredNamesUnique.java:683):
+//      Instead, we rename only within a single function's own subtree, and
+//      only when a nested block's binding would clash with an ancestor binding
+//      *within that same function*. Cross-function name reuse is left alone
+//      — distinct function scopes can never collide.
 //
-//   - Maintain a shared `nameUsage` Map<string, count> for the whole file —
-//     tracks how many times each base name has been declared anywhere.
-//   - Walk every scope top-down. For each binding declared directly in the
-//     scope:
-//       * If scope is the file's program (global) → reserve name as-is.
-//         Closure leaves global names unchanged so external references stay
-//         valid.
-//       * Otherwise → increment count for the base name. If new count is 1
-//         (first occurrence anywhere) keep the name; if > 1 generate
-//         `name__<id>` and reserve. If the generated name itself
-//         collides, retry with an incremented id (mirrors Closure's
-//         `while (nameUsage.contains(newName))` retry loop).
-//   - Use Babel's `scope.rename(oldName, newName)` to update the binding and
-//     every reference atomically. Babel's scope analysis handles the
-//     reference-following Closure does manually via its renamer stack.
-//
-// Departures from Closure:
-//   - We rely on Babel scope analysis instead of porting Closure's
-//     ScopedCallback + Renamer-stack machinery. The semantic outcome is the
-//     same: every local binding is uniquely named after the pass.
-//   - `ARGUMENTS` is irrelevant — Babel doesn't surface it as a binding.
-//   - No `assertOnChange` / `markChanges` modes — those are Closure
-//     pass-management concerns.
+//      After the rename, every let/const/class/fn-decl owned by a nested
+//      scope inside the function is unique with respect to the function
+//      scope and every other nested scope. This is the invariant that
+//      `NodeUtil.tryMergeBlock`'s `ignoreBlockScopedDeclarations=true` flag
+//      (Closure's `isASTNormalized()`) relies on — flattening any nested
+//      block into its parent can't introduce duplicate let/const bindings.
 //
 // Marker:
-//   The exported `markFileNormalized` / `isFileNormalized` pair lets later
-//   passes check `isASTNormalized()`-equivalent state. Backed by a WeakSet
-//   keyed on the File node.
+//   The exported `markFileNormalized` / `isFileNormalized` pair records that
+//   structural normalization ran. It does *not* imply that names have been
+//   uniquified — call `renameForFlatten` on a specific function before
+//   relaxing block-merge safety for that function.
 
 import type { NodePath } from '@babel/traverse';
 import * as t from '@babel/types';
@@ -64,8 +53,6 @@ import { traverse } from './babel-interop';
 // We diverge intentionally for readability: double-underscore is shorter,
 // reads as a "compiler-generated" marker in any JS code, and avoids `$` so
 // the suffix can't be visually mistaken for template-literal `${…}` syntax.
-// User code rarely contains `foo__1`; the collision-retry loop in
-// `pickReplacement` covers the rare case where it does.
 const UNIQUE_ID_SEPARATOR = '__';
 
 const NORMALIZED = new WeakSet<t.Node>();
@@ -79,108 +66,112 @@ export function markFileNormalized(file: t.Node): void {
 }
 
 export type NormalizeResult = {
-    /** Number of bindings renamed. */
+    /** Always 0 — rename moved out of the file-level entry point. */
     renamed: number;
 };
 
 export function makeDeclaredNamesUnique(file: t.File): NormalizeResult {
-    // Stage 1: structural normalizations. These run before the rename pass so
-    // that the rename pass sees the post-split / post-hoist binding shape (and
-    // so that scope.crawl picks up bindings hoisted out of for-headers).
     structuralNormalize(file);
+    markFileNormalized(file);
+    return { renamed: 0 };
+}
 
-    const nameUsage = new Map<string, number>();
+/**
+ * Per-function demand-driven α-rename. Walks nested scopes inside `fnPath`
+ * top-down; for every owned binding whose base name is already declared by
+ * an *ancestor* scope (within this function), renames it via Babel's
+ * `scope.rename` so the binding doesn't shadow the ancestor name.
+ *
+ * Sibling scopes are intentionally NOT renamed against each other: two
+ * sibling `if`-consequents can both declare `const dx` and never collide
+ * because neither block ever ends up in the other's lexical scope. The
+ * authored names are preserved for readability.
+ *
+ * If two sibling blocks both could be flattened into a shared statement-
+ * block ancestor (rare: requires both siblings to be plain BlockStatements
+ * sitting in the same parent statement list, not if/loop bodies), the
+ * resulting name collision is caught at merge time by `tryMergeBlock`'s
+ * sibling-collision guard — that block-merge is rejected instead.
+ *
+ * Nested functions are skipped; they're renamed by their own invocation.
+ */
+export function renameForFlatten(fnPath: NodePath<t.Function>): number {
     let renamed = 0;
 
-    // Reserve every name that appears at the program (global) scope first, so
-    // child scopes never pick a generated name that shadows a global.
-    traverse(file, {
-        Program(programPath) {
-            for (const name of Object.keys(programPath.scope.bindings)) {
-                reserveName(nameUsage, name);
-            }
-            programPath.skip();
-        },
-    });
+    const fnScope = fnPath.scope;
 
-    // Then visit every nested scope top-down and rename collisions.
-    traverse(file, {
-        Scope(path) {
-            // The Program scope was handled above (names reserved, no rename).
-            if (path.isProgram()) return;
-
-            const bindings = path.scope.bindings;
-            for (const baseName of Object.keys(bindings)) {
-                const binding = bindings[baseName];
-                if (binding === undefined) continue;
-                // Only rename bindings owned by *this* scope. Babel surfaces
-                // some inherited entries on `bindings` only for the owning
-                // scope itself, but be defensive.
-                if (binding.scope !== path.scope) continue;
-
-                // Skip function parameters. Closure's ContextualRenamer exists
-                // to make hoist-friendly names for later block-flatten / let→
-                // var lowering — those passes never cross function boundaries,
-                // so the param contract is already isolated. Renaming params
-                // here pollutes the output with `__N` suffixes on names the
-                // user authored, and (more importantly) belongs to the
-                // inliner's `InlineRenamer`-equivalent — which renames a
-                // callee's params at the call site as part of inlining, not
-                // here.
-                if (binding.kind === 'param') {
-                    // Reserve the param's name so synthetic `name__N` later
-                    // can't shadow it accidentally.
-                    reserveName(nameUsage, baseName);
-                    continue;
-                }
-
-                const newName = pickReplacement(nameUsage, baseName);
-                if (newName === null) {
-                    // First occurrence anywhere — keep the name, just count it.
-                    continue;
-                }
-                renameBinding(path, baseName, newName);
-                renamed++;
-            }
-        },
-    });
-
-    markFileNormalized(file);
-    return { renamed };
-}
-
-function reserveName(nameUsage: Map<string, number>, name: string): void {
-    if ((nameUsage.get(name) ?? 0) < 1) nameUsage.set(name, 1);
-}
-
-/** Returns the new name, or null if the base name is still free. */
-function pickReplacement(nameUsage: Map<string, number>, baseName: string): string | null {
-    const prev = nameUsage.get(baseName) ?? 0;
-    nameUsage.set(baseName, prev + 1);
-    if (prev === 0) {
-        // First time we've seen this name anywhere — keep it as-is.
-        return null;
+    // Stack-shaped: `active` holds names that are visible at the current
+    // traversal position — i.e. declared by some ancestor scope (within
+    // this function). Synthetic-suffix counter is global per function so
+    // `__1`, `__2` don't collide across distinct rename sites.
+    const active = new Set<string>();
+    const allNames = new Set<string>();
+    for (const name of Object.keys(fnScope.bindings)) {
+        active.add(name);
+        allNames.add(name);
     }
-    // Collision: produce `baseName__<id>`. If that itself collides
-    // (another scope already used or reserved that synthetic name), bump.
-    let id = prev;
+
+    type Frame = { added: string[] };
+    const frames = new WeakMap<t.Node, Frame>();
+
+    fnPath.traverse({
+        Scope: {
+            enter(p) {
+                // Inner functions own their own rename pass; don't descend.
+                if (p.isFunction()) {
+                    p.skip();
+                    return;
+                }
+                // Function-body Block / Program / etc. that share fnScope
+                // are already in `active`.
+                if (p.scope === fnScope) return;
+
+                const added: string[] = [];
+                const bindings = p.scope.bindings;
+                for (const baseName of Object.keys(bindings)) {
+                    const binding = bindings[baseName];
+                    if (binding === undefined) continue;
+                    if (binding.scope !== p.scope) continue;
+                    // Catch-clause params show up here. They never participate
+                    // in block-flatten, so leaving them as-is is safe.
+                    if (binding.kind === 'param') continue;
+
+                    if (active.has(baseName)) {
+                        // Ancestor shadowing — rename.
+                        const newName = pickFreshName(baseName, allNames);
+                        p.scope.rename(baseName, newName);
+                        active.add(newName);
+                        allNames.add(newName);
+                        added.push(newName);
+                        renamed++;
+                    } else {
+                        active.add(baseName);
+                        allNames.add(baseName);
+                        added.push(baseName);
+                    }
+                }
+                if (added.length > 0) frames.set(p.node, { added });
+            },
+            exit(p) {
+                const frame = frames.get(p.node);
+                if (frame === undefined) return;
+                for (const n of frame.added) active.delete(n);
+                frames.delete(p.node);
+            },
+        },
+    });
+
+    return renamed;
+}
+
+function pickFreshName(baseName: string, allNames: Set<string>): string {
+    let id = 1;
     let candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
-    while ((nameUsage.get(candidate) ?? 0) > 0) {
+    while (allNames.has(candidate)) {
         id++;
         candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
     }
-    nameUsage.set(candidate, 1);
-    // Keep the base counter consistent with the id we ultimately picked so
-    // the next collision starts from a higher number.
-    if (id > prev) nameUsage.set(baseName, id + 1);
     return candidate;
-}
-
-function renameBinding(path: NodePath, oldName: string, newName: string): void {
-    // Babel's scope.rename updates the binding identifier plus every
-    // reference to it within this scope. It also updates child scopes'
-    // bindings/references because they share the parent's reference set.
-    path.scope.rename(oldName, newName);
 }
 
 // ---------------------------------------------------------------------------

@@ -354,8 +354,20 @@ function defIsConditional(defPath: NodePath, usePath: NodePath): boolean {
 }
 
 function useIsInsideLoopOutOfDef(defPath: NodePath, usePath: NodePath): boolean {
+    // Walk up from use, stopping at any common ancestor with def. If we cross
+    // a loop *before* reaching common ancestry, the use is inside a loop that
+    // def is outside of → bail. If def lives inside the same loop (def runs
+    // per-iteration too), the common ancestor sits between use and the loop,
+    // so we stop short and return false.
+    const defAncestors = new Set<t.Node>();
+    let dp: NodePath | null = defPath;
+    while (dp) {
+        defAncestors.add(dp.node);
+        dp = dp.parentPath;
+    }
     let p: NodePath | null = usePath.parentPath;
-    while (p && p.node !== defPath.node) {
+    while (p) {
+        if (defAncestors.has(p.node)) return false;
         if (
             t.isForStatement(p.node) ||
             t.isForInStatement(p.node) ||

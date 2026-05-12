@@ -23,7 +23,11 @@ import * as nodePath from 'node:path';
 
 import * as t from '@babel/types';
 
-import { commentIsFlattenDirective, commentIsInlineDirective } from './directives';
+import {
+    commentIsFlattenDirective,
+    commentIsInlineDirective,
+    hasLeadingDirective,
+} from './directives';
 import { getSlot } from './node-util';
 import {
     type FileIndex,
@@ -181,7 +185,7 @@ function discoverCandidates(
         if (t.isFunctionDeclaration(n) && n.id) {
             const params = paramNames(n);
             if (params === null) return;
-            const annotated = hasInlineAnnotation(n);
+            const annotated = hasInlineAnnotation(n, parent);
             const c: Candidate = {
                 name: n.id.name,
                 callee: { fn: n, paramNames: params },
@@ -204,7 +208,7 @@ function discoverCandidates(
             ) {
                 const params = paramNames(d.init);
                 if (params === null) return;
-                const annotated = hasInlineAnnotation(n) || hasInlineAnnotation(d.init);
+                const annotated = hasInlineAnnotation(n, parent) || hasInlineAnnotation(d.init);
                 const c: Candidate = {
                     name: d.id.name,
                     callee: { fn: d.init, paramNames: params },
@@ -234,22 +238,12 @@ function paramNames(fn: t.Function): string[] | null {
     return out;
 }
 
-function hasInlineAnnotation(n: t.Node): boolean {
-    const cs = (n.leadingComments ?? []) as t.Comment[];
-    for (const c of cs) {
-        if (c.type === 'CommentBlock' && commentIsInlineDirective(c.value)) return true;
-        if (c.type === 'CommentLine' && commentIsInlineDirective(c.value)) return true;
-    }
-    return false;
+function hasInlineAnnotation(n: t.Node, parent: t.Node | null = null): boolean {
+    return hasLeadingDirective(n, parent, commentIsInlineDirective);
 }
 
-function hasFlattenAnnotation(n: t.Node): boolean {
-    const cs = (n.leadingComments ?? []) as t.Comment[];
-    for (const c of cs) {
-        if (c.type === 'CommentBlock' && commentIsFlattenDirective(c.value)) return true;
-        if (c.type === 'CommentLine' && commentIsFlattenDirective(c.value)) return true;
-    }
-    return false;
+function hasFlattenAnnotation(n: t.Node, parent: t.Node | null = null): boolean {
+    return hasLeadingDirective(n, parent, commentIsFlattenDirective);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +302,7 @@ function collectCallSites(
     ): void => {
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
-            flattenStack.push(hasFlattenAnnotation(n));
+            flattenStack.push(hasFlattenAnnotation(n, parent));
         }
 
         // If this is a Statement child of a Block/Program, update stmtCtx.
@@ -507,6 +501,10 @@ function buildCrossFileCandidate(
     // body calls another donor function, the splice would leave an unbound
     // reference in the consumer. Bail.
     if (donorFn.functionRefs.size > 0) return null;
+    // Donor body references a top-level binding we can't classify
+    // (e.g. TS enums, classes) — the hoister wouldn't know how to bring
+    // it along. Bail rather than emitting a broken inline.
+    if (donorFn.unresolvedRefs.size > 0) return null;
 
     const params: string[] = [];
     for (const p of donorFn.params) {
@@ -648,7 +646,7 @@ function hoistRequiredModuleVars(ast: t.File, xfile: CrossFileCtx): void {
         }
     }
 
-    const toInsert: t.VariableDeclaration[] = [];
+    const toInsert: t.Statement[] = [];
     const insertedKeys = new Set<string>();
 
     for (const [key, req] of xfile.requiredModuleVars) {
@@ -656,7 +654,7 @@ function hoistRequiredModuleVars(ast: t.File, xfile: CrossFileCtx): void {
         if (consumerLocals.has(req.name)) continue;
         const cloned = cloneModuleVarForHoisting(req.moduleVar, req.name);
         if (!cloned) continue;
-        toInsert.push(cloned);
+        toInsert.push(...cloned);
         insertedKeys.add(key);
     }
 
@@ -674,14 +672,117 @@ function hoistRequiredModuleVars(ast: t.File, xfile: CrossFileCtx): void {
 function cloneModuleVarForHoisting(
     moduleVar: ModuleVar,
     name: string,
-): t.VariableDeclaration | null {
-    const matching = moduleVar.declaration.declarations.find(
+): t.Statement[] | null {
+    const decl = moduleVar.declaration;
+    if (t.isTSEnumDeclaration(decl)) {
+        if (decl.id.name !== name) return null;
+        return lowerTsEnumToJs(decl);
+    }
+    const matching = decl.declarations.find(
         (d) => t.isIdentifier(d.id) && d.id.name === name,
     );
     if (!matching) return null;
-    return t.variableDeclaration(moduleVar.declaration.kind, [
-        t.cloneNode(matching, true, false),
-    ]);
+    return [t.variableDeclaration(decl.kind, [t.cloneNode(matching, true, false)])];
+}
+
+// Lower a TSEnumDeclaration to the TypeScript-equivalent JS emit. Matches
+// `tsc --target esnext` output: numeric members get reverse-mapping; string
+// members get forward-only assignment. Returns null if any member has a
+// non-literal initializer we can't evaluate at compile time.
+//
+//   enum E { A = 0, B = 1 }
+// becomes:
+//   var E;
+//   (function (E) {
+//       E[E["A"] = 0] = "A";
+//       E[E["B"] = 1] = "B";
+//   })(E || (E = {}));
+function lowerTsEnumToJs(decl: t.TSEnumDeclaration): t.Statement[] | null {
+    const name = decl.id.name;
+    type Resolved = { key: string; value: t.NumericLiteral | t.StringLiteral };
+    const resolved: Resolved[] = [];
+    let nextNumeric: number | null = 0;
+
+    for (const m of decl.members) {
+        const keyName = t.isIdentifier(m.id)
+            ? m.id.name
+            : t.isStringLiteral(m.id)
+              ? m.id.value
+              : null;
+        if (keyName === null) return null;
+
+        let value: t.NumericLiteral | t.StringLiteral;
+        if (m.initializer) {
+            const init = m.initializer;
+            if (t.isNumericLiteral(init)) {
+                value = t.numericLiteral(init.value);
+                nextNumeric = init.value + 1;
+            } else if (
+                t.isUnaryExpression(init) &&
+                init.operator === '-' &&
+                t.isNumericLiteral(init.argument)
+            ) {
+                value = t.numericLiteral(-init.argument.value);
+                nextNumeric = (value.value as number) + 1;
+            } else if (t.isStringLiteral(init)) {
+                value = t.stringLiteral(init.value);
+                // After a string init, auto-increment is no longer valid in TS.
+                nextNumeric = null;
+            } else {
+                return null;
+            }
+        } else {
+            if (nextNumeric === null) return null;
+            value = t.numericLiteral(nextNumeric);
+            nextNumeric += 1;
+        }
+        resolved.push({ key: keyName, value });
+    }
+
+    const idRef = (): t.Identifier => t.identifier(name);
+    const bodyStmts: t.Statement[] = resolved.map(({ key, value }) => {
+        if (t.isStringLiteral(value)) {
+            // E["KEY"] = "VAL";  (no reverse mapping for string members)
+            return t.expressionStatement(
+                t.assignmentExpression(
+                    '=',
+                    t.memberExpression(idRef(), t.stringLiteral(key), true),
+                    value,
+                ),
+            );
+        }
+        // E[E["KEY"] = VAL] = "KEY";  (reverse mapping for numeric members)
+        return t.expressionStatement(
+            t.assignmentExpression(
+                '=',
+                t.memberExpression(
+                    idRef(),
+                    t.assignmentExpression(
+                        '=',
+                        t.memberExpression(idRef(), t.stringLiteral(key), true),
+                        value,
+                    ),
+                    true,
+                ),
+                t.stringLiteral(key),
+            ),
+        );
+    });
+
+    const iife = t.expressionStatement(
+        t.callExpression(
+            t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)),
+            [
+                t.logicalExpression(
+                    '||',
+                    idRef(),
+                    t.assignmentExpression('=', idRef(), t.objectExpression([])),
+                ),
+            ],
+        ),
+    );
+
+    return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
 }
 
 // ---------------------------------------------------------------------------

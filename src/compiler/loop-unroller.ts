@@ -102,10 +102,16 @@ function iterationStmts(
     varName: string,
     replacement: t.Expression,
 ): t.Statement[] {
+    // Each iteration becomes its own BlockStatement so per-iteration
+    // let/const/class/fn-decl bindings stay isolated. The simplifier's
+    // demand-driven α-rename (see normalize.renameForFlatten) renames
+    // colliding inner bindings before block-flatten merges them, so the
+    // wrappers don't ossify — they collapse into the parent once names
+    // are unique.
     if (t.isBlockStatement(body)) {
         const clonedBlock = t.cloneNode(body, true, true);
         substitute(clonedBlock, varName, replacement, false);
-        return clonedBlock.body;
+        return [clonedBlock];
     }
     return [cloneAndSubstitute(body, varName, replacement)];
 }

@@ -33,6 +33,31 @@ describe('PeepholeRemoveDeadCode', () => {
         expect(r.code).toContain('return 1');
     });
 
+    it('flips empty-consequent if into negated if', () => {
+        // Closure tryFoldIf rule: `if (x) {} else { Y }` → `if (!x) { Y }`.
+        // Post-inline shape: contact-constraints' `if (part.totalLambda === 0) return;`
+        // collapses the early-return into an empty consequent, leaving the
+        // body to run unconditionally — but with this rule it stays guarded.
+        const r = rm('function f(x) { if (x === 0) {} else { use(x); } }');
+        expect(r.code).toContain('if (x !== 0)');
+        expect(r.code).toContain('use(x)');
+        expect(r.code).not.toMatch(/else\s*\{/);
+    });
+
+    it('flips empty-consequent if with EmptyStatement form', () => {
+        // The post-FunctionToBlockMutator shape is literally `if (X) ; else { Y }`.
+        const r = rm('function f(x) { if (x === 0) ; else { use(x); } }');
+        expect(r.code).toContain('if (x !== 0)');
+        expect(r.code).toContain('use(x)');
+    });
+
+    it('drops empty else branch', () => {
+        // Closure tryFoldIf: `if (x) { ... } else {}` → `if (x) { ... }`.
+        const r = rm('function f(x) { if (x) { use(x); } else {} }');
+        expect(r.code).toContain('if (x)');
+        expect(r.code).not.toMatch(/else\s*\{/);
+    });
+
     it('folds conditional expression with literal test', () => {
         expect(rm('var x = true ? 1 : 2;').code).toContain('var x = 1');
         expect(rm('var x = false ? 1 : 2;').code).toContain('var x = 2');
@@ -104,6 +129,51 @@ describe('PeepholeRemoveDeadCode', () => {
         const r = rm('function f() { if (foo()) { return 1; } else { return 2; } }');
         expect(r.code).toContain('foo()');
         expect(r.code).toContain('if');
+    });
+});
+
+describe('PeepholeRemoveDeadCode — tryFoldLabel', () => {
+    // Closure PRDC.java:138-177 + RenameLabels.java:222-232. Surfaces after the
+    // FunctionToBlockMutator's labeled wrapper has its only `break L;` minimised
+    // away by PeepholeMinimizeConditions — the label is dead and should drop so
+    // the inner block can merge into its parent scope.
+    it('drops empty labeled statement', () => {
+        const r = rm('function f() { L: ; }');
+        expect(r.code).not.toContain('L:');
+    });
+
+    it('drops labeled empty block', () => {
+        const r = rm('function f() { L: {} }');
+        expect(r.code).not.toContain('L:');
+    });
+
+    it('drops labeled single-break-self block', () => {
+        const r = rm('function f() { L: { break L; } }');
+        expect(r.code).not.toContain('L:');
+        expect(r.code).not.toContain('break');
+    });
+
+    it('drops label when body has no break/continue to it (unwraps)', () => {
+        const r = rm('function f() { L: { foo(); bar(); } }');
+        expect(r.code).not.toContain('L:');
+        expect(r.code).toContain('foo()');
+        expect(r.code).toContain('bar()');
+    });
+
+    it('keeps label when body still references it', () => {
+        const r = rm('function f(x) { L: { foo(); if (x) break L; bar(); } }');
+        expect(r.code).toContain('L:');
+        expect(r.code).toContain('break L');
+    });
+
+    it('keeps label when continue targets it from inside a loop', () => {
+        const r = rm('function f() { L: while (x) { if (y) continue L; foo(); } }');
+        expect(r.code).toContain('L:');
+    });
+
+    it('does not unwrap label when nested loop continue targets it', () => {
+        const r = rm('function f() { L: while (a) { while (b) { continue L; } } }');
+        expect(r.code).toContain('L:');
     });
 });
 

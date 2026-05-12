@@ -12,11 +12,11 @@
 //   - statements after return/throw/break/continue dropped
 //   - comma expression with pure left side: (pure, x) → x
 //   - empty `if` / empty `else` cleanup
+//   - unused / single-break labels dropped (PRDC.tryFoldLabel + RenameLabels)
 //
 // Not covered (deferred):
 //   - switch case folding
 //   - try/catch/finally optimization
-//   - label removal (classic dce.ts handles unused labels via scope)
 //   - optional-chain folding
 //   - var/let hoisting through dead branches
 //
@@ -101,13 +101,110 @@ function tryRemove(n: t.Node): t.Node | null | undefined {
     if (t.isDoWhileStatement(n)) return foldDoWhile(n);
     if (t.isExpressionStatement(n)) return foldExpressionStatement(n);
     if (t.isSequenceExpression(n)) return foldSequence(n);
+    if (t.isLabeledStatement(n)) return foldLabel(n);
     return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Labels
+//
+// Port of PeepholeRemoveDeadCode.tryFoldLabel (PRDC.java:138-177) plus the
+// "unreferenced label" cleanup from RenameLabels.java:222-232. Closure splits
+// these between two passes; we fold them together since we don't run a
+// separate label-renaming pass and the cost is identical.
+
+function foldLabel(n: t.LabeledStatement): t.Node | null | undefined {
+    const labelName = n.label.name;
+    const stmt = n.body;
+
+    // PRDC.java:141-145 — `L: ;` → drop.
+    if (t.isEmptyStatement(stmt)) return null;
+
+    // PRDC.java:147-157 — `L: {}` → drop.
+    if (t.isBlockStatement(stmt) && stmt.body.length === 0) return null;
+
+    // PRDC.java:159-175 — `L: break L;` (possibly wrapped in a single-stmt
+    // block) → drop. We additionally fold the general "unreferenced label"
+    // case from RenameLabels: if the body contains no `break L` / `continue L`
+    // anywhere, unwrap the label. This is the case that lets inlined-call
+    // blocks merge into the surrounding scope after the early-return break
+    // gets minimised away by PeepholeMinimizeConditions.
+    if (!isLabelReferenced(labelName, stmt)) {
+        return stmt;
+    }
+
+    // Closure's getOnlyInterestingChild handles `L: { break L; }` even when
+    // the block has other (uninteresting) children. We already covered the
+    // empty-block case; what remains is a block whose sole effective stmt
+    // is `break L`. Since `isLabelReferenced` returned true here, there is
+    // at least one reference — verify it's exactly a top-level `break L` in
+    // a single-stmt block.
+    if (t.isBlockStatement(stmt) && stmt.body.length === 1) {
+        const only = stmt.body[0];
+        if (
+            t.isBreakStatement(only) &&
+            only.label != null &&
+            only.label.name === labelName
+        ) {
+            return null;
+        }
+    }
+    return undefined;
+}
+
+function isLabelReferenced(labelName: string, root: t.Node): boolean {
+    let found = false;
+    const visit = (n: t.Node): void => {
+        if (found) return;
+        if (
+            (t.isBreakStatement(n) || t.isContinueStatement(n)) &&
+            n.label != null &&
+            n.label.name === labelName
+        ) {
+            found = true;
+            return;
+        }
+        // Nested labels with the same name shadow the outer one; Closure's
+        // RenameLabels uses a per-scope namespace, so we must stop recursing
+        // into a labelled subtree that re-binds the same name.
+        if (t.isLabeledStatement(n) && n.label.name === labelName) {
+            return;
+        }
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child == null) continue;
+            if (Array.isArray(child)) {
+                for (const c of child) if (c) visit(c);
+            } else if (typeof (child as { type?: string }).type === 'string') {
+                visit(child as t.Node);
+            }
+        }
+    };
+    visit(root);
+    return found;
 }
 
 // ---------------------------------------------------------------------------
 // If / Conditional
 
 function foldIfStatement(n: t.IfStatement): t.Node | null | undefined {
+    // Closure PeepholeRemoveDeadCode.tryFoldIf: `if (x) { ... } else {}` →
+    // drop the empty alternate. Run first so subsequent rules see the
+    // canonicalized shape.
+    if (n.alternate != null && isEmpty(n.alternate)) {
+        n.alternate = null;
+        // Fall through with updated shape.
+    }
+
+    // Closure PeepholeRemoveDeadCode.tryFoldIf: `if (x) {} else { ... }` →
+    // `if (!x) { ... }`. Surfaced by post-inline shapes like
+    // `if (cond) return; else { body }` collapsing the early-return branch
+    // to an empty placeholder while `body` survives.
+    if (isEmpty(n.consequent) && n.alternate != null && !isEmpty(n.alternate)) {
+        const negated = negateTest(n.test);
+        return t.ifStatement(negated, n.alternate, null);
+    }
+
     const b = asBoolean(n.test);
     if (b === true) {
         if (mayHaveSideEffects(n.test)) return undefined;
@@ -124,6 +221,27 @@ function foldIfStatement(n: t.IfStatement): t.Node | null | undefined {
         return t.expressionStatement(n.test);
     }
     return undefined;
+}
+
+// Negate a condition expression. `!x` → `x`; `x === y` → `x !== y` etc.;
+// otherwise wrap in `!`. Mirrors Closure's NOT-wrapping in tryFoldIf —
+// PeepholeMinimizeConditions later collapses double negations / picks the
+// shorter form.
+function negateTest(test: t.Expression): t.Expression {
+    if (t.isUnaryExpression(test) && test.operator === '!') {
+        return test.argument;
+    }
+    if (t.isBinaryExpression(test)) {
+        const flip: Partial<Record<t.BinaryExpression['operator'], t.BinaryExpression['operator']>> = {
+            '==': '!=',
+            '!=': '==',
+            '===': '!==',
+            '!==': '===',
+        };
+        const op = flip[test.operator];
+        if (op) return t.binaryExpression(op, test.left, test.right);
+    }
+    return t.unaryExpression('!', test, /* prefix */ true);
 }
 
 function foldConditional(n: t.ConditionalExpression): t.Node | undefined {

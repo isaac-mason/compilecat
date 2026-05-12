@@ -65,6 +65,11 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
         allowLibraryInline: options.allowLibraryInline,
     });
     const unr = unrollLoops(ast);
+    // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
+    // before SROA so its escape analysis sees only direct `name[i]` uses.
+    // Without this, a cascade-induced alias of an SROA candidate poisons the
+    // candidate's escape check (`init` of a VariableDeclarator is rejected).
+    const ivarPre = inlineVariables(ast);
     const sroa = applySroa(ast);
     // Normalize before the simplifier fixpoint. Closure runs Normalize before
     // its optimization pass group; passes downstream (block flatten, let→var
@@ -72,9 +77,9 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
     makeDeclaredNamesUnique(ast);
     const simp = simplifyAll(ast);
     const ivar = inlineVariables(ast);
+    ivar.inlined += ivarPre.inlined;
     const ruc = removeUnusedCode(ast);
 
-    // biome-ignore lint/suspicious/noExplicitAny: generator default-import shim
     const gen = generate as unknown as (n: t.Node, opts?: any) => { code: string; map: any };
     const out = gen(ast, {
         sourceMaps: options.sourceMaps === true,

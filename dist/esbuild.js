@@ -1,6 +1,6 @@
 import { createUnplugin } from 'unplugin';
-import { parse } from '@babel/parser';
 import * as t from '@babel/types';
+import { parse } from '@babel/parser';
 import _generate from '@babel/generator';
 import _traverse from '@babel/traverse';
 import * as fs from 'node:fs';
@@ -23,6 +23,32 @@ function commentIsInlineDirective(value) {
 }
 function commentIsFlattenDirective(value) {
     return DIRECTIVE_PATTERNS.flatten.test(value) || DIRECTIVE_PATTERNS.optimize.test(value);
+}
+function commentIsSroaDirective(value) {
+    return DIRECTIVE_PATTERNS.sroa.test(value) || DIRECTIVE_PATTERNS.optimize.test(value);
+}
+function isExportWrapper(n) {
+    return n !== null && (t.isExportNamedDeclaration(n) || t.isExportDefaultDeclaration(n));
+}
+// Babel attaches JSDoc preceding `export function` / `export default function`
+// (and `export const foo = ...`) to the export wrapper, not the inner
+// declaration. `hasLeadingDirective` checks the node's own leadingComments and
+// falls back to the wrapping parent's, so authored `@inline`/`@optimize`/etc.
+// on the export node still counts.
+function hasLeadingDirective(n, parent, pred) {
+    if (matchLeadingComment(n, pred))
+        return true;
+    if (isExportWrapper(parent) && matchLeadingComment(parent, pred))
+        return true;
+    return false;
+}
+function matchLeadingComment(n, pred) {
+    const cs = (n.leadingComments ?? []);
+    for (const c of cs) {
+        if (pred(c.value))
+            return true;
+    }
+    return false;
 }
 
 // Babel ships its packages as CJS with a `default` export. Under some
@@ -71,13 +97,8 @@ function indexFile(absolutePath, ast) {
     for (const stmt of ast.program.body) {
         collectStatement(stmt, absolutePath, functions, moduleVars, imports, namespaceReexports, false, false);
     }
-    const topLevelNames = new Set([
-        ...functions.keys(),
-        ...moduleVars.keys(),
-        ...imports.keys(),
-    ]);
     for (const fn of functions.values()) {
-        analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast);
+        analyzeFreeRefs(fn, functions, moduleVars, imports, ast);
     }
     return { absolutePath, ast, functions, moduleVars, imports, namespaceReexports };
 }
@@ -112,6 +133,10 @@ function collectStatement(stmt, sourceFile, functions, moduleVars, imports, name
     }
     if (t.isFunctionDeclaration(stmt) && stmt.id) {
         functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, localInline, localFlatten));
+        return;
+    }
+    if (t.isTSEnumDeclaration(stmt)) {
+        moduleVars.set(stmt.id.name, { name: stmt.id.name, declaration: stmt, isExported: false });
         return;
     }
     if (t.isVariableDeclaration(stmt)) {
@@ -154,6 +179,7 @@ function buildFunctionEntry(name, sourceFile, fn, inlineAnnot, flattenAnnot) {
         moduleVarRefs: new Set(),
         functionRefs: new Set(),
         importRefs: new Set(),
+        unresolvedRefs: new Set(),
     };
 }
 function classifyBody(body) {
@@ -198,7 +224,7 @@ function recordImports(decl, imports) {
         }
     }
 }
-function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast) {
+function analyzeFreeRefs(fn, functions, moduleVars, imports, ast) {
     let rootPath = null;
     traverse(ast, {
         FunctionDeclaration(path) {
@@ -231,17 +257,18 @@ function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast)
     if (!rootPath)
         return;
     const safePath = rootPath;
+    // Babel's scope plugin doesn't bind TSEnumDeclaration (and a few other TS-only
+    // forms), so `getBinding` is `null` for valid top-level enum refs. When the
+    // scope is silent, fall back to the top-level index — `getBinding` would have
+    // returned a *non-Program* binding if any inner local shadowed the name, so a
+    // null result is safe to resolve against module-scope.
     safePath.traverse({
         Identifier(innerPath) {
             const name = innerPath.node.name;
-            if (!topLevelNames.has(name))
-                return;
             if (!innerPath.isReferencedIdentifier())
                 return;
             const scopeBinding = innerPath.scope.getBinding(name);
-            if (!scopeBinding)
-                return;
-            if (scopeBinding.scope.block.type !== 'Program')
+            if (scopeBinding && scopeBinding.scope.block.type !== 'Program')
                 return;
             if (functions.has(name))
                 fn.functionRefs.add(name);
@@ -249,6 +276,8 @@ function analyzeFreeRefs(fn, topLevelNames, functions, moduleVars, imports, ast)
                 fn.moduleVarRefs.add(name);
             else if (imports.has(name))
                 fn.importRefs.add(name);
+            else if (scopeBinding)
+                fn.unresolvedRefs.add(name);
         },
     });
 }
@@ -552,12 +581,96 @@ function canMergeBlockChild(c) {
  * child count) when the merge happened, or 0 when it was rejected.
  */
 function tryMergeBlock(block, parentBody, indexInParent, parent, ignoreBlockScopedDeclarations) {
-    const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
-    if (!isStatementBlock(parent) || !canMerge)
+    if (!isStatementBlock(parent))
         return 0;
+    const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
+    if (!canMerge)
+        return 0;
+    // Even when names are ancestor-unique, sibling block-scoped decls inside
+    // the same statement-list can still collide on merge. Block-flatten with
+    // `ignoreBlockScopedDeclarations=true` assumes nested names are unique
+    // vs ancestors; it does NOT assume sibling-block uniqueness. Refuse the
+    // merge when splicing would introduce a duplicate let/const/class/fn
+    // binding name into `parentBody`.
+    if (ignoreBlockScopedDeclarations) {
+        const incoming = collectBlockScopedNames(block.body);
+        if (incoming.size > 0) {
+            for (let i = 0; i < parentBody.length; i++) {
+                if (i === indexInParent)
+                    continue;
+                const sibling = parentBody[i];
+                if (sibling === undefined)
+                    continue;
+                if (siblingDeclaresAny(sibling, incoming))
+                    return 0;
+            }
+        }
+    }
     const inserted = block.body.length;
     parentBody.splice(indexInParent, 1, ...block.body);
     return inserted;
+}
+function collectBlockScopedNames(stmts) {
+    const out = new Set();
+    for (const s of stmts)
+        collectBlockScopedNamesInto(s, out);
+    return out;
+}
+function collectBlockScopedNamesInto(s, out) {
+    if (t.isLabeledStatement(s)) {
+        collectBlockScopedNamesInto(s.body, out);
+        return;
+    }
+    if (t.isVariableDeclaration(s) && (s.kind === 'const' || s.kind === 'let')) {
+        for (const d of s.declarations)
+            collectPatternNames(d.id, out);
+        return;
+    }
+    if (t.isClassDeclaration(s) && s.id !== null && s.id !== undefined) {
+        out.add(s.id.name);
+        return;
+    }
+    if (t.isFunctionDeclaration(s) && s.id !== null && s.id !== undefined) {
+        out.add(s.id.name);
+        return;
+    }
+}
+function siblingDeclaresAny(s, names) {
+    const declared = new Set();
+    collectBlockScopedNamesInto(s, declared);
+    for (const n of declared)
+        if (names.has(n))
+            return true;
+    return false;
+}
+function collectPatternNames(pat, out) {
+    if (t.isIdentifier(pat)) {
+        out.add(pat.name);
+        return;
+    }
+    if (t.isArrayPattern(pat)) {
+        for (const el of pat.elements)
+            if (el !== null)
+                collectPatternNames(el, out);
+        return;
+    }
+    if (t.isObjectPattern(pat)) {
+        for (const prop of pat.properties) {
+            if (t.isRestElement(prop))
+                collectPatternNames(prop.argument, out);
+            else if (t.isObjectProperty(prop))
+                collectPatternNames(prop.value, out);
+        }
+        return;
+    }
+    if (t.isRestElement(pat)) {
+        collectPatternNames(pat.argument, out);
+        return;
+    }
+    if (t.isAssignmentPattern(pat)) {
+        collectPatternNames(pat.left, out);
+        return;
+    }
 }
 /**
  * Closure's `isLiteralValue` — recognises primitive literal nodes used by
@@ -2276,7 +2389,7 @@ function discoverCandidates(root, out) {
             const params = paramNames(n);
             if (params === null)
                 return;
-            const annotated = hasInlineAnnotation(n);
+            const annotated = hasInlineAnnotation(n, parent);
             const c = {
                 name: n.id.name,
                 callee: { fn: n, paramNames: params },
@@ -2297,7 +2410,7 @@ function discoverCandidates(root, out) {
                 const params = paramNames(d.init);
                 if (params === null)
                     return;
-                const annotated = hasInlineAnnotation(n) || hasInlineAnnotation(d.init);
+                const annotated = hasInlineAnnotation(n, parent) || hasInlineAnnotation(d.init);
                 const c = {
                     name: d.id.name,
                     callee: { fn: d.init, paramNames: params },
@@ -2322,25 +2435,11 @@ function paramNames(fn) {
     }
     return out;
 }
-function hasInlineAnnotation(n) {
-    const cs = (n.leadingComments ?? []);
-    for (const c of cs) {
-        if (c.type === 'CommentBlock' && commentIsInlineDirective(c.value))
-            return true;
-        if (c.type === 'CommentLine' && commentIsInlineDirective(c.value))
-            return true;
-    }
-    return false;
+function hasInlineAnnotation(n, parent = null) {
+    return hasLeadingDirective(n, parent, commentIsInlineDirective);
 }
-function hasFlattenAnnotation(n) {
-    const cs = (n.leadingComments ?? []);
-    for (const c of cs) {
-        if (c.type === 'CommentBlock' && commentIsFlattenDirective(c.value))
-            return true;
-        if (c.type === 'CommentLine' && commentIsFlattenDirective(c.value))
-            return true;
-    }
-    return false;
+function hasFlattenAnnotation(n, parent = null) {
+    return hasLeadingDirective(n, parent, commentIsFlattenDirective);
 }
 function buildCrossFileCtx(root, opts) {
     if (!opts.consumerPath || !opts.fileCache)
@@ -2369,7 +2468,7 @@ function collectCallSites(root, candidates, xfile) {
     stmtCtx) => {
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
-            flattenStack.push(hasFlattenAnnotation(n));
+            flattenStack.push(hasFlattenAnnotation(n, parent));
         }
         // If this is a Statement child of a Block/Program, update stmtCtx.
         let nextStmtCtx = stmtCtx;
@@ -2529,6 +2628,11 @@ function buildCrossFileCandidate(donorFn, donorPath, donorIndex) {
     // reference in the consumer. Bail.
     if (donorFn.functionRefs.size > 0)
         return null;
+    // Donor body references a top-level binding we can't classify
+    // (e.g. TS enums, classes) — the hoister wouldn't know how to bring
+    // it along. Bail rather than emitting a broken inline.
+    if (donorFn.unresolvedRefs.size > 0)
+        return null;
     const params = [];
     for (const p of donorFn.params) {
         if (!t.isIdentifier(p))
@@ -2668,7 +2772,7 @@ function hoistRequiredModuleVars(ast, xfile) {
         const cloned = cloneModuleVarForHoisting(req.moduleVar, req.name);
         if (!cloned)
             continue;
-        toInsert.push(cloned);
+        toInsert.push(...cloned);
         insertedKeys.add(key);
     }
     if (toInsert.length === 0)
@@ -2684,12 +2788,84 @@ function hoistRequiredModuleVars(ast, xfile) {
     body.splice(insertAt, 0, ...toInsert);
 }
 function cloneModuleVarForHoisting(moduleVar, name) {
-    const matching = moduleVar.declaration.declarations.find((d) => t.isIdentifier(d.id) && d.id.name === name);
+    const decl = moduleVar.declaration;
+    if (t.isTSEnumDeclaration(decl)) {
+        if (decl.id.name !== name)
+            return null;
+        return lowerTsEnumToJs(decl);
+    }
+    const matching = decl.declarations.find((d) => t.isIdentifier(d.id) && d.id.name === name);
     if (!matching)
         return null;
-    return t.variableDeclaration(moduleVar.declaration.kind, [
-        t.cloneNode(matching, true, false),
-    ]);
+    return [t.variableDeclaration(decl.kind, [t.cloneNode(matching, true, false)])];
+}
+// Lower a TSEnumDeclaration to the TypeScript-equivalent JS emit. Matches
+// `tsc --target esnext` output: numeric members get reverse-mapping; string
+// members get forward-only assignment. Returns null if any member has a
+// non-literal initializer we can't evaluate at compile time.
+//
+//   enum E { A = 0, B = 1 }
+// becomes:
+//   var E;
+//   (function (E) {
+//       E[E["A"] = 0] = "A";
+//       E[E["B"] = 1] = "B";
+//   })(E || (E = {}));
+function lowerTsEnumToJs(decl) {
+    const name = decl.id.name;
+    const resolved = [];
+    let nextNumeric = 0;
+    for (const m of decl.members) {
+        const keyName = t.isIdentifier(m.id)
+            ? m.id.name
+            : t.isStringLiteral(m.id)
+                ? m.id.value
+                : null;
+        if (keyName === null)
+            return null;
+        let value;
+        if (m.initializer) {
+            const init = m.initializer;
+            if (t.isNumericLiteral(init)) {
+                value = t.numericLiteral(init.value);
+                nextNumeric = init.value + 1;
+            }
+            else if (t.isUnaryExpression(init) &&
+                init.operator === '-' &&
+                t.isNumericLiteral(init.argument)) {
+                value = t.numericLiteral(-init.argument.value);
+                nextNumeric = value.value + 1;
+            }
+            else if (t.isStringLiteral(init)) {
+                value = t.stringLiteral(init.value);
+                // After a string init, auto-increment is no longer valid in TS.
+                nextNumeric = null;
+            }
+            else {
+                return null;
+            }
+        }
+        else {
+            if (nextNumeric === null)
+                return null;
+            value = t.numericLiteral(nextNumeric);
+            nextNumeric += 1;
+        }
+        resolved.push({ key: keyName, value });
+    }
+    const idRef = () => t.identifier(name);
+    const bodyStmts = resolved.map(({ key, value }) => {
+        if (t.isStringLiteral(value)) {
+            // E["KEY"] = "VAL";  (no reverse mapping for string members)
+            return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value));
+        }
+        // E[E["KEY"] = VAL] = "KEY";  (reverse mapping for numeric members)
+        return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value), true), t.stringLiteral(key)));
+    });
+    const iife = t.expressionStatement(t.callExpression(t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)), [
+        t.logicalExpression('||', idRef(), t.assignmentExpression('=', idRef(), t.objectExpression([]))),
+    ]));
+    return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
 }
 // ---------------------------------------------------------------------------
 function hasInlineAnnotationOnCall(call, parent, key) {
@@ -3143,8 +3319,21 @@ function defIsConditional(defPath, usePath) {
     return false;
 }
 function useIsInsideLoopOutOfDef(defPath, usePath) {
+    // Walk up from use, stopping at any common ancestor with def. If we cross
+    // a loop *before* reaching common ancestry, the use is inside a loop that
+    // def is outside of → bail. If def lives inside the same loop (def runs
+    // per-iteration too), the common ancestor sits between use and the loop,
+    // so we stop short and return false.
+    const defAncestors = new Set();
+    let dp = defPath;
+    while (dp) {
+        defAncestors.add(dp.node);
+        dp = dp.parentPath;
+    }
     let p = usePath.parentPath;
-    while (p && p.node !== defPath.node) {
+    while (p) {
+        if (defAncestors.has(p.node))
+            return false;
         if (t.isForStatement(p.node) ||
             t.isForInStatement(p.node) ||
             t.isForOfStatement(p.node) ||
@@ -3238,10 +3427,16 @@ function expandFor(node) {
     return out;
 }
 function iterationStmts(body, varName, replacement) {
+    // Each iteration becomes its own BlockStatement so per-iteration
+    // let/const/class/fn-decl bindings stay isolated. The simplifier's
+    // demand-driven α-rename (see normalize.renameForFlatten) renames
+    // colliding inner bindings before block-flatten merges them, so the
+    // wrappers don't ossify — they collapse into the parent once names
+    // are unique.
     if (t.isBlockStatement(body)) {
         const clonedBlock = t.cloneNode(body, true, true);
         substitute(clonedBlock, varName, replacement, false);
-        return clonedBlock.body;
+        return [clonedBlock];
     }
     return [cloneAndSubstitute(body, varName, replacement)];
 }
@@ -3573,9 +3768,9 @@ function hasOptimizeAnnotation(n) {
 }
 
 // Port of jscomp/Normalize.java + jscomp/MakeDeclaredNamesUnique.java
-// (ContextualRenamer subset).
+// (InlineRenamer-style subset).
 //
-// Two-stage pass mirroring Closure's NormalizeStatements + ContextualRenamer:
+// Two stages:
 //
 //   1. Structural normalizations (Closure NormalizeStatements):
 //      - Rewrite blockless arrow function bodies to block-with-return
@@ -3590,151 +3785,142 @@ function hasOptimizeAnnotation(n) {
 //        for-init liveness. Skipped for `let`/`const`/`class`/`function`
 //        per-iteration block-scoped semantics.
 //
-//   2. Renaming (ContextualRenamer):
-//      Every locally-declared name is uniquified across the whole program.
-//      After this pass, downstream passes (block-flatten, let→var lowering)
-//      can act on the assumption that hoisting a binding out of an inner
-//      block can never collide with another binding — the assumption Closure
-//      encodes via NodeUtil.tryMergeBlock's `ignoreBlockScopedDeclarations`
-//      flag passed as `isASTNormalized()`.
+//   2. Demand-driven α-rename (`renameForFlatten`, run per-function from the
+//      simplifier — not from this file's entry):
+//      Models Closure's InlineRenamer (MakeDeclaredNamesUnique.java:497-562):
+//      rename only where a collision is actually possible. Closure's
+//      ContextualRenamer (file-wide eager rename) sprays `__N` suffixes
+//      across every function that happens to share a name with any other
+//      function's locals — even when those names will never end up in the
+//      same scope. The output noise (`cp__3`, `i__7`) makes the intermediate
+//      code we ship to a bundler much harder to read.
 //
-// Algorithm (mirrors ContextualRenamer in MakeDeclaredNamesUnique.java:683):
+//      Instead, we rename only within a single function's own subtree, and
+//      only when a nested block's binding would clash with an ancestor binding
+//      *within that same function*. Cross-function name reuse is left alone
+//      — distinct function scopes can never collide.
 //
-//   - Maintain a shared `nameUsage` Map<string, count> for the whole file —
-//     tracks how many times each base name has been declared anywhere.
-//   - Walk every scope top-down. For each binding declared directly in the
-//     scope:
-//       * If scope is the file's program (global) → reserve name as-is.
-//         Closure leaves global names unchanged so external references stay
-//         valid.
-//       * Otherwise → increment count for the base name. If new count is 1
-//         (first occurrence anywhere) keep the name; if > 1 generate
-//         `name__<id>` and reserve. If the generated name itself
-//         collides, retry with an incremented id (mirrors Closure's
-//         `while (nameUsage.contains(newName))` retry loop).
-//   - Use Babel's `scope.rename(oldName, newName)` to update the binding and
-//     every reference atomically. Babel's scope analysis handles the
-//     reference-following Closure does manually via its renamer stack.
-//
-// Departures from Closure:
-//   - We rely on Babel scope analysis instead of porting Closure's
-//     ScopedCallback + Renamer-stack machinery. The semantic outcome is the
-//     same: every local binding is uniquely named after the pass.
-//   - `ARGUMENTS` is irrelevant — Babel doesn't surface it as a binding.
-//   - No `assertOnChange` / `markChanges` modes — those are Closure
-//     pass-management concerns.
+//      After the rename, every let/const/class/fn-decl owned by a nested
+//      scope inside the function is unique with respect to the function
+//      scope and every other nested scope. This is the invariant that
+//      `NodeUtil.tryMergeBlock`'s `ignoreBlockScopedDeclarations=true` flag
+//      (Closure's `isASTNormalized()`) relies on — flattening any nested
+//      block into its parent can't introduce duplicate let/const bindings.
 //
 // Marker:
-//   The exported `markFileNormalized` / `isFileNormalized` pair lets later
-//   passes check `isASTNormalized()`-equivalent state. Backed by a WeakSet
-//   keyed on the File node.
+//   The exported `markFileNormalized` / `isFileNormalized` pair records that
+//   structural normalization ran. It does *not* imply that names have been
+//   uniquified — call `renameForFlatten` on a specific function before
+//   relaxing block-merge safety for that function.
 // Closure's literal constant is `$jscomp$` (MakeDeclaredNamesUnique.java:697).
 // We diverge intentionally for readability: double-underscore is shorter,
 // reads as a "compiler-generated" marker in any JS code, and avoids `$` so
 // the suffix can't be visually mistaken for template-literal `${…}` syntax.
-// User code rarely contains `foo__1`; the collision-retry loop in
-// `pickReplacement` covers the rare case where it does.
 const UNIQUE_ID_SEPARATOR = '__';
 const NORMALIZED = new WeakSet();
-function isFileNormalized(file) {
-    return NORMALIZED.has(file);
-}
 function markFileNormalized(file) {
     NORMALIZED.add(file);
 }
 function makeDeclaredNamesUnique(file) {
-    // Stage 1: structural normalizations. These run before the rename pass so
-    // that the rename pass sees the post-split / post-hoist binding shape (and
-    // so that scope.crawl picks up bindings hoisted out of for-headers).
     structuralNormalize(file);
-    const nameUsage = new Map();
-    let renamed = 0;
-    // Reserve every name that appears at the program (global) scope first, so
-    // child scopes never pick a generated name that shadows a global.
-    traverse(file, {
-        Program(programPath) {
-            for (const name of Object.keys(programPath.scope.bindings)) {
-                reserveName(nameUsage, name);
-            }
-            programPath.skip();
-        },
-    });
-    // Then visit every nested scope top-down and rename collisions.
-    traverse(file, {
-        Scope(path) {
-            // The Program scope was handled above (names reserved, no rename).
-            if (path.isProgram())
-                return;
-            const bindings = path.scope.bindings;
-            for (const baseName of Object.keys(bindings)) {
-                const binding = bindings[baseName];
-                if (binding === undefined)
-                    continue;
-                // Only rename bindings owned by *this* scope. Babel surfaces
-                // some inherited entries on `bindings` only for the owning
-                // scope itself, but be defensive.
-                if (binding.scope !== path.scope)
-                    continue;
-                // Skip function parameters. Closure's ContextualRenamer exists
-                // to make hoist-friendly names for later block-flatten / let→
-                // var lowering — those passes never cross function boundaries,
-                // so the param contract is already isolated. Renaming params
-                // here pollutes the output with `__N` suffixes on names the
-                // user authored, and (more importantly) belongs to the
-                // inliner's `InlineRenamer`-equivalent — which renames a
-                // callee's params at the call site as part of inlining, not
-                // here.
-                if (binding.kind === 'param') {
-                    // Reserve the param's name so synthetic `name__N` later
-                    // can't shadow it accidentally.
-                    reserveName(nameUsage, baseName);
-                    continue;
-                }
-                const newName = pickReplacement(nameUsage, baseName);
-                if (newName === null) {
-                    // First occurrence anywhere — keep the name, just count it.
-                    continue;
-                }
-                renameBinding(path, baseName, newName);
-                renamed++;
-            }
-        },
-    });
     markFileNormalized(file);
-    return { renamed };
+    return { renamed: 0 };
 }
-function reserveName(nameUsage, name) {
-    if ((nameUsage.get(name) ?? 0) < 1)
-        nameUsage.set(name, 1);
-}
-/** Returns the new name, or null if the base name is still free. */
-function pickReplacement(nameUsage, baseName) {
-    const prev = nameUsage.get(baseName) ?? 0;
-    nameUsage.set(baseName, prev + 1);
-    if (prev === 0) {
-        // First time we've seen this name anywhere — keep it as-is.
-        return null;
+/**
+ * Per-function demand-driven α-rename. Walks nested scopes inside `fnPath`
+ * top-down; for every owned binding whose base name is already declared by
+ * an *ancestor* scope (within this function), renames it via Babel's
+ * `scope.rename` so the binding doesn't shadow the ancestor name.
+ *
+ * Sibling scopes are intentionally NOT renamed against each other: two
+ * sibling `if`-consequents can both declare `const dx` and never collide
+ * because neither block ever ends up in the other's lexical scope. The
+ * authored names are preserved for readability.
+ *
+ * If two sibling blocks both could be flattened into a shared statement-
+ * block ancestor (rare: requires both siblings to be plain BlockStatements
+ * sitting in the same parent statement list, not if/loop bodies), the
+ * resulting name collision is caught at merge time by `tryMergeBlock`'s
+ * sibling-collision guard — that block-merge is rejected instead.
+ *
+ * Nested functions are skipped; they're renamed by their own invocation.
+ */
+function renameForFlatten(fnPath) {
+    let renamed = 0;
+    const fnScope = fnPath.scope;
+    // Stack-shaped: `active` holds names that are visible at the current
+    // traversal position — i.e. declared by some ancestor scope (within
+    // this function). Synthetic-suffix counter is global per function so
+    // `__1`, `__2` don't collide across distinct rename sites.
+    const active = new Set();
+    const allNames = new Set();
+    for (const name of Object.keys(fnScope.bindings)) {
+        active.add(name);
+        allNames.add(name);
     }
-    // Collision: produce `baseName__<id>`. If that itself collides
-    // (another scope already used or reserved that synthetic name), bump.
-    let id = prev;
+    const frames = new WeakMap();
+    fnPath.traverse({
+        Scope: {
+            enter(p) {
+                // Inner functions own their own rename pass; don't descend.
+                if (p.isFunction()) {
+                    p.skip();
+                    return;
+                }
+                // Function-body Block / Program / etc. that share fnScope
+                // are already in `active`.
+                if (p.scope === fnScope)
+                    return;
+                const added = [];
+                const bindings = p.scope.bindings;
+                for (const baseName of Object.keys(bindings)) {
+                    const binding = bindings[baseName];
+                    if (binding === undefined)
+                        continue;
+                    if (binding.scope !== p.scope)
+                        continue;
+                    // Catch-clause params show up here. They never participate
+                    // in block-flatten, so leaving them as-is is safe.
+                    if (binding.kind === 'param')
+                        continue;
+                    if (active.has(baseName)) {
+                        // Ancestor shadowing — rename.
+                        const newName = pickFreshName(baseName, allNames);
+                        p.scope.rename(baseName, newName);
+                        active.add(newName);
+                        allNames.add(newName);
+                        added.push(newName);
+                        renamed++;
+                    }
+                    else {
+                        active.add(baseName);
+                        allNames.add(baseName);
+                        added.push(baseName);
+                    }
+                }
+                if (added.length > 0)
+                    frames.set(p.node, { added });
+            },
+            exit(p) {
+                const frame = frames.get(p.node);
+                if (frame === undefined)
+                    return;
+                for (const n of frame.added)
+                    active.delete(n);
+                frames.delete(p.node);
+            },
+        },
+    });
+    return renamed;
+}
+function pickFreshName(baseName, allNames) {
+    let id = 1;
     let candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
-    while ((nameUsage.get(candidate) ?? 0) > 0) {
+    while (allNames.has(candidate)) {
         id++;
         candidate = `${baseName}${UNIQUE_ID_SEPARATOR}${id}`;
     }
-    nameUsage.set(candidate, 1);
-    // Keep the base counter consistent with the id we ultimately picked so
-    // the next collision starts from a higher number.
-    if (id > prev)
-        nameUsage.set(baseName, id + 1);
     return candidate;
-}
-function renameBinding(path, oldName, newName) {
-    // Babel's scope.rename updates the binding identifier plus every
-    // reference to it within this scope. It also updates child scopes'
-    // bindings/references because they share the parent's reference set.
-    path.scope.rename(oldName, newName);
 }
 // ---------------------------------------------------------------------------
 // Structural normalizations.
@@ -4108,13 +4294,13 @@ function collectCandidates(root) {
     const walk = (n, parent, _key, index, scope) => {
         const enteringFn = t.isFunction(n);
         const enteringScope = enteringFn || t.isProgram(n);
-        const annotated = sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n);
+        const annotated = sroaScopeStack[sroaScopeStack.length - 1] || hasSroaAnnotation(n, parent);
         if (enteringScope) {
             sroaScopeStack.push(annotated);
         }
         const nextScope = enteringScope ? n : scope;
         if (t.isVariableDeclaration(n) && parent && index !== undefined) {
-            const declAnnot = annotated || hasSroaAnnotation(n);
+            const declAnnot = annotated || hasSroaAnnotation(n, parent);
             for (const d of n.declarations) {
                 if (!declAnnot && !hasSroaAnnotation(d))
                     continue;
@@ -4174,15 +4360,8 @@ function inferInitializer(init) {
     }
     return { size, initExprs: exprs };
 }
-function hasSroaAnnotation(n) {
-    const cs = (n.leadingComments ?? []);
-    for (const c of cs) {
-        if (DIRECTIVE_PATTERNS.sroa.test(c.value))
-            return true;
-        if (DIRECTIVE_PATTERNS.optimize.test(c.value))
-            return true;
-    }
-    return false;
+function hasSroaAnnotation(n, parent = null) {
+    return hasLeadingDirective(n, parent, commentIsSroaDirective);
 }
 // ---------------------------------------------------------------------------
 // Phase 2 — escape analysis. Reject if any reference is anything other than:
@@ -8541,31 +8720,22 @@ function tryMinimizeIf(n, ctx) {
     const shortCond = getMinimized(mc, 'ALLOW_LEADING_NOT');
     if (elseBranch === null) {
         // No else.
+        //
+        // Closure's tryMinimizeIf rewrites `if (x) foo();` → `x && foo();` and
+        // `if (!x) bar();` → `x || bar();` here. The rewrite is a pure code-size
+        // win (gzip-equivalent semantically, identical bytecode after V8 tiers
+        // up). compilecat's output is consumed by a downstream
+        // bundler/minifier, and its design goal is *readable* intermediate
+        // code, so we skip the if→&& / if→|| fold. We still let condition
+        // minimization run on the test slot below. See conversation note —
+        // intentional Closure deviation.
         if (isFoldableExpressBlock(thenBranch)) {
-            const expr = getBlockExpression(thenBranch); // ExpressionStatement
-            const inner = expr.expression;
-            if (isMeasuredNot(shortCond)) {
-                // if(!x)bar(); → x||bar();
-                const stripped = withoutNot(shortCond);
-                const newCond = buildReplacement(stripped);
+            const replaced = applyMeasured(originalCond, unnegated);
+            if (replaced !== originalCond) {
+                n.test = replaced;
                 ctx.minimized++;
-                return t.expressionStatement(t.logicalExpression('||', newCond, inner));
             }
-            // if(x)foo(); → x&&foo();
-            // Parens cost gate: only do the rewrite when it doesn't introduce
-            // an extra pair of parens on both sides.
-            const newCond = applyMeasured(originalCond, shortCond);
-            if (isLowerPrecedenceThan(shortCond, AND_PRECEDENCE) &&
-                precedence(inner) < AND_PRECEDENCE) {
-                // Just minimize the cond, don't fold to &&.
-                if (newCond !== originalCond) {
-                    n.test = newCond;
-                    ctx.minimized++;
-                }
-                return n;
-            }
-            ctx.minimized++;
-            return t.expressionStatement(t.logicalExpression('&&', newCond, inner));
+            return n;
         }
         // Try to combine `if (x) { if (y) Z; }` into `if (x && y) Z;`.
         if (t.isBlockStatement(thenBranch) &&
@@ -8601,77 +8771,21 @@ function tryMinimizeIf(n, ctx) {
         ctx.minimized++;
         return swapped;
     }
-    // if(c)return X; else return Y; → return c ? X : Y;
-    if (isReturnExpressBlock(thenBranch) && isReturnExpressBlock(elseBranch)) {
-        const thenExpr = getBlockReturnExpression(thenBranch);
-        const elseExpr = getBlockReturnExpression(elseBranch);
-        const newCond = applyMeasured(originalCond, shortCond);
-        ctx.minimized++;
-        return t.returnStatement(t.conditionalExpression(newCond, thenExpr, elseExpr));
-    }
-    const thenExpr = isFoldableExpressBlock(thenBranch);
-    const elseExpr = isFoldableExpressBlock(elseBranch);
-    if (thenExpr && elseExpr) {
-        const thenOp = getBlockExpression(thenBranch).expression;
-        const elseOp = getBlockExpression(elseBranch).expression;
-        // if(x) a=1; else a=2; → a = x ? 1 : 2;
-        if (t.isAssignmentExpression(thenOp) &&
-            t.isAssignmentExpression(elseOp) &&
-            thenOp.operator === elseOp.operator &&
-            areNodesEqual(thenOp.left, elseOp.left) &&
-            !mayEffectMutableState(thenOp.left) &&
-            (!mayHaveSideEffects(originalCond) ||
-                (thenOp.operator === '=' && t.isIdentifier(thenOp.left)))) {
-            const newCond = applyMeasured(originalCond, shortCond);
-            const hook = t.conditionalExpression(newCond, thenOp.right, elseOp.right);
-            ctx.minimized++;
-            return t.expressionStatement(t.assignmentExpression(thenOp.operator, thenOp.left, hook));
-        }
-        // if(x) foo(); else bar(); → x ? foo() : bar();
-        const newCond = applyMeasured(originalCond, shortCond);
-        ctx.minimized++;
-        return t.expressionStatement(t.conditionalExpression(newCond, thenOp, elseOp));
-    }
-    // if(x) var y=1; else y=2  →  var y = x?1:2;
-    const thenVar = getSingleVarDecl(thenBranch);
-    const elseAssignOp = elseExpr ? getBlockExpression(elseBranch).expression : null;
-    if (thenVar !== null &&
-        elseAssignOp !== null &&
-        t.isAssignmentExpression(elseAssignOp) &&
-        elseAssignOp.operator === '=' &&
-        t.isIdentifier(elseAssignOp.left) &&
-        thenVar.declarations.length === 1 &&
-        t.isIdentifier(thenVar.declarations[0].id) &&
-        thenVar.declarations[0].init !== null &&
-        thenVar.declarations[0].init !== undefined &&
-        thenVar.declarations[0].id.name === elseAssignOp.left.name) {
-        const newCond = applyMeasured(originalCond, shortCond);
-        const hook = t.conditionalExpression(newCond, thenVar.declarations[0].init, elseAssignOp.right);
-        ctx.minimized++;
-        return t.variableDeclaration(thenVar.kind, [
-            t.variableDeclarator(thenVar.declarations[0].id, hook),
-        ]);
-    }
-    // if(x) y=1; else var y=2 → var y = x?1:2; (mirror case)
-    const elseVar = getSingleVarDecl(elseBranch);
-    const thenAssignOp = thenExpr ? getBlockExpression(thenBranch).expression : null;
-    if (elseVar !== null &&
-        thenAssignOp !== null &&
-        t.isAssignmentExpression(thenAssignOp) &&
-        thenAssignOp.operator === '=' &&
-        t.isIdentifier(thenAssignOp.left) &&
-        elseVar.declarations.length === 1 &&
-        t.isIdentifier(elseVar.declarations[0].id) &&
-        elseVar.declarations[0].init !== null &&
-        elseVar.declarations[0].init !== undefined &&
-        elseVar.declarations[0].id.name === thenAssignOp.left.name) {
-        const newCond = applyMeasured(originalCond, shortCond);
-        const hook = t.conditionalExpression(newCond, thenAssignOp.right, elseVar.declarations[0].init);
-        ctx.minimized++;
-        return t.variableDeclaration(elseVar.kind, [
-            t.variableDeclarator(elseVar.declarations[0].id, hook),
-        ]);
-    }
+    // Closure's `tryMinimizeIfBlockExits` / `tryMinimizeCondition` collapse
+    // if/else pairs into ternary expressions in five shapes:
+    //
+    //   - if(c) return X; else return Y;           → return c ? X : Y;
+    //   - if(c) a = 1;   else a = 2;               → a = c ? 1 : 2;
+    //   - if(c) foo();   else bar();               → c ? foo() : bar();
+    //   - if(c) var y=1; else y=2;                 → var y = c ? 1 : 2;
+    //   - if(c) y=1;     else var y=2;             → var y = c ? 1 : 2;
+    //
+    // Disabled — these are code-size wins, not perf wins, and they cascade:
+    // a chain of `if (a) jv = ...; else if (b) jv = -...; else jv = 0;` folds
+    // into a nested ternary `jv = a ? ... : b ? -... : 0;` that's strictly
+    // less readable than the authored if/else chain. compilecat targets
+    // readable intermediate code; ternary collapsing is the downstream
+    // bundler/minifier's job. The condition itself is still minimized below.
     // Default: minimize cond only.
     const replaced = applyMeasured(originalCond, unnegated);
     if (replaced !== originalCond) {
@@ -8721,26 +8835,10 @@ function tryReplaceIfBlock(block, ctx) {
                 continue;
             }
         }
-        // (2) if(c) return X; (no else) followed by return Y; → return c?X:Y;
-        if (next !== null &&
-            elseBranch === null &&
-            isReturnBlock(thenBranch) &&
-            t.isReturnStatement(next)) {
-            let thenExpr;
-            if (isReturnExpressBlock(thenBranch)) {
-                thenExpr = getBlockReturnExpression(thenBranch);
-            }
-            else {
-                thenExpr = t.identifier('undefined');
-            }
-            const elseExpr = next.argument ?? t.identifier('undefined');
-            const ret = t.returnStatement(t.conditionalExpression(ifNode.test, thenExpr, elseExpr));
-            body.splice(i, 2, ret);
-            ctx.minimized++;
-            // Everything after a return is dead — peephole-remove-dead-code
-            // will drop the rest in a later pass.
-            continue;
-        }
+        // (2) `if(c) return X;` followed by `return Y;` → `return c?X:Y;`.
+        // Disabled — same readability rationale as the expr-level
+        // if/else→ternary collapses above. The authored two-statement form
+        // reads cleanly; ternary collapsing is the bundler's job.
         // (3) if(c) { ...exit; } else X; → if(c){...exit;} X; (hoist else)
         if (elseBranch !== null && statementMustExitParent(thenBranch)) {
             // Replace cur with `if(c){...exit;}` (no else) and insert elseBranch
@@ -8969,28 +9067,8 @@ function isFoldableExpressBlock(n) {
     }
     return true;
 }
-function getBlockExpression(n) {
-    return unwrapSingle(n);
-}
 function isReturnBlock(n) {
     return t.isReturnStatement(unwrapSingle(n));
-}
-function isReturnExpressBlock(n) {
-    const inner = unwrapSingle(n);
-    return (t.isReturnStatement(inner) &&
-        inner.argument !== null &&
-        inner.argument !== undefined);
-}
-function getBlockReturnExpression(n) {
-    return unwrapSingle(n).argument;
-}
-function getSingleVarDecl(n) {
-    const inner = unwrapSingle(n);
-    if (!t.isVariableDeclaration(inner))
-        return null;
-    if (inner.declarations.length !== 1)
-        return null;
-    return inner;
 }
 function consumesDanglingElse(n) {
     let cur = n;
@@ -9024,18 +9102,6 @@ function isLiteralValue(n) {
         t.isStringLiteral(n) ||
         t.isNullLiteral(n));
 }
-function mayEffectMutableState(n) {
-    // For our purposes: a property write target is mutable, an identifier is
-    // not. Used to gate the assignment-collapse case in tryMinimizeIf — if the
-    // LHS is `o.p`, evaluating it twice is unsafe.
-    if (t.isMemberExpression(n) || t.isOptionalMemberExpression(n))
-        return true;
-    if (t.isCallExpression(n))
-        return true;
-    if (t.isAssignmentExpression(n) || t.isUpdateExpression(n))
-        return true;
-    return false;
-}
 
 // Port of jscomp/PeepholeRemoveDeadCode.java (subset).
 //
@@ -9051,11 +9117,11 @@ function mayEffectMutableState(n) {
 //   - statements after return/throw/break/continue dropped
 //   - comma expression with pure left side: (pure, x) → x
 //   - empty `if` / empty `else` cleanup
+//   - unused / single-break labels dropped (PRDC.tryFoldLabel + RenameLabels)
 //
 // Not covered (deferred):
 //   - switch case folding
 //   - try/catch/finally optimization
-//   - label removal (classic dce.ts handles unused labels via scope)
 //   - optional-chain folding
 //   - var/let hoisting through dead branches
 //
@@ -9113,11 +9179,103 @@ function tryRemove(n) {
         return foldExpressionStatement(n);
     if (t.isSequenceExpression(n))
         return foldSequence(n);
+    if (t.isLabeledStatement(n))
+        return foldLabel(n);
     return undefined;
+}
+// ---------------------------------------------------------------------------
+// Labels
+//
+// Port of PeepholeRemoveDeadCode.tryFoldLabel (PRDC.java:138-177) plus the
+// "unreferenced label" cleanup from RenameLabels.java:222-232. Closure splits
+// these between two passes; we fold them together since we don't run a
+// separate label-renaming pass and the cost is identical.
+function foldLabel(n) {
+    const labelName = n.label.name;
+    const stmt = n.body;
+    // PRDC.java:141-145 — `L: ;` → drop.
+    if (t.isEmptyStatement(stmt))
+        return null;
+    // PRDC.java:147-157 — `L: {}` → drop.
+    if (t.isBlockStatement(stmt) && stmt.body.length === 0)
+        return null;
+    // PRDC.java:159-175 — `L: break L;` (possibly wrapped in a single-stmt
+    // block) → drop. We additionally fold the general "unreferenced label"
+    // case from RenameLabels: if the body contains no `break L` / `continue L`
+    // anywhere, unwrap the label. This is the case that lets inlined-call
+    // blocks merge into the surrounding scope after the early-return break
+    // gets minimised away by PeepholeMinimizeConditions.
+    if (!isLabelReferenced(labelName, stmt)) {
+        return stmt;
+    }
+    // Closure's getOnlyInterestingChild handles `L: { break L; }` even when
+    // the block has other (uninteresting) children. We already covered the
+    // empty-block case; what remains is a block whose sole effective stmt
+    // is `break L`. Since `isLabelReferenced` returned true here, there is
+    // at least one reference — verify it's exactly a top-level `break L` in
+    // a single-stmt block.
+    if (t.isBlockStatement(stmt) && stmt.body.length === 1) {
+        const only = stmt.body[0];
+        if (t.isBreakStatement(only) &&
+            only.label != null &&
+            only.label.name === labelName) {
+            return null;
+        }
+    }
+    return undefined;
+}
+function isLabelReferenced(labelName, root) {
+    let found = false;
+    const visit = (n) => {
+        if (found)
+            return;
+        if ((t.isBreakStatement(n) || t.isContinueStatement(n)) &&
+            n.label != null &&
+            n.label.name === labelName) {
+            found = true;
+            return;
+        }
+        // Nested labels with the same name shadow the outer one; Closure's
+        // RenameLabels uses a per-scope namespace, so we must stop recursing
+        // into a labelled subtree that re-binds the same name.
+        if (t.isLabeledStatement(n) && n.label.name === labelName) {
+            return;
+        }
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, k);
+            if (child == null)
+                continue;
+            if (Array.isArray(child)) {
+                for (const c of child)
+                    if (c)
+                        visit(c);
+            }
+            else if (typeof child.type === 'string') {
+                visit(child);
+            }
+        }
+    };
+    visit(root);
+    return found;
 }
 // ---------------------------------------------------------------------------
 // If / Conditional
 function foldIfStatement(n) {
+    // Closure PeepholeRemoveDeadCode.tryFoldIf: `if (x) { ... } else {}` →
+    // drop the empty alternate. Run first so subsequent rules see the
+    // canonicalized shape.
+    if (n.alternate != null && isEmpty(n.alternate)) {
+        n.alternate = null;
+        // Fall through with updated shape.
+    }
+    // Closure PeepholeRemoveDeadCode.tryFoldIf: `if (x) {} else { ... }` →
+    // `if (!x) { ... }`. Surfaced by post-inline shapes like
+    // `if (cond) return; else { body }` collapsing the early-return branch
+    // to an empty placeholder while `body` survives.
+    if (isEmpty(n.consequent) && n.alternate != null && !isEmpty(n.alternate)) {
+        const negated = negateTest(n.test);
+        return t.ifStatement(negated, n.alternate, null);
+    }
     const b = asBoolean(n.test);
     if (b === true) {
         if (mayHaveSideEffects(n.test))
@@ -9138,6 +9296,27 @@ function foldIfStatement(n) {
         return t.expressionStatement(n.test);
     }
     return undefined;
+}
+// Negate a condition expression. `!x` → `x`; `x === y` → `x !== y` etc.;
+// otherwise wrap in `!`. Mirrors Closure's NOT-wrapping in tryFoldIf —
+// PeepholeMinimizeConditions later collapses double negations / picks the
+// shorter form.
+function negateTest(test) {
+    if (t.isUnaryExpression(test) && test.operator === '!') {
+        return test.argument;
+    }
+    if (t.isBinaryExpression(test)) {
+        const flip = {
+            '==': '!=',
+            '!=': '==',
+            '===': '!==',
+            '!==': '===',
+        };
+        const op = flip[test.operator];
+        if (op)
+            return t.binaryExpression(op, test.left, test.right);
+    }
+    return t.unaryExpression('!', test, /* prefix */ true);
 }
 function foldConditional(n) {
     const b = asBoolean(n.test);
@@ -9463,7 +9642,7 @@ const MAX_ITERATIONS = 16;
  * Simplify a single function in place. Caller is responsible for picking
  * which functions to simplify (zone gating happens in the pipeline layer).
  */
-function simplifyFunction(fnPath, options = {}) {
+function simplifyFunction(fnPath, _options = {}) {
     const stats = {
         iterations: 0,
         folded: 0,
@@ -9473,6 +9652,12 @@ function simplifyFunction(fnPath, options = {}) {
         minimized: 0,
     };
     const fn = fnPath.node;
+    // Rename nested-block bindings that would collide on flatten. After this
+    // pass, every let/const/class/function-declaration inside `fn` is uniquely
+    // named within the function, so `PeepholeRemoveDeadCode` can splice nested
+    // blocks into their parents with `ignoreBlockScopedDeclarations=true`.
+    renameForFlatten(fnPath);
+    const normalized = true;
     for (let i = 0; i < MAX_ITERATIONS; i++) {
         let changed = false;
         const fold = runPeepholeFoldConstants(fn.body);
@@ -9493,7 +9678,7 @@ function simplifyFunction(fnPath, options = {}) {
             changed = true;
             stats.minimized += min.minimized;
         }
-        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized: options.normalized });
+        const dead = runPeepholeRemoveDeadCode(fn.body, { normalized });
         if (dead.removed > 0) {
             changed = true;
             stats.removed += dead.removed;
@@ -9540,7 +9725,11 @@ function simplifyFunction(fnPath, options = {}) {
  * the already-cleaned inner shape.
  */
 function simplifyAll(root) {
-    const normalized = isFileNormalized(root);
+    // Top-level rename is intentionally not performed — we only uniquify
+    // names within each function (see `simplifyFunction`). At the program
+    // level we leave `normalized=false` so PeepholeRemoveDeadCode keeps the
+    // conservative block-merge check for any top-level inner blocks.
+    const normalized = false;
     const total = {
         iterations: 0,
         folded: 0,
@@ -9552,7 +9741,7 @@ function simplifyAll(root) {
     traverse(root, {
         Function: {
             exit(path) {
-                const s = simplifyFunction(path, { normalized });
+                const s = simplifyFunction(path, { });
                 total.iterations += s.iterations;
                 total.folded += s.folded;
                 total.removed += s.removed;
@@ -9607,6 +9796,11 @@ function transform(code, options = {}) {
         allowLibraryInline: options.allowLibraryInline,
     });
     const unr = unrollLoops(ast);
+    // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
+    // before SROA so its escape analysis sees only direct `name[i]` uses.
+    // Without this, a cascade-induced alias of an SROA candidate poisons the
+    // candidate's escape check (`init` of a VariableDeclarator is rejected).
+    const ivarPre = inlineVariables(ast);
     const sroa = applySroa(ast);
     // Normalize before the simplifier fixpoint. Closure runs Normalize before
     // its optimization pass group; passes downstream (block flatten, let→var
@@ -9614,8 +9808,8 @@ function transform(code, options = {}) {
     makeDeclaredNamesUnique(ast);
     const simp = simplifyAll(ast);
     const ivar = inlineVariables(ast);
+    ivar.inlined += ivarPre.inlined;
     const ruc = removeUnusedCode(ast);
-    // biome-ignore lint/suspicious/noExplicitAny: generator default-import shim
     const gen = generate;
     const out = gen(ast, {
         sourceMaps: options.sourceMaps === true,
