@@ -177,23 +177,6 @@ compilecat({
 })
 ```
 
-## Programmatic API
-
-```ts
-import { transform } from 'compilecat';
-
-const { code, map, stats } = transform(source, {
-    filename: chunkFileName,
-    sourceMaps: true,
-    inputSourceMap,             // chain through an upstream map if you have one
-});
-```
-
-`transform` operates on a single program — typically a rollup chunk. There's no
-cross-file or multi-pass coordination to set up; if you're driving compilecat
-yourself outside of a bundler, hand it the concatenated source you want
-optimized.
-
 ## Acknowledgements
 
 Heavily inspired by [unplugin-inline-functions](https://github.com/krispya/unplugin-inline-functions).
