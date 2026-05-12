@@ -28,7 +28,7 @@ export default {
 };
 ```
 
-Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compilecat/rolldown`. esbuild and webpack are not supported in bundle mode.
+Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compilecat/rolldown`. Currently other bundlers are not supported.
 
 ## Directives
 
