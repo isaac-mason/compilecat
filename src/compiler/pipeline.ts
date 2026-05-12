@@ -1,37 +1,33 @@
-// Per-file orchestration. Mirrors src/plugin/transform.ts but driven by the
-// gcc-tree analyses + transforms.
+// Single-Program orchestration. Operates on a parsed AST representing one
+// program — in bundle-mode this is the entire chunk after rollup has
+// resolved imports.
 //
 // Steps:
-//   1. ANY_DIRECTIVE_IN_SOURCE pre-check (caller's responsibility usually).
-//   2. Parse with @babel/parser.
-//   3. Run InlineFunctions across the file.
-//   4. Run simplifyAll across the file.
+//   1. Parse with @babel/parser (TS/JSX-aware).
+//   2. Strip TS-only syntax so downstream passes only see JS.
+//   3. Run InlineFunctions across the program.
+//   4. Run simplifyAll across the program.
 //   5. Generate code (and optional sourcemap).
 
 import { parse, type ParserOptions } from '@babel/parser';
 import * as t from '@babel/types';
 
 import { generate } from './babel-interop';
-import type { FileCache } from './file-index';
 import { inlineFunctions } from './inline-functions';
 import { inlineVariables } from './inline-variables';
 import { unrollLoops } from './loop-unroller';
 import { makeDeclaredNamesUnique } from './normalize';
 import { removeUnusedCode } from './remove-unused-code';
-import type { FileReader } from './resolve';
 import { applySroa } from './scalar-replace-aggregates';
 import { simplifyAll } from './simplifier';
+import { stripTypeScript } from './strip-typescript';
 
 export type TransformOptions = {
     sourceMaps?: boolean;
     /** Filename for sourcemap purposes. */
     filename?: string;
-    /** Shared cache for cross-file inlining. When omitted, cross-file is off. */
-    fileCache?: FileCache;
-    /** Custom file reader (defaults to disk). */
-    fileReader?: FileReader;
-    /** Permit `node_modules` inlining when the call site opts in. */
-    allowLibraryInline?: boolean;
+    /** Incoming source map to chain through (e.g. from rollup's chunk). */
+    inputSourceMap?: unknown;
 };
 
 export type TransformResult = {
@@ -58,17 +54,12 @@ export type TransformResult = {
 export function transform(code: string, options: TransformOptions = {}): TransformResult {
     const ast = parse(code, parserOptions(options.filename));
 
-    const inl = inlineFunctions(ast, {
-        consumerPath: options.filename,
-        fileCache: options.fileCache,
-        fileReader: options.fileReader,
-        allowLibraryInline: options.allowLibraryInline,
-    });
+    stripTypeScript(ast);
+
+    const inl = inlineFunctions(ast);
     const unr = unrollLoops(ast);
     // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
     // before SROA so its escape analysis sees only direct `name[i]` uses.
-    // Without this, a cascade-induced alias of an SROA candidate poisons the
-    // candidate's escape check (`init` of a VariableDeclarator is rejected).
     const ivarPre = inlineVariables(ast);
     const sroa = applySroa(ast);
     // Normalize before the simplifier fixpoint. Closure runs Normalize before
@@ -84,6 +75,7 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
     const out = gen(ast, {
         sourceMaps: options.sourceMaps === true,
         sourceFileName: options.filename,
+        inputSourceMap: options.inputSourceMap,
     });
 
     return {
@@ -108,10 +100,11 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
 }
 
 function parserOptions(filename?: string): ParserOptions {
-    const isTs = filename ? /\.tsx?$/.test(filename) : false;
+    // In bundle-mode the chunk filename is `.js`, but the chunk text may
+    // still contain TS (consumers who don't transpile TS before compilecat).
+    // The typescript plugin is tolerant of plain JS, so enable unconditionally.
     const isJsx = filename ? /\.[jt]sx$/.test(filename) : false;
-    const plugins: ParserOptions['plugins'] = [];
-    if (isTs) plugins.push('typescript');
+    const plugins: ParserOptions['plugins'] = ['typescript'];
     if (isJsx) plugins.push('jsx');
     return {
         sourceType: 'module',

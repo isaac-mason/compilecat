@@ -17,11 +17,19 @@
 //   - any call / new
 //   - any assignment / update (++ -- compound assigns)
 //   - delete
-//   - member access (might trigger a getter)
 //   - yield / await / throw
 //   - tagged templates
 //   - everything we don't recognise — Closure errs on the side of "may have
 //     side effects" and we follow.
+//
+// Member access (`obj.prop`, `obj[k]`, optional-chain variants) is treated
+// as pure when the object (and computed key, if any) is itself pure. This
+// matches Closure's AstAnalyzer with `assumeGettersArePure=true` — its
+// default mode (AstAnalyzer.java:434-437). The risk is user-defined
+// getters firing as side effects; Closure documents the alternative —
+// flagging every getprop impure — as having "completely unacceptable" code
+// size cost. We follow that policy, especially since the downstream bundler
+// or minifier (esbuild, terser) makes the same assumption.
 
 import * as t from '@babel/types';
 
@@ -107,6 +115,15 @@ export function isPure(node: t.Node): boolean {
         // Untagged template — no effects from the template itself, only the
         // inserted expressions matter.
         return node.expressions.every((e) => t.isExpression(e) && isPure(e));
+    }
+
+    if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
+        // Closure AstAnalyzer.java:434-437 (GETPROP/OPTCHAIN_GETPROP) and
+        // :432 (GETELEM/OPTCHAIN_GETELEM): with assumeGettersArePure (the
+        // default), a property read is pure iff the children are pure.
+        if (!isPure(node.object as t.Node)) return false;
+        if (node.computed && !isPure(node.property as t.Node)) return false;
+        return true;
     }
 
     return false;

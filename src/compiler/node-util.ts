@@ -183,84 +183,14 @@ export function tryMergeBlock(
     if (!isStatementBlock(parent)) return 0;
     const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
     if (!canMerge) return 0;
-    // Even when names are ancestor-unique, sibling block-scoped decls inside
-    // the same statement-list can still collide on merge. Block-flatten with
-    // `ignoreBlockScopedDeclarations=true` assumes nested names are unique
-    // vs ancestors; it does NOT assume sibling-block uniqueness. Refuse the
-    // merge when splicing would introduce a duplicate let/const/class/fn
-    // binding name into `parentBody`.
-    if (ignoreBlockScopedDeclarations) {
-        const incoming = collectBlockScopedNames(block.body);
-        if (incoming.size > 0) {
-            for (let i = 0; i < parentBody.length; i++) {
-                if (i === indexInParent) continue;
-                const sibling = parentBody[i];
-                if (sibling === undefined) continue;
-                if (siblingDeclaresAny(sibling, incoming)) return 0;
-            }
-        }
-    }
+    // When `ignoreBlockScopedDeclarations` is true, the caller has run
+    // `renameForFlatten` (ContextualRenamer-style) which guarantees every
+    // nested let/const/class/fn name in the function is unique vs every
+    // other nested name. Sibling collisions can't exist by construction —
+    // no further check needed.
     const inserted = block.body.length;
     parentBody.splice(indexInParent, 1, ...block.body);
     return inserted;
-}
-
-function collectBlockScopedNames(stmts: t.Statement[]): Set<string> {
-    const out = new Set<string>();
-    for (const s of stmts) collectBlockScopedNamesInto(s, out);
-    return out;
-}
-
-function collectBlockScopedNamesInto(s: t.Node, out: Set<string>): void {
-    if (t.isLabeledStatement(s)) {
-        collectBlockScopedNamesInto(s.body, out);
-        return;
-    }
-    if (t.isVariableDeclaration(s) && (s.kind === 'const' || s.kind === 'let')) {
-        for (const d of s.declarations) collectPatternNames(d.id, out);
-        return;
-    }
-    if (t.isClassDeclaration(s) && s.id !== null && s.id !== undefined) {
-        out.add(s.id.name);
-        return;
-    }
-    if (t.isFunctionDeclaration(s) && s.id !== null && s.id !== undefined) {
-        out.add(s.id.name);
-        return;
-    }
-}
-
-function siblingDeclaresAny(s: t.Node, names: Set<string>): boolean {
-    const declared = new Set<string>();
-    collectBlockScopedNamesInto(s, declared);
-    for (const n of declared) if (names.has(n)) return true;
-    return false;
-}
-
-function collectPatternNames(pat: t.Node, out: Set<string>): void {
-    if (t.isIdentifier(pat)) {
-        out.add(pat.name);
-        return;
-    }
-    if (t.isArrayPattern(pat)) {
-        for (const el of pat.elements) if (el !== null) collectPatternNames(el, out);
-        return;
-    }
-    if (t.isObjectPattern(pat)) {
-        for (const prop of pat.properties) {
-            if (t.isRestElement(prop)) collectPatternNames(prop.argument, out);
-            else if (t.isObjectProperty(prop)) collectPatternNames(prop.value as t.Node, out);
-        }
-        return;
-    }
-    if (t.isRestElement(pat)) {
-        collectPatternNames(pat.argument, out);
-        return;
-    }
-    if (t.isAssignmentPattern(pat)) {
-        collectPatternNames(pat.left, out);
-        return;
-    }
 }
 
 /**

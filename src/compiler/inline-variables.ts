@@ -112,12 +112,21 @@ function trySingleUseInline(
     // Init must be pure — we're moving it to a new evaluation point.
     if (mayHaveSideEffects(init)) return false;
 
+    // Closure InlineVariables.StandardVarExpert.canMoveExpression — refuses to
+    // relocate any expression that reads a property (GETPROP/GETELEM). The
+    // property could be mutated between def and use, and this pass has no
+    // flow-sensitive view to prove otherwise. FlowSensitiveInlineVariables
+    // (paired with MustBeReachingVariableDef) is what handles that case.
+    if (containsPropertyRead(init)) return false;
+
     const initPath = path.get('init') as NodePath<t.Expression | null | undefined>;
     if (!initPath.node) return false;
     if (initFreeVarsAreUnstable(initPath as NodePath<t.Expression>, path.scope)) return false;
 
     const refPath = binding.referencePaths[0];
     if (!refPath) return false;
+
+    if (!isPlainRead(refPath)) return false;
 
     if (crossesAsyncBoundary(path, refPath)) return false;
 
@@ -260,6 +269,10 @@ function isPlainRead(refPath: NodePath): boolean {
     if ((t.isFunctionDeclaration(parent) || t.isFunctionExpression(parent) || t.isClassDeclaration(parent) || t.isClassExpression(parent)) && parent.id === refPath.node) return false;
     // parameter binding
     if (t.isFunction(parent) && Array.isArray(parent.params) && parent.params.includes(refPath.node as t.Identifier)) return false;
+    // export specifier — `local` must remain an Identifier; substituting a
+    // literal there would violate the AST spec. Common in bundle-mode where
+    // a chunk may carry `export { K }` after `const K = 42`.
+    if (t.isExportSpecifier(parent)) return false;
     return true;
 }
 
@@ -306,6 +319,33 @@ function crossesAsyncBoundary(defPath: NodePath, usePath: NodePath): boolean {
         p = p.parentPath;
     }
     return false;
+}
+
+// True iff `node` (or any subexpression) is a property read. We treat these
+// as unsafe to relocate because we have no flow-sensitive view that would
+// prove the property isn't mutated between def and use.
+function containsPropertyRead(node: t.Node): boolean {
+    if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) return true;
+    let found = false;
+    // biome-ignore lint/suspicious/noExplicitAny: structural walk
+    const walk = (n: any) => {
+        if (found || n === null || typeof n !== 'object') return;
+        if (Array.isArray(n)) {
+            for (const c of n) walk(c);
+            return;
+        }
+        if (typeof n.type !== 'string') return;
+        if (n.type === 'MemberExpression' || n.type === 'OptionalMemberExpression') {
+            found = true;
+            return;
+        }
+        for (const k of Object.keys(n)) {
+            if (k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments') continue;
+            walk(n[k]);
+        }
+    };
+    walk(node);
+    return found;
 }
 
 // A primitive literal is cheap to re-evaluate (no allocation, no observable

@@ -81,16 +81,17 @@ describe('Normalize.renameForFlatten', () => {
         expect(r.renamed).toBe(1);
     });
 
-    it('leaves sibling-block let bindings alone (no ancestor collision)', () => {
+    it('renames sibling-block let bindings to a unique name per function', () => {
         const r = runRename(
             'function f() { { let i = 1; sink(i); } { let i = 2; sink(i); } }',
         );
-        // Sibling block scopes never see each other's bindings, so renaming
-        // for readability's sake would just add noise. Block-merge safety is
-        // enforced at merge time by `tryMergeBlock`'s sibling-collision guard.
+        // ContextualRenamer-style: every nested binding inside the function
+        // is uniquified so `tryMergeBlock(ignoreBlockScopedDeclarations=true)`
+        // can splice blindly without sibling-collision checks.
         expect(r.code).toMatch(/let i = 1/);
-        expect(r.code).toMatch(/let i = 2/);
-        expect(r.code).not.toMatch(/i__\d+/);
+        expect(r.code).toMatch(/let i__1 = 2/);
+        expect(r.code).toMatch(/sink\(i__1\)/);
+        expect(r.renamed).toBe(1);
     });
 
     it('renames inner function-declarations that collide with an outer var', () => {

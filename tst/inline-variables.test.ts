@@ -37,6 +37,29 @@ describe('inlineVariables', () => {
         expect(stats.inlined).toBe(0);
     });
 
+    it('does not single-use-inline a property read past a mutation of the same property', () => {
+        // Closure InlineVariables.canMoveExpression — GETPROP inits can't be
+        // relocated by this non-flow-sensitive pass. Regression for the
+        // `addBroadphaseLayer` bug where `const index = layers.broadphaseLayers;
+        // layers.broadphaseLayers += 1; return index;` was rewritten to
+        // `layers.broadphaseLayers += 1; return layers.broadphaseLayers;` —
+        // observing the post-increment value.
+        const { out, stats } = run(
+            `function f(o) { const i = o.n; o.n += 1; return i; }`,
+        );
+        expect(out).toContain('const i = o.n');
+        expect(out).toContain('return i');
+        expect(stats.inlined).toBe(0);
+    });
+
+    it('does not single-use-inline a nested property read', () => {
+        const { out } = run(
+            `function f(o) { const v = o.a.b; o.a.b = 99; return v; }`,
+        );
+        expect(out).toContain('const v = o.a.b');
+        expect(out).toContain('return v');
+    });
+
     it('does not inline impure init', () => {
         const { out, stats } = run(`const x = sideEffect(); console.log(x);`);
         expect(out).toContain('const x = sideEffect()');

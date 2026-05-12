@@ -1,22 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import compilecatDefault, { unplugin } from '../src/index';
+import compilecatDefault, { compilecat } from '../src/index';
 
 describe('compilecat smoke', () => {
-    it('exports unplugin factory', () => {
-        expect(unplugin).toBeDefined();
-        expect(typeof unplugin.vite).toBe('function');
-        expect(typeof unplugin.webpack).toBe('function');
-        expect(typeof unplugin.rollup).toBe('function');
-        expect(typeof unplugin.esbuild).toBe('function');
-        expect(typeof unplugin.rolldown).toBe('function');
+    it('exports a plugin factory', () => {
+        expect(typeof compilecat).toBe('function');
     });
 
-    it('default export is the unplugin factory', () => {
-        expect(compilecatDefault).toBe(unplugin);
+    it('default export is the plugin factory', () => {
+        expect(compilecatDefault).toBe(compilecat);
     });
 
-    it('vite plugin is wireable', () => {
-        const plugin = unplugin.vite();
-        expect(plugin).toBeDefined();
+    it('produces a rollup-shaped plugin', () => {
+        const plugin = compilecat();
+        expect(plugin.name).toBe('compilecat');
+        expect(typeof plugin.renderChunk).toBe('function');
     });
 });

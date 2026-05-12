@@ -1,15 +1,9 @@
-import type { FileCache } from './file-index';
-import type { FileReader } from './resolve';
 export type TransformOptions = {
     sourceMaps?: boolean;
     /** Filename for sourcemap purposes. */
     filename?: string;
-    /** Shared cache for cross-file inlining. When omitted, cross-file is off. */
-    fileCache?: FileCache;
-    /** Custom file reader (defaults to disk). */
-    fileReader?: FileReader;
-    /** Permit `node_modules` inlining when the call site opts in. */
-    allowLibraryInline?: boolean;
+    /** Incoming source map to chain through (e.g. from rollup's chunk). */
+    inputSourceMap?: unknown;
 };
 export type TransformResult = {
     code: string;

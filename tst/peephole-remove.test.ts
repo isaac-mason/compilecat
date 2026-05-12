@@ -130,6 +130,27 @@ describe('PeepholeRemoveDeadCode', () => {
         expect(r.code).toContain('foo()');
         expect(r.code).toContain('if');
     });
+
+    it('drops bare-member-access expression statement (assumeGettersArePure)', () => {
+        // Closure AstAnalyzer with default `assumeGettersArePure=true` treats
+        // `Number.POSITIVE_INFINITY` as side-effect-free, so foldExpressionStatement
+        // collapses it. Regression: orphan RHS left by DAE on
+        // `bounds_0 = Number.POSITIVE_INFINITY` followed by an overwrite.
+        const r = rm('function f() { Number.POSITIVE_INFINITY; return 1; }');
+        expect(r.code).not.toContain('POSITIVE_INFINITY');
+        expect(r.code).toContain('return 1');
+    });
+
+    it('drops nested-member-access expression statement', () => {
+        const r = rm('function f() { a.b.c; return 1; }');
+        expect(r.code).not.toContain('a.b.c');
+    });
+
+    it('keeps member access whose object has side effects', () => {
+        // `foo().bar` — the call itself is impure, so the whole expr must stay.
+        const r = rm('function f() { foo().bar; return 1; }');
+        expect(r.code).toContain('foo()');
+    });
 });
 
 describe('PeepholeRemoveDeadCode — tryFoldLabel', () => {

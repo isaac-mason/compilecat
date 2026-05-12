@@ -14,17 +14,10 @@ const external = [
 	'@babel/parser',
 	'@babel/traverse',
 	'@babel/types',
-	'unplugin',
+	'rollup',
 ];
 
-const entries = [
-	'index',
-	'vite',
-	'webpack',
-	'rollup',
-	'esbuild',
-	'rolldown',
-];
+const entries = ['index', 'vite', 'rollup', 'rolldown'];
 
 export default entries.map((entry) => ({
 	input: `./src/${entry}.ts`,

@@ -39,16 +39,39 @@ function gen(n: t.Node): string {
 
 describe('FlowSensitiveInlineVariables', () => {
     it('inlines a single def into a single use', () => {
+        // Closure FlowSensitiveInlineVariables.inlineVariable (NameDeclaration
+        // branch) detaches the rhs but leaves the bare declarator `var x;` so
+        // any later reassignments still have a target. DAE/RemoveUnusedCode
+        // clean it up downstream when the whole chain is dead.
         const r = run('function f() { var x = 1; return x; }');
         expect(r.inlined).toBe(1);
         expect(r.code).toContain('return 1');
-        expect(r.code).not.toMatch(/var x/);
+        expect(r.code).toContain('var x;');
     });
 
     it('inlines a top-level assign def', () => {
         const r = run('function f(p) { var x; x = p + 1; return x; }');
         expect(r.inlined).toBe(1);
         expect(r.code).toContain('return p + 1');
+    });
+
+    it('preserves the bare declarator so a subsequent write still binds', () => {
+        // Regression: closure-aligned inlineVariable must not orphan the
+        // subsequent `firstLinkTo = ...` writes by removing the declarator.
+        // The first use is inlined; the trailing write must still have a
+        // binding to target — i.e. `let firstLinkTo;` survives the removal
+        // of the init.
+        const r = run(
+            `function f(a, b) {
+                let firstLinkTo = a;
+                use(firstLinkTo);
+                firstLinkTo = b;
+            }`,
+        );
+        expect(r.inlined).toBe(1);
+        expect(r.code).toMatch(/let firstLinkTo;/);
+        expect(r.code).toContain('use(a)');
+        expect(r.code).toContain('firstLinkTo = b');
     });
 
     it('does not inline when the var is used twice', () => {

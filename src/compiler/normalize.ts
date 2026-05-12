@@ -77,21 +77,22 @@ export function makeDeclaredNamesUnique(file: t.File): NormalizeResult {
 }
 
 /**
- * Per-function demand-driven α-rename. Walks nested scopes inside `fnPath`
- * top-down; for every owned binding whose base name is already declared by
- * an *ancestor* scope (within this function), renames it via Babel's
- * `scope.rename` so the binding doesn't shadow the ancestor name.
+ * Per-function α-rename, ContextualRenamer-style
+ * (MakeDeclaredNamesUnique.java:265-380). Walks nested scopes inside `fnPath`
+ * top-down; for every owned binding whose base name has already been declared
+ * *anywhere* within this function (ancestor OR sibling scope visited earlier),
+ * renames it via Babel's `scope.rename` so the name becomes globally unique
+ * inside the function subtree.
  *
- * Sibling scopes are intentionally NOT renamed against each other: two
- * sibling `if`-consequents can both declare `const dx` and never collide
- * because neither block ever ends up in the other's lexical scope. The
- * authored names are preserved for readability.
+ * This eager uniqueness is the invariant Closure's `isASTNormalized()`
+ * actually promises, and it's what lets `tryMergeBlock` splice a nested
+ * block into its parent with `ignoreBlockScopedDeclarations=true` without
+ * any further collision checks — sibling collisions can't exist by
+ * construction.
  *
- * If two sibling blocks both could be flattened into a shared statement-
- * block ancestor (rare: requires both siblings to be plain BlockStatements
- * sitting in the same parent statement list, not if/loop bodies), the
- * resulting name collision is caught at merge time by `tryMergeBlock`'s
- * sibling-collision guard — that block-merge is rejected instead.
+ * Cost: more `__N` suffixes in intermediate output (Closure pays the same
+ * cost). Since we feed a downstream bundler/minifier the suffix-noise is
+ * absorbed at the next stage.
  *
  * Nested functions are skipped; they're renamed by their own invocation.
  */
@@ -136,8 +137,9 @@ export function renameForFlatten(fnPath: NodePath<t.Function>): number {
                     // in block-flatten, so leaving them as-is is safe.
                     if (binding.kind === 'param') continue;
 
-                    if (active.has(baseName)) {
-                        // Ancestor shadowing — rename.
+                    if (allNames.has(baseName)) {
+                        // Already declared somewhere in this function
+                        // (ancestor or earlier-visited sibling) — rename.
                         const newName = pickFreshName(baseName, allNames);
                         p.scope.rename(baseName, newName);
                         active.add(newName);

@@ -1,3 +1,1 @@
-import { unplugin } from './index';
-
-export default unplugin.vite;
+export { compilecat as default } from './plugin';

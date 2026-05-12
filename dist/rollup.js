@@ -1,10 +1,7 @@
-import { createUnplugin } from 'unplugin';
 import * as t from '@babel/types';
 import { parse } from '@babel/parser';
 import _generate from '@babel/generator';
 import _traverse from '@babel/traverse';
-import * as fs from 'node:fs';
-import * as nodePath from 'node:path';
 
 // Authored `@*` directive vocabulary, ported from src/plugin/analyses/directives.ts.
 // Standalone — no cross-tree imports. Same regex shapes so behavior matches.
@@ -59,420 +56,6 @@ function matchLeadingComment(n, pred) {
 const unwrap = (mod) => mod.default ?? mod;
 const generate = unwrap(_generate);
 const traverse = unwrap(_traverse);
-
-// Per-file index. Mirrors src/plugin/analyses/discover.ts; standalone — no
-// cross-tree imports. Surfaces the structural facts the cross-file inliner
-// needs:
-//   - Top-level functions (with annotations)
-//   - Module-scope variables (scratch buffers, constants)
-//   - Imports (named / default / namespace)
-//   - Namespace re-exports (`export * as X from './Y'`)
-//   - Per-function free references to top-level names
-//
-// Pure: parse + walk, no AST mutation. Re-invoke after mutations invalidate
-// the previous index.
-const INLINE_PATTERN = DIRECTIVE_PATTERNS.inline;
-const FLATTEN_PATTERN = DIRECTIVE_PATTERNS.flatten;
-const OPTIMIZE_PATTERN = DIRECTIVE_PATTERNS.optimize;
-function hasBlockAnnotation(node, pattern) {
-    if (!node)
-        return false;
-    const comments = node.leadingComments;
-    if (!comments)
-        return false;
-    return comments.some((c) => c.type === 'CommentBlock' && pattern.test(c.value));
-}
-function hasInlineAnnotation$1(node) {
-    return hasBlockAnnotation(node, INLINE_PATTERN);
-}
-function hasFlattenAnnotation$1(node) {
-    return (hasBlockAnnotation(node, FLATTEN_PATTERN) ||
-        hasBlockAnnotation(node, OPTIMIZE_PATTERN));
-}
-function indexFile(absolutePath, ast) {
-    const functions = new Map();
-    const moduleVars = new Map();
-    const imports = new Map();
-    const namespaceReexports = new Map();
-    for (const stmt of ast.program.body) {
-        collectStatement(stmt, absolutePath, functions, moduleVars, imports, namespaceReexports, false, false);
-    }
-    for (const fn of functions.values()) {
-        analyzeFreeRefs(fn, functions, moduleVars, imports, ast);
-    }
-    return { absolutePath, ast, functions, moduleVars, imports, namespaceReexports };
-}
-function collectStatement(stmt, sourceFile, functions, moduleVars, imports, namespaceReexports, inheritedInline, inheritedFlatten) {
-    const localInline = inheritedInline || hasInlineAnnotation$1(stmt);
-    const localFlatten = inheritedFlatten || hasFlattenAnnotation$1(stmt);
-    if (t.isImportDeclaration(stmt)) {
-        recordImports(stmt, imports);
-        return;
-    }
-    if (t.isExportNamedDeclaration(stmt)) {
-        if (stmt.source && stmt.specifiers.length > 0) {
-            for (const spec of stmt.specifiers) {
-                if (t.isExportNamespaceSpecifier(spec)) {
-                    namespaceReexports.set(spec.exported.name, stmt.source.value);
-                }
-            }
-        }
-        if (stmt.declaration) {
-            collectStatement(stmt.declaration, sourceFile, functions, moduleVars, imports, namespaceReexports, localInline, localFlatten);
-        }
-        return;
-    }
-    if (t.isExportDefaultDeclaration(stmt)) {
-        const decl = stmt.declaration;
-        if (t.isFunctionDeclaration(decl) ||
-            t.isFunctionExpression(decl) ||
-            t.isArrowFunctionExpression(decl)) {
-            functions.set('default', buildFunctionEntry('default', sourceFile, decl, localInline, localFlatten));
-        }
-        return;
-    }
-    if (t.isFunctionDeclaration(stmt) && stmt.id) {
-        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, localInline, localFlatten));
-        return;
-    }
-    if (t.isTSEnumDeclaration(stmt)) {
-        moduleVars.set(stmt.id.name, { name: stmt.id.name, declaration: stmt, isExported: false });
-        return;
-    }
-    if (t.isVariableDeclaration(stmt)) {
-        for (const decl of stmt.declarations) {
-            if (!t.isIdentifier(decl.id))
-                continue;
-            const name = decl.id.name;
-            if (decl.init &&
-                (t.isArrowFunctionExpression(decl.init) || t.isFunctionExpression(decl.init))) {
-                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, localInline, localFlatten));
-            }
-            else {
-                moduleVars.set(name, { name, declaration: stmt, isExported: false });
-            }
-        }
-        return;
-    }
-}
-function buildFunctionEntry(name, sourceFile, fn, inlineAnnot, flattenAnnot) {
-    const body = t.isBlockStatement(fn.body)
-        ? fn.body
-        : t.blockStatement([t.returnStatement(fn.body)]);
-    const { isSimpleReturn, returnExpression } = classifyBody(body);
-    const kind = t.isFunctionDeclaration(fn)
-        ? 'declaration'
-        : t.isArrowFunctionExpression(fn)
-            ? 'arrow'
-            : 'expression';
-    return {
-        name,
-        sourceFile,
-        kind,
-        fnNode: fn,
-        params: fn.params,
-        body,
-        hasInlineAnnotation: inlineAnnot,
-        hasFlattenAnnotation: flattenAnnot,
-        isSimpleReturn,
-        returnExpression,
-        moduleVarRefs: new Set(),
-        functionRefs: new Set(),
-        importRefs: new Set(),
-        unresolvedRefs: new Set(),
-    };
-}
-function classifyBody(body) {
-    if (body.body.length !== 1)
-        return { isSimpleReturn: false, returnExpression: null };
-    const only = body.body[0];
-    if (!t.isReturnStatement(only))
-        return { isSimpleReturn: false, returnExpression: null };
-    if (!only.argument)
-        return { isSimpleReturn: false, returnExpression: null };
-    return { isSimpleReturn: true, returnExpression: only.argument };
-}
-function recordImports(decl, imports) {
-    const source = decl.source.value;
-    for (const spec of decl.specifiers) {
-        if (t.isImportSpecifier(spec)) {
-            const importedName = t.isIdentifier(spec.imported)
-                ? spec.imported.name
-                : spec.imported.value;
-            imports.set(spec.local.name, {
-                localName: spec.local.name,
-                importedName,
-                style: 'named',
-                source,
-            });
-        }
-        else if (t.isImportDefaultSpecifier(spec)) {
-            imports.set(spec.local.name, {
-                localName: spec.local.name,
-                importedName: 'default',
-                style: 'default',
-                source,
-            });
-        }
-        else if (t.isImportNamespaceSpecifier(spec)) {
-            imports.set(spec.local.name, {
-                localName: spec.local.name,
-                importedName: '*',
-                style: 'namespace',
-                source,
-            });
-        }
-    }
-}
-function analyzeFreeRefs(fn, functions, moduleVars, imports, ast) {
-    let rootPath = null;
-    traverse(ast, {
-        FunctionDeclaration(path) {
-            if (path.node.id?.name === fn.name) {
-                rootPath = path;
-                path.stop();
-            }
-        },
-        VariableDeclarator(path) {
-            if (t.isIdentifier(path.node.id) &&
-                path.node.id.name === fn.name &&
-                (t.isArrowFunctionExpression(path.node.init) ||
-                    t.isFunctionExpression(path.node.init))) {
-                rootPath = path.get('init');
-                path.stop();
-            }
-        },
-        ExportDefaultDeclaration(path) {
-            if (fn.name !== 'default')
-                return;
-            const decl = path.node.declaration;
-            if (t.isFunctionDeclaration(decl) ||
-                t.isFunctionExpression(decl) ||
-                t.isArrowFunctionExpression(decl)) {
-                rootPath = path.get('declaration');
-                path.stop();
-            }
-        },
-    });
-    if (!rootPath)
-        return;
-    const safePath = rootPath;
-    // Babel's scope plugin doesn't bind TSEnumDeclaration (and a few other TS-only
-    // forms), so `getBinding` is `null` for valid top-level enum refs. When the
-    // scope is silent, fall back to the top-level index — `getBinding` would have
-    // returned a *non-Program* binding if any inner local shadowed the name, so a
-    // null result is safe to resolve against module-scope.
-    safePath.traverse({
-        Identifier(innerPath) {
-            const name = innerPath.node.name;
-            if (!innerPath.isReferencedIdentifier())
-                return;
-            const scopeBinding = innerPath.scope.getBinding(name);
-            if (scopeBinding && scopeBinding.scope.block.type !== 'Program')
-                return;
-            if (functions.has(name))
-                fn.functionRefs.add(name);
-            else if (moduleVars.has(name))
-                fn.moduleVarRefs.add(name);
-            else if (imports.has(name))
-                fn.importRefs.add(name);
-            else if (scopeBinding)
-                fn.unresolvedRefs.add(name);
-        },
-    });
-}
-
-// Path resolution for cross-file inlining.
-//
-// Two modes:
-//   - Same-project (relative + absolute paths). Always allowed; probes
-//     extensions and index files.
-//   - Library (bare specifier `lodash`, `@scope/pkg/sub`). Only consulted
-//     when the call site explicitly opts in via `/* @inline */`. Walks up
-//     `node_modules`, honors package.json `exports` / `main` / `module`.
-//
-// FileReader abstraction lets tests inject a virtual filesystem. Library
-// resolution always reads package.json directly from disk.
-const defaultFileReader = (absolutePath) => {
-    try {
-        return fs.readFileSync(absolutePath, 'utf-8');
-    }
-    catch {
-        return null;
-    }
-};
-const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
-function diskExists(path) {
-    try {
-        return fs.statSync(path).isFile();
-    }
-    catch {
-        return false;
-    }
-}
-function makeExists(reader) {
-    if (!reader)
-        return diskExists;
-    return (path) => reader(path) !== null;
-}
-function probeWithExtensions(base, exists) {
-    if (exists(base))
-        return base;
-    for (const ext of SOURCE_EXTENSIONS) {
-        if (exists(base + ext))
-            return base + ext;
-    }
-    for (const ext of SOURCE_EXTENSIONS) {
-        const p = nodePath.join(base, `index${ext}`);
-        if (exists(p))
-            return p;
-    }
-    return null;
-}
-function resolveRelativeImport(fromFile, specifier, reader) {
-    if (!specifier.startsWith('./') &&
-        !specifier.startsWith('../') &&
-        !specifier.startsWith('/')) {
-        return null;
-    }
-    const base = nodePath.isAbsolute(specifier)
-        ? specifier
-        : nodePath.resolve(nodePath.dirname(fromFile), specifier);
-    return probeWithExtensions(base, makeExists(reader));
-}
-function splitBareSpecifier(specifier) {
-    if (specifier.startsWith('@')) {
-        const parts = specifier.split('/');
-        if (parts.length < 2)
-            return [specifier, '.'];
-        const name = `${parts[0]}/${parts[1]}`;
-        const sub = parts.length > 2 ? `./${parts.slice(2).join('/')}` : '.';
-        return [name, sub];
-    }
-    const idx = specifier.indexOf('/');
-    if (idx < 0)
-        return [specifier, '.'];
-    return [specifier.slice(0, idx), `./${specifier.slice(idx + 1)}`];
-}
-function findPackageRoot(fromDir, pkgName) {
-    let dir = fromDir;
-    for (;;) {
-        const candidate = nodePath.join(dir, 'node_modules', pkgName);
-        if (diskExists(nodePath.join(candidate, 'package.json'))) {
-            return candidate;
-        }
-        const parent = nodePath.dirname(dir);
-        if (parent === dir)
-            return null;
-        dir = parent;
-    }
-}
-function readPackageJson(pkgRoot) {
-    try {
-        const raw = fs.readFileSync(nodePath.join(pkgRoot, 'package.json'), 'utf-8');
-        return JSON.parse(raw);
-    }
-    catch {
-        return null;
-    }
-}
-const EXPORT_CONDITIONS = ['import', 'module', 'default', 'require'];
-function resolveThroughExports(exportsField, subpath) {
-    if (!exportsField || typeof exportsField !== 'object')
-        return null;
-    const exps = exportsField;
-    if (typeof exportsField === 'string') {
-        return subpath === '.' ? exportsField : null;
-    }
-    const directKey = subpath === '.' ? '.' : subpath;
-    const entry = exps[directKey];
-    if (entry === undefined)
-        return null;
-    return resolveConditionEntry(entry);
-}
-function resolveConditionEntry(entry) {
-    if (typeof entry === 'string')
-        return entry;
-    if (!entry || typeof entry !== 'object')
-        return null;
-    const obj = entry;
-    for (const cond of EXPORT_CONDITIONS) {
-        if (cond in obj) {
-            const resolved = resolveConditionEntry(obj[cond]);
-            if (resolved)
-                return resolved;
-        }
-    }
-    return null;
-}
-function resolveLibraryImport(fromFile, specifier) {
-    const [pkgName, subpath] = splitBareSpecifier(specifier);
-    const pkgRoot = findPackageRoot(nodePath.dirname(fromFile), pkgName);
-    if (!pkgRoot)
-        return null;
-    const pkg = readPackageJson(pkgRoot);
-    if (!pkg)
-        return null;
-    const exists = diskExists;
-    const exportTarget = resolveThroughExports(pkg.exports, subpath);
-    if (exportTarget) {
-        return probeWithExtensions(nodePath.join(pkgRoot, exportTarget), exists);
-    }
-    if (subpath === '.') {
-        const target = pkg.module ?? pkg.main;
-        if (target)
-            return probeWithExtensions(nodePath.join(pkgRoot, target), exists);
-        return probeWithExtensions(nodePath.join(pkgRoot, 'index'), exists);
-    }
-    return probeWithExtensions(nodePath.join(pkgRoot, subpath), exists);
-}
-function resolveImportSource(fromFile, specifier, allowLibrary, reader) {
-    const rel = resolveRelativeImport(fromFile, specifier, reader);
-    if (rel)
-        return rel;
-    if (allowLibrary)
-        return resolveLibraryImport(fromFile, specifier);
-    return null;
-}
-
-// Lazy, cached cross-file indexing.
-//
-//   - createFileCache() returns a mutable cache; share across multiple
-//     transform calls in one build to amortize parse/index cost.
-//   - ensureIndexed(cache, path, reader) parses + indexes if not cached and
-//     returns the index. null when the file can't be read or parsed.
-//   - Cycle-guard sentinel ('in-progress') breaks A→B→A recursion.
-function createFileCache() {
-    return { entries: new Map() };
-}
-function ensureIndexed(cache, absolutePath, reader = defaultFileReader) {
-    const existing = cache.entries.get(absolutePath);
-    if (existing === 'in-progress')
-        return null;
-    if (existing)
-        return existing;
-    cache.entries.set(absolutePath, 'in-progress');
-    const code = reader(absolutePath);
-    if (code === null) {
-        cache.entries.delete(absolutePath);
-        return null;
-    }
-    let ast;
-    try {
-        ast = parse(code, {
-            sourceType: 'module',
-            plugins: ['typescript', 'jsx'],
-            sourceFilename: absolutePath,
-        });
-    }
-    catch {
-        cache.entries.delete(absolutePath);
-        return null;
-    }
-    const index = indexFile(absolutePath, ast);
-    cache.entries.set(absolutePath, index);
-    return index;
-}
 
 // Port of jscomp/NodeUtil.java (subset).
 //
@@ -586,91 +169,14 @@ function tryMergeBlock(block, parentBody, indexInParent, parent, ignoreBlockScop
     const canMerge = ignoreBlockScopedDeclarations || canMergeBlock(block);
     if (!canMerge)
         return 0;
-    // Even when names are ancestor-unique, sibling block-scoped decls inside
-    // the same statement-list can still collide on merge. Block-flatten with
-    // `ignoreBlockScopedDeclarations=true` assumes nested names are unique
-    // vs ancestors; it does NOT assume sibling-block uniqueness. Refuse the
-    // merge when splicing would introduce a duplicate let/const/class/fn
-    // binding name into `parentBody`.
-    if (ignoreBlockScopedDeclarations) {
-        const incoming = collectBlockScopedNames(block.body);
-        if (incoming.size > 0) {
-            for (let i = 0; i < parentBody.length; i++) {
-                if (i === indexInParent)
-                    continue;
-                const sibling = parentBody[i];
-                if (sibling === undefined)
-                    continue;
-                if (siblingDeclaresAny(sibling, incoming))
-                    return 0;
-            }
-        }
-    }
+    // When `ignoreBlockScopedDeclarations` is true, the caller has run
+    // `renameForFlatten` (ContextualRenamer-style) which guarantees every
+    // nested let/const/class/fn name in the function is unique vs every
+    // other nested name. Sibling collisions can't exist by construction —
+    // no further check needed.
     const inserted = block.body.length;
     parentBody.splice(indexInParent, 1, ...block.body);
     return inserted;
-}
-function collectBlockScopedNames(stmts) {
-    const out = new Set();
-    for (const s of stmts)
-        collectBlockScopedNamesInto(s, out);
-    return out;
-}
-function collectBlockScopedNamesInto(s, out) {
-    if (t.isLabeledStatement(s)) {
-        collectBlockScopedNamesInto(s.body, out);
-        return;
-    }
-    if (t.isVariableDeclaration(s) && (s.kind === 'const' || s.kind === 'let')) {
-        for (const d of s.declarations)
-            collectPatternNames(d.id, out);
-        return;
-    }
-    if (t.isClassDeclaration(s) && s.id !== null && s.id !== undefined) {
-        out.add(s.id.name);
-        return;
-    }
-    if (t.isFunctionDeclaration(s) && s.id !== null && s.id !== undefined) {
-        out.add(s.id.name);
-        return;
-    }
-}
-function siblingDeclaresAny(s, names) {
-    const declared = new Set();
-    collectBlockScopedNamesInto(s, declared);
-    for (const n of declared)
-        if (names.has(n))
-            return true;
-    return false;
-}
-function collectPatternNames(pat, out) {
-    if (t.isIdentifier(pat)) {
-        out.add(pat.name);
-        return;
-    }
-    if (t.isArrayPattern(pat)) {
-        for (const el of pat.elements)
-            if (el !== null)
-                collectPatternNames(el, out);
-        return;
-    }
-    if (t.isObjectPattern(pat)) {
-        for (const prop of pat.properties) {
-            if (t.isRestElement(prop))
-                collectPatternNames(prop.argument, out);
-            else if (t.isObjectProperty(prop))
-                collectPatternNames(prop.value, out);
-        }
-        return;
-    }
-    if (t.isRestElement(pat)) {
-        collectPatternNames(pat.argument, out);
-        return;
-    }
-    if (t.isAssignmentPattern(pat)) {
-        collectPatternNames(pat.left, out);
-        return;
-    }
 }
 /**
  * Closure's `isLiteralValue` — recognises primitive literal nodes used by
@@ -1035,11 +541,19 @@ function getBooleanValue(n) {
 //   - any call / new
 //   - any assignment / update (++ -- compound assigns)
 //   - delete
-//   - member access (might trigger a getter)
 //   - yield / await / throw
 //   - tagged templates
 //   - everything we don't recognise — Closure errs on the side of "may have
 //     side effects" and we follow.
+//
+// Member access (`obj.prop`, `obj[k]`, optional-chain variants) is treated
+// as pure when the object (and computed key, if any) is itself pure. This
+// matches Closure's AstAnalyzer with `assumeGettersArePure=true` — its
+// default mode (AstAnalyzer.java:434-437). The risk is user-defined
+// getters firing as side effects; Closure documents the alternative —
+// flagging every getprop impure — as having "completely unacceptable" code
+// size cost. We follow that policy, especially since the downstream bundler
+// or minifier (esbuild, terser) makes the same assumption.
 function mayHaveSideEffects(node) {
     return !isPure(node);
 }
@@ -1121,6 +635,16 @@ function isPure(node) {
         // Untagged template — no effects from the template itself, only the
         // inserted expressions matter.
         return node.expressions.every((e) => t.isExpression(e) && isPure(e));
+    }
+    if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node)) {
+        // Closure AstAnalyzer.java:434-437 (GETPROP/OPTCHAIN_GETPROP) and
+        // :432 (GETELEM/OPTCHAIN_GETELEM): with assumeGettersArePure (the
+        // default), a property read is pure iff the children are pure.
+        if (!isPure(node.object))
+            return false;
+        if (node.computed && !isPure(node.property))
+            return false;
+        return true;
     }
     return false;
 }
@@ -2297,38 +1821,35 @@ function calleeName(fn) {
 // Port of jscomp/InlineFunctions.java (subset).
 //
 // Drives FunctionInjector: discovers candidate callees and call sites within
-// a single program, classifies each, and performs the splice.
+// a single Program, classifies each, and performs the splice.
 //
-// v1 scope (same-file only):
+// Operates on a single Program — in bundle-mode this is the entire chunk
+// after rollup has resolved imports. No cross-file resolution; if you can
+// see the callee in the program, it's a candidate.
+//
 //   - Candidate callees:
 //     - `function NAME(...) { ... }` declarations at any block scope
 //     - `const NAME = (...) => { ... }` / `const NAME = function (...) { ... }`
 //   - Trigger:
 //     - declaration carries an `@inline` JSDoc / leading block comment, OR
-//     - call expression carries an `@inline` leading block comment
+//     - call expression carries an `@inline` leading block comment, OR
+//     - call sits inside a `@flatten`-annotated function
 //   - Call sites:
 //     - `NAME(args)` — Identifier callee matching a known candidate
-//   - No method calls, no `this`/`arguments`, no recursion, no cross-file.
+//   - No method calls, no `this`/`arguments`, no recursion.
 //
 // Discovery is name-keyed. We don't model scope shadowing — if two callees
 // share a name (top-level vs. nested), we conservatively treat the
-// outermost as the only candidate. Cross-file inlining lives in the
-// classic tree's `inline.ts` and is out of scope for v1 of the gcc port.
+// outermost as the only candidate.
 // ---------------------------------------------------------------------------
 // Public entry.
-function inlineFunctions(root, options = {}) {
+function inlineFunctions(root) {
     const result = { inlined: 0, calls: 0, succeeded: 0 };
-    // Discover top-level (and nested) candidate functions.
     const candidates = new Map();
     discoverCandidates(root, candidates);
-    // Cross-file context. Built once so the consumerIndex (free-ref analysis)
-    // is shared across every call-site lookup.
-    const xfile = buildCrossFileCtx(root, options);
-    if (candidates.size === 0 && !xfile)
+    if (candidates.size === 0)
         return result;
-    // Find call sites and inject. We pre-collect sites in a single pass so
-    // that injection-time AST mutation can't disturb the iteration.
-    const sites = collectCallSites(root, candidates, xfile);
+    const sites = collectCallSites(root, candidates);
     let nextId = 0;
     const opts = { nextId: () => nextId++ };
     for (const { candidate, site } of sites) {
@@ -2341,49 +1862,23 @@ function inlineFunctions(root, options = {}) {
         if (cls.mode === 'DIRECT') {
             ok = inlineDirect(candidate.callee, site);
             if (!ok) {
-                // Fall back to BLOCK if DIRECT can't substitute (e.g. side-effect
-                // arg used twice).
                 ok = inlineBlock(candidate.callee, site, opts);
             }
         }
         else {
             ok = inlineBlock(candidate.callee, site, opts);
         }
-        if (ok) {
+        if (ok)
             result.succeeded++;
-            if (xfile && candidate.donor)
-                trackDonorRefs(candidate, xfile);
-        }
     }
     if (result.succeeded > 0)
         result.inlined = candidates.size;
-    // Strip declaration-annotated callees once consumed. Conservative: only
-    // strip if we successfully inlined at least one call. We don't yet track
-    // per-candidate consumption, so we leave the declaration in place if any
-    // identifier remains referencing it.
-    stripFullyInlinedDecls(root, candidates, sites);
-    // Hoist donor-side module-vars and imports referenced by spliced bodies.
-    if (xfile && t.isFile(root)) {
-        if (xfile.requiredImports.size > 0) {
-            hoistRequiredImports(root, xfile);
-        }
-        if (xfile.requiredModuleVars.size > 0) {
-            hoistRequiredModuleVars(root, xfile);
-        }
-    }
+    stripFullyInlinedDecls(candidates, sites);
     return result;
 }
 // ---------------------------------------------------------------------------
 // Candidate discovery.
 function discoverCandidates(root, out) {
-    const flattenInside = new Set();
-    // Pass 1: detect @flatten functions — every call inside their body
-    // becomes a candidate trigger even without explicit @inline.
-    visit$1(root, (n) => {
-        if (t.isFunction(n) && hasFlattenAnnotation(n))
-            flattenInside.add(n);
-    });
-    // Pass 2: register candidates.
     visitWithParents(root, (n, parent, _key, index) => {
         if (t.isFunctionDeclaration(n) && n.id) {
             const params = paramNames(n);
@@ -2395,7 +1890,8 @@ function discoverCandidates(root, out) {
                 callee: { fn: n, paramNames: params },
                 declAnnotated: annotated,
             };
-            if ((parent && (t.isBlockStatement(parent) || t.isProgram(parent))) &&
+            if (parent &&
+                (t.isBlockStatement(parent) || t.isProgram(parent)) &&
                 index !== undefined) {
                 c.declRef = { parent: parent, index };
             }
@@ -2416,7 +1912,8 @@ function discoverCandidates(root, out) {
                     callee: { fn: d.init, paramNames: params },
                     declAnnotated: annotated,
                 };
-                if ((parent && (t.isBlockStatement(parent) || t.isProgram(parent))) &&
+                if (parent &&
+                    (t.isBlockStatement(parent) || t.isProgram(parent)) &&
                     index !== undefined) {
                     c.declRef = { parent: parent, index };
                 }
@@ -2441,36 +1938,14 @@ function hasInlineAnnotation(n, parent = null) {
 function hasFlattenAnnotation(n, parent = null) {
     return hasLeadingDirective(n, parent, commentIsFlattenDirective);
 }
-function buildCrossFileCtx(root, opts) {
-    if (!opts.consumerPath || !opts.fileCache)
-        return null;
-    if (!t.isFile(root))
-        return null;
-    const reader = opts.fileReader ?? defaultFileReader;
-    const consumerIndex = indexFile(opts.consumerPath, root);
-    return {
-        consumerPath: opts.consumerPath,
-        consumerIndex,
-        cache: opts.fileCache,
-        reader,
-        allowLibrary: opts.allowLibraryInline === true,
-        memo: new Map(),
-        requiredModuleVars: new Map(),
-        requiredImports: new Map(),
-    };
-}
-function collectCallSites(root, candidates, xfile) {
+function collectCallSites(root, candidates) {
     const sites = [];
-    // Track current enclosing function (for flatten propagation).
     const flattenStack = [false];
-    const walk = (n, parent, key, index, 
-    // Path of (statementParent, statementIndex, enclosingStatement).
-    stmtCtx) => {
+    const walk = (n, parent, key, index, stmtCtx) => {
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
             flattenStack.push(hasFlattenAnnotation(n, parent));
         }
-        // If this is a Statement child of a Block/Program, update stmtCtx.
         let nextStmtCtx = stmtCtx;
         if (parent &&
             (t.isBlockStatement(parent) || t.isProgram(parent)) &&
@@ -2483,11 +1958,8 @@ function collectCallSites(root, candidates, xfile) {
                 stmt: n,
             };
         }
-        // Detect call site.
-        if (t.isCallExpression(n) &&
-            nextStmtCtx !== null &&
-            parent !== null) {
-            const cand = resolveCandidateForCall(n, candidates, xfile);
+        if (t.isCallExpression(n) && nextStmtCtx !== null && parent !== null) {
+            const cand = resolveCandidateForCall(n, candidates);
             if (cand !== null) {
                 const callsiteAnnotated = hasInlineAnnotationOnCall(n, parent, key);
                 const enclosingFlatten = flattenStack[flattenStack.length - 1];
@@ -2528,350 +2000,15 @@ function collectCallSites(root, candidates, xfile) {
     walk(root, null, '', undefined, null);
     return sites;
 }
-// ---------------------------------------------------------------------------
-// Candidate resolution at a call site (local or cross-file).
-function resolveCandidateForCall(call, localCandidates, xfile) {
+function resolveCandidateForCall(call, candidates) {
     const callee = call.callee;
-    if (t.isIdentifier(callee)) {
-        const name = callee.name;
-        const local = localCandidates.get(name);
-        if (local)
-            return local;
-        if (!xfile)
-            return null;
-        const binding = xfile.consumerIndex.imports.get(name);
-        if (!binding)
-            return null;
-        return resolveImportedCallee(binding.importedName, binding, xfile);
-    }
-    if (t.isMemberExpression(callee) && !callee.computed) {
-        if (!xfile)
-            return null;
-        if (!t.isIdentifier(callee.object))
-            return null;
-        if (!t.isIdentifier(callee.property))
-            return null;
-        const nsName = callee.object.name;
-        const fnName = callee.property.name;
-        const binding = xfile.consumerIndex.imports.get(nsName);
-        if (binding && binding.style === 'namespace') {
-            return resolveImportedCallee(fnName, binding, xfile);
-        }
-        const reexportSource = xfile.consumerIndex.namespaceReexports.get(nsName);
-        if (reexportSource) {
-            const fakeBinding = {
-                source: reexportSource,
-            };
-            return resolveImportedCallee(fnName, fakeBinding, xfile);
-        }
-        // `import { ns } from 'pkg'` where the donor file re-exports `ns` as a
-        // namespace (`export * as ns from './impl'` or
-        // `import * as ns from './impl'; export { ns };`). Follow through.
-        if (binding && binding.style === 'named') {
-            const donorPath = resolveImportSource(xfile.consumerPath, binding.source, xfile.allowLibrary, xfile.reader);
-            if (!donorPath)
-                return null;
-            const donorIndex = ensureIndexed(xfile.cache, donorPath, xfile.reader);
-            if (!donorIndex)
-                return null;
-            let nsSource = donorIndex.namespaceReexports.get(binding.importedName);
-            if (!nsSource) {
-                const nsImport = donorIndex.imports.get(binding.importedName);
-                if (nsImport?.style === 'namespace')
-                    nsSource = nsImport.source;
-            }
-            if (!nsSource)
-                return null;
-            const fakeBinding = {
-                source: nsSource,
-            };
-            // Resolve `fnName` from the *donor* file's perspective.
-            return resolveImportedCalleeFrom(donorPath, fnName, fakeBinding, xfile);
-        }
-    }
+    if (t.isIdentifier(callee))
+        return candidates.get(callee.name) ?? null;
     return null;
 }
-function resolveImportedCallee(importedName, binding, xfile) {
-    return resolveImportedCalleeFrom(xfile.consumerPath, importedName, binding, xfile);
-}
-function resolveImportedCalleeFrom(fromFile, importedName, binding, xfile) {
-    const donorPath = resolveImportSource(fromFile, binding.source, xfile.allowLibrary, xfile.reader);
-    if (!donorPath)
-        return null;
-    const memoKey = `${donorPath}::${importedName}`;
-    if (xfile.memo.has(memoKey))
-        return xfile.memo.get(memoKey) ?? null;
-    const donorIndex = ensureIndexed(xfile.cache, donorPath, xfile.reader);
-    if (!donorIndex) {
-        xfile.memo.set(memoKey, null);
-        return null;
-    }
-    const donorFn = donorIndex.functions.get(importedName);
-    if (!donorFn) {
-        xfile.memo.set(memoKey, null);
-        return null;
-    }
-    const cand = buildCrossFileCandidate(donorFn, donorPath, donorIndex);
-    xfile.memo.set(memoKey, cand);
-    return cand;
-}
-/**
- * Build a Candidate from a donor IndexedFunction. The body's references to
- * donor module-vars and imports are tracked through `Candidate.donor`; on
- * successful inline we register them so the post-pass can hoist clones into
- * the consumer file. Calls to *other* donor functions cannot be hoisted
- * (they would require pulling whole functions across), so we reject those.
- */
-function buildCrossFileCandidate(donorFn, donorPath, donorIndex) {
-    // We don't pull donor function definitions across files. If the donor
-    // body calls another donor function, the splice would leave an unbound
-    // reference in the consumer. Bail.
-    if (donorFn.functionRefs.size > 0)
-        return null;
-    // Donor body references a top-level binding we can't classify
-    // (e.g. TS enums, classes) — the hoister wouldn't know how to bring
-    // it along. Bail rather than emitting a broken inline.
-    if (donorFn.unresolvedRefs.size > 0)
-        return null;
-    const params = [];
-    for (const p of donorFn.params) {
-        if (!t.isIdentifier(p))
-            return null;
-        params.push(p.name);
-    }
-    return {
-        name: donorFn.name,
-        callee: { fn: donorFn.fnNode, paramNames: params },
-        declAnnotated: donorFn.hasInlineAnnotation,
-        donor: { donorPath, donorIndex, fn: donorFn },
-    };
-}
-function trackDonorRefs(candidate, xfile) {
-    if (!candidate.donor)
-        return;
-    const { donorPath, donorIndex, fn } = candidate.donor;
-    for (const name of fn.moduleVarRefs) {
-        const mv = donorIndex.moduleVars.get(name);
-        if (!mv)
-            continue;
-        const key = `${donorPath}::${name}`;
-        if (xfile.requiredModuleVars.has(key))
-            continue;
-        xfile.requiredModuleVars.set(key, { sourceFile: donorPath, name, moduleVar: mv });
-    }
-    for (const name of fn.importRefs) {
-        const b = donorIndex.imports.get(name);
-        if (!b)
-            continue;
-        const key = `${donorPath}::${name}`;
-        if (xfile.requiredImports.has(key))
-            continue;
-        xfile.requiredImports.set(key, {
-            sourceFile: donorPath,
-            localName: name,
-            binding: b,
-        });
-    }
-}
-// ---------------------------------------------------------------------------
-// Hoisting donor module-vars + imports.
-//
-// Mirrors classic's logic: imports are rewritten relative to the consumer
-// file (or kept as bare specifiers for library imports). Module-var clones
-// are inserted right after the import block. Collisions are skipped — when
-// the consumer already has a binding by the same name, we leave the spliced
-// body's reference to bind to whatever is in scope (matching classic).
-function hoistRequiredImports(ast, xfile) {
-    const consumerIndex = xfile.consumerIndex;
-    const reader = xfile.reader;
-    const consumerFile = xfile.consumerPath;
-    const existingBindings = new Set([
-        ...consumerIndex.imports.keys(),
-        ...consumerIndex.functions.keys(),
-        ...consumerIndex.moduleVars.keys(),
-    ]);
-    for (const stmt of ast.program.body) {
-        if (t.isImportDeclaration(stmt)) {
-            for (const spec of stmt.specifiers)
-                existingBindings.add(spec.local.name);
-        }
-    }
-    const byTarget = new Map();
-    const consumerDir = nodePath.dirname(consumerFile);
-    for (const req of xfile.requiredImports.values()) {
-        const binding = req.binding;
-        if (!binding)
-            continue;
-        if (existingBindings.has(binding.localName))
-            continue;
-        let rewrittenSource = binding.source;
-        if (binding.source.startsWith('./') ||
-            binding.source.startsWith('../') ||
-            binding.source.startsWith('/')) {
-            const abs = resolveRelativeImport(req.sourceFile, binding.source, reader);
-            if (abs) {
-                let rel = nodePath.relative(consumerDir, abs);
-                if (!rel.startsWith('.'))
-                    rel = `./${rel}`;
-                rel = rel.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, '');
-                rewrittenSource = rel;
-            }
-        }
-        const bucket = byTarget.get(rewrittenSource) ?? {
-            source: rewrittenSource,
-            specs: [],
-        };
-        bucket.specs.push({
-            localName: binding.localName,
-            importedName: binding.importedName,
-            style: binding.style,
-        });
-        byTarget.set(rewrittenSource, bucket);
-        existingBindings.add(binding.localName);
-    }
-    if (byTarget.size === 0)
-        return;
-    const importsToInsert = [];
-    for (const { source, specs } of byTarget.values()) {
-        const specifiers = [];
-        for (const s of specs) {
-            if (s.style === 'default') {
-                specifiers.push(t.importDefaultSpecifier(t.identifier(s.localName)));
-            }
-            else if (s.style === 'namespace') {
-                specifiers.push(t.importNamespaceSpecifier(t.identifier(s.localName)));
-            }
-            else {
-                specifiers.push(t.importSpecifier(t.identifier(s.localName), t.identifier(s.importedName)));
-            }
-        }
-        importsToInsert.push(t.importDeclaration(specifiers, t.stringLiteral(source)));
-    }
-    ast.program.body.unshift(...importsToInsert);
-}
-function hoistRequiredModuleVars(ast, xfile) {
-    const consumerIndex = xfile.consumerIndex;
-    const consumerLocals = new Set([
-        ...consumerIndex.moduleVars.keys(),
-        ...consumerIndex.functions.keys(),
-        ...consumerIndex.imports.keys(),
-    ]);
-    for (const stmt of ast.program.body) {
-        if (t.isImportDeclaration(stmt)) {
-            for (const spec of stmt.specifiers)
-                consumerLocals.add(spec.local.name);
-        }
-    }
-    const toInsert = [];
-    const insertedKeys = new Set();
-    for (const [key, req] of xfile.requiredModuleVars) {
-        if (insertedKeys.has(key))
-            continue;
-        if (consumerLocals.has(req.name))
-            continue;
-        const cloned = cloneModuleVarForHoisting(req.moduleVar, req.name);
-        if (!cloned)
-            continue;
-        toInsert.push(...cloned);
-        insertedKeys.add(key);
-    }
-    if (toInsert.length === 0)
-        return;
-    const body = ast.program.body;
-    let insertAt = 0;
-    for (let i = 0; i < body.length; i++) {
-        if (t.isImportDeclaration(body[i]))
-            insertAt = i + 1;
-        else
-            break;
-    }
-    body.splice(insertAt, 0, ...toInsert);
-}
-function cloneModuleVarForHoisting(moduleVar, name) {
-    const decl = moduleVar.declaration;
-    if (t.isTSEnumDeclaration(decl)) {
-        if (decl.id.name !== name)
-            return null;
-        return lowerTsEnumToJs(decl);
-    }
-    const matching = decl.declarations.find((d) => t.isIdentifier(d.id) && d.id.name === name);
-    if (!matching)
-        return null;
-    return [t.variableDeclaration(decl.kind, [t.cloneNode(matching, true, false)])];
-}
-// Lower a TSEnumDeclaration to the TypeScript-equivalent JS emit. Matches
-// `tsc --target esnext` output: numeric members get reverse-mapping; string
-// members get forward-only assignment. Returns null if any member has a
-// non-literal initializer we can't evaluate at compile time.
-//
-//   enum E { A = 0, B = 1 }
-// becomes:
-//   var E;
-//   (function (E) {
-//       E[E["A"] = 0] = "A";
-//       E[E["B"] = 1] = "B";
-//   })(E || (E = {}));
-function lowerTsEnumToJs(decl) {
-    const name = decl.id.name;
-    const resolved = [];
-    let nextNumeric = 0;
-    for (const m of decl.members) {
-        const keyName = t.isIdentifier(m.id)
-            ? m.id.name
-            : t.isStringLiteral(m.id)
-                ? m.id.value
-                : null;
-        if (keyName === null)
-            return null;
-        let value;
-        if (m.initializer) {
-            const init = m.initializer;
-            if (t.isNumericLiteral(init)) {
-                value = t.numericLiteral(init.value);
-                nextNumeric = init.value + 1;
-            }
-            else if (t.isUnaryExpression(init) &&
-                init.operator === '-' &&
-                t.isNumericLiteral(init.argument)) {
-                value = t.numericLiteral(-init.argument.value);
-                nextNumeric = value.value + 1;
-            }
-            else if (t.isStringLiteral(init)) {
-                value = t.stringLiteral(init.value);
-                // After a string init, auto-increment is no longer valid in TS.
-                nextNumeric = null;
-            }
-            else {
-                return null;
-            }
-        }
-        else {
-            if (nextNumeric === null)
-                return null;
-            value = t.numericLiteral(nextNumeric);
-            nextNumeric += 1;
-        }
-        resolved.push({ key: keyName, value });
-    }
-    const idRef = () => t.identifier(name);
-    const bodyStmts = resolved.map(({ key, value }) => {
-        if (t.isStringLiteral(value)) {
-            // E["KEY"] = "VAL";  (no reverse mapping for string members)
-            return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value));
-        }
-        // E[E["KEY"] = VAL] = "KEY";  (reverse mapping for numeric members)
-        return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value), true), t.stringLiteral(key)));
-    });
-    const iife = t.expressionStatement(t.callExpression(t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)), [
-        t.logicalExpression('||', idRef(), t.assignmentExpression('=', idRef(), t.objectExpression([]))),
-    ]));
-    return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
-}
-// ---------------------------------------------------------------------------
 function hasInlineAnnotationOnCall(call, parent, key) {
     if (hasInlineAnnotation(call))
         return true;
-    // Comment may attach to enclosing ExpressionStatement.
     if (key === 'expression' && t.isExpressionStatement(parent) && hasInlineAnnotation(parent)) {
         return true;
     }
@@ -2879,31 +2016,22 @@ function hasInlineAnnotationOnCall(call, parent, key) {
 }
 // ---------------------------------------------------------------------------
 // Decl stripping.
-function stripFullyInlinedDecls(root, candidates, sites) {
-    // Remove declarations that are decl-annotated and have at least one
-    // successful site, and have no surviving identifier reads outside the
-    // declaration itself. We approximate "no surviving reads" by re-scanning
-    // the AST and counting identifier reads of each candidate name.
+function stripFullyInlinedDecls(candidates, sites) {
     const succeededByName = new Map();
     for (const s of sites) {
         succeededByName.set(s.candidate.name, (succeededByName.get(s.candidate.name) ?? 0) + 1);
     }
     for (const [name, c] of candidates) {
-        if (c.donor)
-            continue;
         if (!c.declAnnotated)
             continue;
         if (!c.declRef)
             continue;
         if ((succeededByName.get(name) ?? 0) === 0)
             continue;
-        // We don't currently re-scan for residual reads; conservatively do so.
-        // (Cheap.) Skip strip if any identifier read of `name` remains.
         const anyResidual = anyResidualReference(c.declRef.parent, name, c.declRef.index);
         if (anyResidual)
             continue;
         c.declRef.parent.body.splice(c.declRef.index, 1);
-        // Adjust later candidate indices in the same parent.
         for (const other of candidates.values()) {
             if (other.declRef &&
                 other.declRef.parent === c.declRef.parent &&
@@ -3079,6 +2207,13 @@ function trySingleUseInline(path, init, binding) {
     // Init must be pure — we're moving it to a new evaluation point.
     if (mayHaveSideEffects(init))
         return false;
+    // Closure InlineVariables.StandardVarExpert.canMoveExpression — refuses to
+    // relocate any expression that reads a property (GETPROP/GETELEM). The
+    // property could be mutated between def and use, and this pass has no
+    // flow-sensitive view to prove otherwise. FlowSensitiveInlineVariables
+    // (paired with MustBeReachingVariableDef) is what handles that case.
+    if (containsPropertyRead(init))
+        return false;
     const initPath = path.get('init');
     if (!initPath.node)
         return false;
@@ -3086,6 +2221,8 @@ function trySingleUseInline(path, init, binding) {
         return false;
     const refPath = binding.referencePaths[0];
     if (!refPath)
+        return false;
+    if (!isPlainRead(refPath))
         return false;
     if (crossesAsyncBoundary(path, refPath))
         return false;
@@ -3230,6 +2367,11 @@ function isPlainRead(refPath) {
     // parameter binding
     if (t.isFunction(parent) && Array.isArray(parent.params) && parent.params.includes(refPath.node))
         return false;
+    // export specifier — `local` must remain an Identifier; substituting a
+    // literal there would violate the AST spec. Common in bundle-mode where
+    // a chunk may carry `export { K }` after `const K = 42`.
+    if (t.isExportSpecifier(parent))
+        return false;
     return true;
 }
 // True if init reads any identifier that may change between def site and
@@ -3276,6 +2418,37 @@ function crossesAsyncBoundary(defPath, usePath) {
         p = p.parentPath;
     }
     return false;
+}
+// True iff `node` (or any subexpression) is a property read. We treat these
+// as unsafe to relocate because we have no flow-sensitive view that would
+// prove the property isn't mutated between def and use.
+function containsPropertyRead(node) {
+    if (t.isMemberExpression(node) || t.isOptionalMemberExpression(node))
+        return true;
+    let found = false;
+    // biome-ignore lint/suspicious/noExplicitAny: structural walk
+    const walk = (n) => {
+        if (found || n === null || typeof n !== 'object')
+            return;
+        if (Array.isArray(n)) {
+            for (const c of n)
+                walk(c);
+            return;
+        }
+        if (typeof n.type !== 'string')
+            return;
+        if (n.type === 'MemberExpression' || n.type === 'OptionalMemberExpression') {
+            found = true;
+            return;
+        }
+        for (const k of Object.keys(n)) {
+            if (k === 'loc' || k === 'start' || k === 'end' || k === 'leadingComments' || k === 'trailingComments' || k === 'innerComments')
+                continue;
+            walk(n[k]);
+        }
+    };
+    walk(node);
+    return found;
 }
 // A primitive literal is cheap to re-evaluate (no allocation, no observable
 // side effect, value identity is the value itself). Safe to inline into a
@@ -3827,21 +3000,22 @@ function makeDeclaredNamesUnique(file) {
     return { renamed: 0 };
 }
 /**
- * Per-function demand-driven α-rename. Walks nested scopes inside `fnPath`
- * top-down; for every owned binding whose base name is already declared by
- * an *ancestor* scope (within this function), renames it via Babel's
- * `scope.rename` so the binding doesn't shadow the ancestor name.
+ * Per-function α-rename, ContextualRenamer-style
+ * (MakeDeclaredNamesUnique.java:265-380). Walks nested scopes inside `fnPath`
+ * top-down; for every owned binding whose base name has already been declared
+ * *anywhere* within this function (ancestor OR sibling scope visited earlier),
+ * renames it via Babel's `scope.rename` so the name becomes globally unique
+ * inside the function subtree.
  *
- * Sibling scopes are intentionally NOT renamed against each other: two
- * sibling `if`-consequents can both declare `const dx` and never collide
- * because neither block ever ends up in the other's lexical scope. The
- * authored names are preserved for readability.
+ * This eager uniqueness is the invariant Closure's `isASTNormalized()`
+ * actually promises, and it's what lets `tryMergeBlock` splice a nested
+ * block into its parent with `ignoreBlockScopedDeclarations=true` without
+ * any further collision checks — sibling collisions can't exist by
+ * construction.
  *
- * If two sibling blocks both could be flattened into a shared statement-
- * block ancestor (rare: requires both siblings to be plain BlockStatements
- * sitting in the same parent statement list, not if/loop bodies), the
- * resulting name collision is caught at merge time by `tryMergeBlock`'s
- * sibling-collision guard — that block-merge is rejected instead.
+ * Cost: more `__N` suffixes in intermediate output (Closure pays the same
+ * cost). Since we feed a downstream bundler/minifier the suffix-noise is
+ * absorbed at the next stage.
  *
  * Nested functions are skipped; they're renamed by their own invocation.
  */
@@ -3883,8 +3057,9 @@ function renameForFlatten(fnPath) {
                     // in block-flatten, so leaving them as-is is safe.
                     if (binding.kind === 'param')
                         continue;
-                    if (active.has(baseName)) {
-                        // Ancestor shadowing — rename.
+                    if (allNames.has(baseName)) {
+                        // Already declared somewhere in this function
+                        // (ancestor or earlier-visited sibling) — rename.
                         const newName = pickFreshName(baseName, allNames);
                         p.scope.rename(baseName, newName);
                         active.add(newName);
@@ -7446,17 +6621,25 @@ function performInline(c, table, parents) {
         }
     }
     else {
-        // var x = rhs → drop the declarator (or null its init if it's the
-        // only declarator in a const, but const is rejected upstream by the
-        // shape check).
+        // Closure FlowSensitiveInlineVariables.inlineVariable (NameDeclaration
+        // branch): detach just the rhs, leaving the bare declarator `let x;`
+        // in place so any subsequent reassignments still have a binding to
+        // target. DAE + RemoveUnusedCode clean up the dead chain afterwards.
+        // For const, no subsequent reassignments are possible by language
+        // rule, so the whole declarator can be dropped without orphaning.
         const decl = loc.decl;
-        if (decl.declarations.length === 1) {
-            removeFromParent(decl, parents);
+        if (decl.kind === 'const') {
+            if (decl.declarations.length === 1) {
+                removeFromParent(decl, parents);
+            }
+            else {
+                const idx = decl.declarations.indexOf(loc.expr);
+                if (idx >= 0)
+                    decl.declarations.splice(idx, 1);
+            }
         }
         else {
-            const idx = decl.declarations.indexOf(loc.expr);
-            if (idx >= 0)
-                decl.declarations.splice(idx, 1);
+            loc.expr.init = null;
         }
     }
 }
@@ -9778,28 +8961,172 @@ function simplifyAll(root) {
     return total;
 }
 
-// Per-file orchestration. Mirrors src/plugin/transform.ts but driven by the
-// gcc-tree analyses + transforms.
+// Strip TypeScript-only syntax from a parsed Program so downstream passes
+// (and the generator) only see JS. Mutates the AST in place.
+//
+// Handles:
+//   - Type annotations on identifiers / params / declarators / functions
+//     (delegated to node-util.stripTypeScriptOnly).
+//   - Type-only import/export declarations and specifiers (dropped).
+//   - TSEnumDeclaration → lowered to the IIFE shape tsc emits.
+//   - TSInterfaceDeclaration, TSTypeAliasDeclaration, TSDeclareFunction,
+//     TSModuleDeclaration, TSImportEqualsDeclaration → dropped.
+//   - Type assertion wrappers (`expr as T`, `<T>expr`, `expr!`) → unwrapped.
+//
+// Out of scope:
+//   - Runtime namespaces with executable bodies (`namespace N { ... }` that
+//     emits an IIFE in tsc). Rare in bundled output; we drop the whole
+//     declaration. Revisit if crashcat-or-similar starts depending on it.
+//   - Parameter properties in constructors (`constructor(public x: number)`).
+//     Same reasoning — bundled output doesn't typically carry these.
+function stripTypeScript(ast) {
+    const body = ast.program.body;
+    for (let i = body.length - 1; i >= 0; i--) {
+        const stmt = body[i];
+        if (t.isTSEnumDeclaration(stmt)) {
+            const lowered = lowerTsEnumToJs(stmt);
+            if (lowered) {
+                body.splice(i, 1, ...lowered);
+            }
+            else {
+                body.splice(i, 1);
+            }
+            continue;
+        }
+        if (t.isTSInterfaceDeclaration(stmt) ||
+            t.isTSTypeAliasDeclaration(stmt) ||
+            t.isTSDeclareFunction(stmt) ||
+            t.isTSModuleDeclaration(stmt) ||
+            t.isTSImportEqualsDeclaration(stmt) ||
+            t.isTSExportAssignment(stmt) ||
+            t.isTSNamespaceExportDeclaration(stmt)) {
+            body.splice(i, 1);
+            continue;
+        }
+        if (t.isImportDeclaration(stmt)) {
+            if (stmt.importKind === 'type') {
+                body.splice(i, 1);
+                continue;
+            }
+            stmt.specifiers = stmt.specifiers.filter((s) => !(t.isImportSpecifier(s) && s.importKind === 'type'));
+            if (stmt.specifiers.length === 0) {
+                body.splice(i, 1);
+                continue;
+            }
+        }
+        if (t.isExportNamedDeclaration(stmt)) {
+            if (stmt.exportKind === 'type') {
+                body.splice(i, 1);
+                continue;
+            }
+            stmt.specifiers = stmt.specifiers.filter((s) => !(t.isExportSpecifier(s) && s.exportKind === 'type'));
+            if (stmt.declaration &&
+                (t.isTSInterfaceDeclaration(stmt.declaration) ||
+                    t.isTSTypeAliasDeclaration(stmt.declaration) ||
+                    t.isTSDeclareFunction(stmt.declaration) ||
+                    t.isTSEnumDeclaration(stmt.declaration) ||
+                    t.isTSModuleDeclaration(stmt.declaration))) {
+                if (t.isTSEnumDeclaration(stmt.declaration)) {
+                    const lowered = lowerTsEnumToJs(stmt.declaration);
+                    if (lowered) {
+                        body.splice(i, 1, ...lowered);
+                        continue;
+                    }
+                }
+                stmt.declaration = null;
+                if (stmt.specifiers.length === 0 && !stmt.source) {
+                    body.splice(i, 1);
+                    continue;
+                }
+            }
+        }
+    }
+    // Strip annotation slots + unwrap type-assertion wrappers everywhere else.
+    stripTypeScriptOnly(ast);
+}
+// Lower a TSEnumDeclaration to the TypeScript-equivalent JS emit. Matches
+// `tsc --target esnext` output: numeric members get reverse-mapping; string
+// members get forward-only assignment. Returns null if any member has a
+// non-literal initializer we can't evaluate at compile time.
+//
+//   enum E { A = 0, B = 1 }
+// becomes:
+//   var E;
+//   (function (E) {
+//       E[E["A"] = 0] = "A";
+//       E[E["B"] = 1] = "B";
+//   })(E || (E = {}));
+function lowerTsEnumToJs(decl) {
+    const name = decl.id.name;
+    const resolved = [];
+    let nextNumeric = 0;
+    for (const m of decl.members) {
+        const keyName = t.isIdentifier(m.id)
+            ? m.id.name
+            : t.isStringLiteral(m.id)
+                ? m.id.value
+                : null;
+        if (keyName === null)
+            return null;
+        let value;
+        if (m.initializer) {
+            const init = m.initializer;
+            if (t.isNumericLiteral(init)) {
+                value = t.numericLiteral(init.value);
+                nextNumeric = init.value + 1;
+            }
+            else if (t.isUnaryExpression(init) &&
+                init.operator === '-' &&
+                t.isNumericLiteral(init.argument)) {
+                value = t.numericLiteral(-init.argument.value);
+                nextNumeric = value.value + 1;
+            }
+            else if (t.isStringLiteral(init)) {
+                value = t.stringLiteral(init.value);
+                nextNumeric = null;
+            }
+            else {
+                return null;
+            }
+        }
+        else {
+            if (nextNumeric === null)
+                return null;
+            value = t.numericLiteral(nextNumeric);
+            nextNumeric += 1;
+        }
+        resolved.push({ key: keyName, value });
+    }
+    const idRef = () => t.identifier(name);
+    const bodyStmts = resolved.map(({ key, value }) => {
+        if (t.isStringLiteral(value)) {
+            return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value));
+        }
+        return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value), true), t.stringLiteral(key)));
+    });
+    const iife = t.expressionStatement(t.callExpression(t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)), [
+        t.logicalExpression('||', idRef(), t.assignmentExpression('=', idRef(), t.objectExpression([]))),
+    ]));
+    return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
+}
+
+// Single-Program orchestration. Operates on a parsed AST representing one
+// program — in bundle-mode this is the entire chunk after rollup has
+// resolved imports.
 //
 // Steps:
-//   1. ANY_DIRECTIVE_IN_SOURCE pre-check (caller's responsibility usually).
-//   2. Parse with @babel/parser.
-//   3. Run InlineFunctions across the file.
-//   4. Run simplifyAll across the file.
+//   1. Parse with @babel/parser (TS/JSX-aware).
+//   2. Strip TS-only syntax so downstream passes only see JS.
+//   3. Run InlineFunctions across the program.
+//   4. Run simplifyAll across the program.
 //   5. Generate code (and optional sourcemap).
 function transform(code, options = {}) {
     const ast = parse(code, parserOptions(options.filename));
-    const inl = inlineFunctions(ast, {
-        consumerPath: options.filename,
-        fileCache: options.fileCache,
-        fileReader: options.fileReader,
-        allowLibraryInline: options.allowLibraryInline,
-    });
+    stripTypeScript(ast);
+    const inl = inlineFunctions(ast);
     const unr = unrollLoops(ast);
     // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
     // before SROA so its escape analysis sees only direct `name[i]` uses.
-    // Without this, a cascade-induced alias of an SROA candidate poisons the
-    // candidate's escape check (`init` of a VariableDeclarator is rejected).
     const ivarPre = inlineVariables(ast);
     const sroa = applySroa(ast);
     // Normalize before the simplifier fixpoint. Closure runs Normalize before
@@ -9814,6 +9141,7 @@ function transform(code, options = {}) {
     const out = gen(ast, {
         sourceMaps: options.sourceMaps === true,
         sourceFileName: options.filename,
+        inputSourceMap: options.inputSourceMap,
     });
     return {
         code: out.code,
@@ -9836,11 +9164,11 @@ function transform(code, options = {}) {
     };
 }
 function parserOptions(filename) {
-    const isTs = filename ? /\.tsx?$/.test(filename) : false;
+    // In bundle-mode the chunk filename is `.js`, but the chunk text may
+    // still contain TS (consumers who don't transpile TS before compilecat).
+    // The typescript plugin is tolerant of plain JS, so enable unconditionally.
     const isJsx = filename ? /\.[jt]sx$/.test(filename) : false;
-    const plugins = [];
-    if (isTs)
-        plugins.push('typescript');
+    const plugins = ['typescript'];
     if (isJsx)
         plugins.push('jsx');
     return {
@@ -9851,28 +9179,27 @@ function parserOptions(filename) {
     };
 }
 
-const factory = (options = {}) => {
+// Bundle-mode rollup plugin. Operates on whole chunks via `renderChunk`,
+// after the bundler has tree-shaken and concatenated modules. By the time
+// we run, the chunk is a single Program — every `@inline` function in
+// scope is directly reachable, no cross-file resolution needed.
+//
+// Compatible with rollup, vite, and rolldown (vite/rolldown share rollup's
+// plugin shape). esbuild + webpack are not supported in bundle-mode.
+function compilecat(options = {}) {
     const debug = options.debug === true;
-    const crossFile = options.crossFile !== false;
-    const libraryInline = options.libraryInline === true;
-    // One FileCache per build amortizes parse + index across consumer files.
-    const fileCache = crossFile ? createFileCache() : undefined;
     return {
         name: 'compilecat',
-        transform(code, id) {
-            if (!/\.(js|ts|jsx|tsx)$/.test(id))
-                return null;
+        renderChunk(code, chunk) {
             if (!ANY_DIRECTIVE_IN_SOURCE.test(code))
                 return null;
+            const id = chunk.fileName;
             if (debug)
-                console.log(`[compilecat] transforming ${id}`);
+                console.log(`[compilecat] transforming chunk ${id}`);
             try {
                 const r = transform(code, {
                     sourceMaps: true,
                     filename: id,
-                    fileCache,
-                    fileReader: options.fileReader,
-                    allowLibraryInline: libraryInline,
                 });
                 if (debug) {
                     console.log(`[compilecat] ${id}: inlined=${r.stats.inlined} folded=${r.stats.folded} dead=${r.stats.removedDeadCode}`);
@@ -9880,15 +9207,12 @@ const factory = (options = {}) => {
                 return { code: r.code, map: r.map };
             }
             catch (err) {
-                console.error(`[compilecat] failed to transform ${id}:`, err);
+                console.error(`[compilecat] failed to transform chunk ${id}:`, err);
                 return null;
             }
         },
     };
-};
-const unplugin = createUnplugin(factory);
+}
 
-var rollup = unplugin.rollup;
-
-export { rollup as default };
+export { compilecat as default };
 //# sourceMappingURL=rollup.js.map

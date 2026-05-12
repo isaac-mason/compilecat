@@ -16,10 +16,13 @@ function simp(code: string): { code: string; iters: number; folded: number; inli
 
 describe('Simplifier (fixpoint)', () => {
     it('folds + inlines + removes in one pass', () => {
-        // var x = 1 + 2 → folds; return x → inlines; (no DAE work after).
+        // var x = 1 + 2 → folds; return x → inlines. Closure-aligned FSI
+        // detaches the rhs but leaves the bare `var x;` declarator behind —
+        // RemoveUnusedCode (a separate post-simplifier pass) is what strips
+        // the dead binding.
         const r = simp('function f() { var x = 1 + 2; return x; }');
         expect(r.code).toContain('return 3');
-        expect(r.code).not.toMatch(/var x/);
+        expect(r.code).toContain('var x;');
     });
 
     it('reaches a fixpoint of literal folding through inlining', () => {

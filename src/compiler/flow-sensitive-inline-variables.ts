@@ -593,15 +593,22 @@ function performInline(c: Candidate, table: LocalVariableTable, parents: ParentM
             removeFromParent(toRemoveInfo.parent, parents);
         }
     } else {
-        // var x = rhs → drop the declarator (or null its init if it's the
-        // only declarator in a const, but const is rejected upstream by the
-        // shape check).
+        // Closure FlowSensitiveInlineVariables.inlineVariable (NameDeclaration
+        // branch): detach just the rhs, leaving the bare declarator `let x;`
+        // in place so any subsequent reassignments still have a binding to
+        // target. DAE + RemoveUnusedCode clean up the dead chain afterwards.
+        // For const, no subsequent reassignments are possible by language
+        // rule, so the whole declarator can be dropped without orphaning.
         const decl = loc.decl;
-        if (decl.declarations.length === 1) {
-            removeFromParent(decl, parents);
+        if (decl.kind === 'const') {
+            if (decl.declarations.length === 1) {
+                removeFromParent(decl, parents);
+            } else {
+                const idx = decl.declarations.indexOf(loc.expr);
+                if (idx >= 0) decl.declarations.splice(idx, 1);
+            }
         } else {
-            const idx = decl.declarations.indexOf(loc.expr);
-            if (idx >= 0) decl.declarations.splice(idx, 1);
+            loc.expr.init = null;
         }
     }
 }

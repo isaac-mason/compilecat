@@ -1,9 +1,15 @@
-import { createUnplugin, type UnpluginFactory } from 'unplugin';
+// Bundle-mode rollup plugin. Operates on whole chunks via `renderChunk`,
+// after the bundler has tree-shaken and concatenated modules. By the time
+// we run, the chunk is a single Program — every `@inline` function in
+// scope is directly reachable, no cross-file resolution needed.
+//
+// Compatible with rollup, vite, and rolldown (vite/rolldown share rollup's
+// plugin shape). esbuild + webpack are not supported in bundle-mode.
+
+import type { Plugin } from 'rollup';
 
 import { ANY_DIRECTIVE_IN_SOURCE } from './compiler/directives';
-import { createFileCache } from './compiler/file-index';
 import { transform } from './compiler/pipeline';
-import type { FileReader } from './compiler/resolve';
 
 export type Options = {
     /**
@@ -11,46 +17,22 @@ export type Options = {
      * @default false
      */
     debug?: boolean;
-    include?: string | RegExp | (string | RegExp)[];
-    exclude?: string | RegExp | (string | RegExp)[];
-    /**
-     * Enable cross-file inlining (relative imports). On by default.
-     * @default true
-     */
-    crossFile?: boolean;
-    /**
-     * Permit inlining from `node_modules` when the call site opts in via
-     * `/* @inline *​/`. Off by default — library reach must be explicit.
-     * @default false
-     */
-    libraryInline?: boolean;
-    /**
-     * Custom file reader for cross-file (defaults to disk).
-     */
-    fileReader?: FileReader;
 };
 
-const factory: UnpluginFactory<Options | undefined> = (options = {}) => {
+export function compilecat(options: Options = {}): Plugin {
     const debug = options.debug === true;
-    const crossFile = options.crossFile !== false;
-    const libraryInline = options.libraryInline === true;
-    // One FileCache per build amortizes parse + index across consumer files.
-    const fileCache = crossFile ? createFileCache() : undefined;
     return {
         name: 'compilecat',
-        transform(code: string, id: string) {
-            if (!/\.(js|ts|jsx|tsx)$/.test(id)) return null;
+        renderChunk(code, chunk) {
             if (!ANY_DIRECTIVE_IN_SOURCE.test(code)) return null;
 
-            if (debug) console.log(`[compilecat] transforming ${id}`);
+            const id = chunk.fileName;
+            if (debug) console.log(`[compilecat] transforming chunk ${id}`);
 
             try {
                 const r = transform(code, {
                     sourceMaps: true,
                     filename: id,
-                    fileCache,
-                    fileReader: options.fileReader,
-                    allowLibraryInline: libraryInline,
                 });
                 if (debug) {
                     console.log(
@@ -59,11 +41,11 @@ const factory: UnpluginFactory<Options | undefined> = (options = {}) => {
                 }
                 return { code: r.code, map: r.map };
             } catch (err) {
-                console.error(`[compilecat] failed to transform ${id}:`, err);
+                console.error(`[compilecat] failed to transform chunk ${id}:`, err);
                 return null;
             }
         },
     };
-};
+}
 
-export const unplugin = createUnplugin(factory);
+export default compilecat;
