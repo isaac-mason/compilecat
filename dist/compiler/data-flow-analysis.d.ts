@@ -1,4 +1,4 @@
-import { Branch } from './control-flow-graph';
+import type { Branch } from './control-flow-graph';
 import type { ControlFlowGraph, CfgNode } from './control-flow-graph';
 import type { LatticeElement } from './graph/lattice-element';
 export declare const MAX_STEPS_PER_NODE = 20000;

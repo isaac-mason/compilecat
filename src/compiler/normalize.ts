@@ -183,6 +183,13 @@ function pickFreshName(baseName: string, allNames: Set<string>): string {
 // Each helper is a literal port of the corresponding Java method; see
 // referenced line numbers.
 
+function blockifyChild<K extends string>(parent: Partial<Record<K, t.Statement | null | undefined>>, key: K): void {
+    const child = parent[key];
+    if (child === null || child === undefined) return;
+    if (t.isBlockStatement(child)) return;
+    parent[key] = t.blockStatement([child]);
+}
+
 function structuralNormalize(file: t.File): void {
     // Two visitors so we don't have to coordinate insertions during traversal:
     //   1. visitFunction — arrow→block (Normalize.java:387-397).
@@ -199,6 +206,40 @@ function structuralNormalize(file: t.File): void {
                 const body = node.body;
                 node.body = t.blockStatement([t.returnStatement(body)]);
             }
+        },
+    });
+
+    // Wrap statement-child slots in BlockStatement (IRFactory parity).
+    //
+    // Closure's IRFactory.transformBlock (IRFactory.java:718-729) wraps the
+    // body of every IF/WHILE/FOR/DO/WITH/TRY/CATCH in a BLOCK *at parse
+    // time*, marked `setIsAddedBlock(true)`. Every later pass (Normalize,
+    // FunctionInjector, ExpressionDecomposer, CFG builder) relies on this:
+    // ExpressionDecomposer.findInjectionPoint explicitly asserts
+    // `NodeUtil.isStatementBlock(parent)` (ExpressionDecomposer.java:882),
+    // and FunctionInjector.inlineFunction's `parent.replaceWith(newBlock)`
+    // (FunctionInjector.java:630) is only safe because the surrounding
+    // block context is always present.
+    //
+    // Babel preserves the bare-statement form (`for (...) foo();` keeps the
+    // ExpressionStatement directly in `.body`), so we re-establish the
+    // invariant here. Without this, the inliner splices into the for-loop's
+    // *containing* block rather than the loop body — the inlined code
+    // escapes the loop scope and leaves the loop empty.
+    traverse(file, {
+        ForStatement(p) { blockifyChild(p.node, 'body'); },
+        ForInStatement(p) { blockifyChild(p.node, 'body'); },
+        ForOfStatement(p) { blockifyChild(p.node, 'body'); },
+        WhileStatement(p) { blockifyChild(p.node, 'body'); },
+        DoWhileStatement(p) { blockifyChild(p.node, 'body'); },
+        WithStatement(p) { blockifyChild(p.node, 'body'); },
+        IfStatement(p) {
+            // IRFactory wraps BOTH branches unconditionally
+            // (IRFactory.java:2285-2287). `else if` chains become
+            // `else { if (...) {...} }` at the AST level; pretty-printers
+            // re-collapse them at output.
+            blockifyChild(p.node, 'consequent');
+            if (p.node.alternate) blockifyChild(p.node, 'alternate');
         },
     });
 

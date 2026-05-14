@@ -1,5 +1,5 @@
 import type { NodePath } from '@babel/traverse';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 export type SimplifyStats = {
     iterations: number;
     folded: number;

@@ -1,5 +1,5 @@
 import type { NodePath } from '@babel/traverse';
-import * as t from '@babel/types';
+import type * as t from '@babel/types';
 export type LocalVariableTable = {
     /** Resolve an identifier-use site to its lattice slot. Returns undefined
      *  when the identifier refers to something that isn't a local of this

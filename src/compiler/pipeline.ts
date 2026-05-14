@@ -20,6 +20,7 @@ import { makeDeclaredNamesUnique } from './normalize';
 import { removeUnusedCode } from './remove-unused-code';
 import { applySroa } from './scalar-replace-aggregates';
 import { simplifyAll } from './simplifier';
+import { stripDirectiveComments } from './strip-directive-comments';
 import { stripTypeScript } from './strip-typescript';
 
 export type TransformOptions = {
@@ -55,20 +56,27 @@ export function transform(code: string, options: TransformOptions = {}): Transfo
 
     stripTypeScript(ast);
 
+    // Normalize first. Closure runs Normalize before the optimization pass
+    // group (DefaultPassConfig). The structural normalizations (blockify,
+    // split decls, extract for-init) establish invariants that every
+    // later pass depends on — most importantly that splice-target
+    // Statements always have a BlockStatement/Program parent.
+    makeDeclaredNamesUnique(ast);
+
     const inl = inlineFunctions(ast);
     const unr = unrollLoops(ast);
     // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
     // before SROA so its escape analysis sees only direct `name[i]` uses.
     const ivarPre = inlineVariables(ast);
     const sroa = applySroa(ast);
-    // Normalize before the simplifier fixpoint. Closure runs Normalize before
-    // its optimization pass group; passes downstream (block flatten, let→var
-    // lowering) check `isASTNormalized()` to relax safety conditions.
-    makeDeclaredNamesUnique(ast);
     const simp = simplifyAll(ast);
     const ivar = inlineVariables(ast);
     ivar.inlined += ivarPre.inlined;
     const ruc = removeUnusedCode(ast);
+
+    // Strip authored `@*` directive markers from comments after all passes
+    // have consumed them, so they don't bleed into the output.
+    stripDirectiveComments(ast);
 
     const gen = generate as unknown as (n: t.Node, opts?: any) => { code: string; map: any };
     const out = gen(ast, {
