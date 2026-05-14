@@ -1,0 +1,503 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: 'Roboto Mono', monospace;
+  background-color: #222;
+  color: #cccccc;
+  overscroll-behavior-y: contain;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* Top Navigation */
+.nav {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  padding: 1rem;
+  gap: 0.75rem;
+  flex-shrink: 0;
+}
+
+.nav-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.nav-title {
+  font-size: 1.5rem;
+  font-weight: 400;
+  margin: 0;
+  color: #ffffff;
+  letter-spacing: 0.05em;
+  font-family: 'Roboto Mono', monospace;
+  text-transform: lowercase;
+}
+
+.nav-subtitle {
+  font-size: 0.9rem;
+  font-weight: 300;
+  margin: 0;
+  color: #cccccc;
+  font-family: 'Roboto Mono', monospace;
+  text-transform: lowercase;
+}
+
+.nav-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.nav-links a {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  font-family: 'Roboto Mono', monospace;
+  text-transform: lowercase;
+  text-decoration: underline;
+  color: #cccccc;
+  transition: all 0.2s ease;
+  cursor: pointer;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.nav-links a:hover {
+  background: #ffffff;
+  color: #000000;
+}
+
+#root {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Bottom Footer */
+.footer {
+  display: flex;
+  flex-direction: row;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1rem;
+  flex-shrink: 0;
+}
+
+.footer-links {
+  display: flex;
+  flex-direction: row;
+  gap: 0.5em;
+  align-items: center;
+}
+
+.footer-link {
+  font-size: 0.75rem;
+  font-family: 'Roboto Mono', monospace;
+  text-transform: lowercase;
+  text-decoration: none;
+  color: #cccccc;
+  transition: color 0.2s ease;
+  cursor: pointer;
+  padding: 0.2rem 0.75rem;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+}
+
+.footer-link:hover {
+  color: #ffffff;
+}
+
+/* App — demo panes */
+.app {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0 1rem 1rem 1rem;
+  gap: 0.75rem;
+}
+
+.status-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.75rem;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  color: #888888;
+  padding: 0 0.25rem;
+  min-height: 1.75rem;
+}
+
+.controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.control {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.control-label {
+  color: #888888;
+  letter-spacing: 0.05em;
+}
+
+.control-value {
+  color: #ffffff;
+  font-weight: 500;
+  min-width: 2.5ch;
+  text-align: right;
+}
+
+.control input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 8rem;
+  height: 2px;
+  background: #444444;
+  border-radius: 1px;
+  outline: none;
+  cursor: pointer;
+}
+
+.control input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: #ffaa44;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+
+.control input[type='range']::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: #ffaa44;
+  border-radius: 50%;
+  cursor: pointer;
+  border: none;
+}
+
+.status-bar .ok {
+  color: #ffffff;
+}
+
+.status-bar .err {
+  color: #ff8a80;
+}
+
+.panes {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: 18rem 18rem 32rem;
+  gap: 0.75rem;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid #444444;
+  background: #1a1a1a;
+  overflow: hidden;
+}
+
+.pane-header {
+  padding: 0.5rem 0.75rem;
+  min-height: 2.25rem;
+  display: flex;
+  align-items: center;
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+  color: #888888;
+  background: #2a2a2a;
+  border-bottom: 1px solid #444444;
+}
+
+.editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  font-size: 0.8rem;
+}
+
+.editor .cm-editor {
+  height: 100%;
+  background: transparent;
+}
+
+.editor .cm-scroller {
+  font-family: 'Roboto Mono', monospace;
+}
+
+.editor .cm-gutters {
+  background: #1a1a1a;
+  border-right: 1px solid #333333;
+  color: #555555;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.85rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #444444;
+  background: #1a1a1a;
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+.stat {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+  color: #666666;
+  text-transform: lowercase;
+}
+
+.stat.nonzero {
+  color: #cccccc;
+}
+
+.stat.nonzero .stat-value {
+  color: #ffffff;
+}
+
+.stat-value {
+  font-weight: 500;
+}
+
+.stat-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.03em;
+}
+
+/* Preview pane */
+.preview-pane {
+  background: #161616;
+  min-height: 32rem;
+}
+
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.tabs {
+  display: flex;
+}
+
+.tab {
+  background: transparent;
+  border: none;
+  border-right: 1px solid #444444;
+  color: #888888;
+  padding: 0.5rem 0.9rem;
+  font-family: 'Roboto Mono', monospace;
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.tab:hover {
+  color: #cccccc;
+}
+
+.tab.active {
+  background: #ffaa44;
+  color: #161616;
+}
+
+.preview {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+.preview-frame {
+  flex: 1 1 auto;
+  min-height: 0;
+  border: none;
+  background: #161616;
+  display: block;
+}
+
+.perf-graph {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 0.5rem;
+  border: 1px solid #444444;
+  pointer-events: none;
+}
+
+.preview-title {
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+  color: #888888;
+}
+
+/* Dual-preview — two sims running side by side */
+.dual-preview {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.compare-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.4rem 0.75rem;
+  background: #222;
+  border-bottom: 1px solid #444;
+  flex-shrink: 0;
+}
+
+.compare-text {
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #ffffff;
+  text-transform: lowercase;
+  letter-spacing: 0.05em;
+}
+
+.sim-stack {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.sub-preview {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid #333;
+}
+
+.sub-preview:last-child {
+  border-bottom: none;
+}
+
+.sub-preview-header {
+  display: flex;
+  align-items: center;
+  padding: 0.35rem 0.75rem;
+  background: #1f1f1f;
+  border-bottom: 1px solid #333;
+  flex-shrink: 0;
+}
+
+.sub-preview-title {
+  font-size: 0.7rem;
+  text-transform: lowercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+}
+
+/* Desktop */
+@media (min-width: 769px) {
+  .nav {
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
+    padding: 2rem 3rem 1rem 3rem;
+  }
+
+  .nav-title {
+    font-size: 2rem;
+  }
+
+  .nav-subtitle {
+    font-size: 1.1rem;
+  }
+
+  .nav-links {
+    gap: 1rem;
+    flex-wrap: nowrap;
+  }
+
+  .nav-links a {
+    padding: 0;
+    font-size: 1rem;
+    min-height: auto;
+  }
+
+  .app {
+    padding: 0 3rem 1rem 3rem;
+  }
+
+  .app {
+    flex: 1 1 auto;
+    min-height: 0;
+  }
+
+  .panes {
+    flex: 1 1 auto;
+    min-height: 0;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-rows: 1fr;
+    grid-auto-rows: 1fr;
+  }
+
+  .preview-pane {
+    min-height: 0;
+  }
+
+  .status-bar {
+    font-size: 0.75rem;
+  }
+
+  .footer {
+    justify-content: flex-end;
+    padding: 1rem 3rem 2rem 3rem;
+  }
+
+  .footer-links {
+    flex-direction: row;
+    gap: 2rem;
+  }
+
+  .footer-link {
+    font-size: 0.9rem;
+    padding: 0;
+    min-height: auto;
+  }
+}
