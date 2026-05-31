@@ -105,6 +105,23 @@ describe('InlineFunctions', () => {
         expect(r.code).toContain('var z = 1 + 2');
     });
 
+    it('@optimize flattens calls inside but does NOT inline the function itself', () => {
+        // `@optimize` = `@flatten` + `@sroa` + `@unroll` — it does not apply
+        // `@inline`. An `@optimize`-annotated declaration must NOT become a
+        // callee-inline target at its call sites.
+        const r = inl(`
+            function add(a, b) { return a + b; }
+            /** @optimize */
+            function f(x, y) { return add(x, y); }
+            var z = f(1, 2);
+        `);
+        // Only the inner add() call inlines (via flatten propagation);
+        // f itself stays declared and the caller still invokes it.
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('function f');
+        expect(r.code).toMatch(/var z = f\(1, 2\)/);
+    });
+
     it('inlines arrow function via const decl', () => {
         const r = inl(`
             /** @inline */

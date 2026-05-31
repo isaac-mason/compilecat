@@ -27,6 +27,11 @@ export type UnrollResult = {
     unrolled: number;
 };
 
+export type UnrollOptions = {
+    /** Set populated with the enclosing function of every unrolled loop. */
+    touched?: WeakSet<t.Function>;
+};
+
 type LoopShape = {
     varName: string;
     start: number;
@@ -35,19 +40,19 @@ type LoopShape = {
     step: number;
 };
 
-export function unrollLoops(root: t.Node): UnrollResult {
+export function unrollLoops(root: t.Node, options: UnrollOptions = {}): UnrollResult {
     let total = 0;
     for (let pass = 0; pass < MAX_UNROLL_PASSES; pass++) {
-        const n = unrollPass(root);
+        const n = unrollPass(root, options.touched);
         if (n === 0) break;
         total += n;
     }
     return { unrolled: total };
 }
 
-function unrollPass(root: t.Node): number {
+function unrollPass(root: t.Node, touched: WeakSet<t.Function> | undefined): number {
     let count = 0;
-    walkStatementLists(root, (body, inOptimize) => {
+    walkStatementLists(root, (body, inOptimize, enclosingFn) => {
         for (let i = 0; i < body.length; i++) {
             const s = body[i];
             if (!hasUnrollAnnotation(s) && !inOptimize) continue;
@@ -57,6 +62,7 @@ function unrollPass(root: t.Node): number {
                 if (out !== null) {
                     body.splice(i, 1, ...out);
                     count++;
+                    if (touched && enclosingFn) touched.add(enclosingFn);
                     i += out.length - 1;
                     continue;
                 }
@@ -68,6 +74,7 @@ function unrollPass(root: t.Node): number {
                 if (out !== null) {
                     body.splice(i, 1, ...out);
                     count++;
+                    if (touched && enclosingFn) touched.add(enclosingFn);
                     i += out.length - 1;
                     continue;
                 }
@@ -360,16 +367,25 @@ function blockDeclaresName(b: t.BlockStatement, name: string): boolean {
 // Statement-list traversal — invokes `cb` for every Block/Program body so the
 // caller can splice in place.
 
-function walkStatementLists(root: t.Node, cb: (body: t.Statement[], inOptimize: boolean) => void): void {
+function walkStatementLists(
+    root: t.Node,
+    cb: (body: t.Statement[], inOptimize: boolean, enclosingFn: t.Function | null) => void,
+): void {
     const optimizeStack: boolean[] = [false];
+    const fnStack: (t.Function | null)[] = [null];
     const visit = (n: t.Node | null | undefined): void => {
         if (n == null) return;
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
             optimizeStack.push(hasOptimizeAnnotation(n));
+            fnStack.push(n as t.Function);
         }
         if (t.isBlockStatement(n) || t.isProgram(n)) {
-            cb(n.body as t.Statement[], optimizeStack[optimizeStack.length - 1]);
+            cb(
+                n.body as t.Statement[],
+                optimizeStack[optimizeStack.length - 1],
+                fnStack[fnStack.length - 1],
+            );
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
             const child = getSlot(n, k);
@@ -382,7 +398,10 @@ function walkStatementLists(root: t.Node, cb: (body: t.Statement[], inOptimize: 
                 visit(child);
             }
         }
-        if (enteringFn) optimizeStack.pop();
+        if (enteringFn) {
+            optimizeStack.pop();
+            fnStack.pop();
+        }
     };
     visit(root);
 }

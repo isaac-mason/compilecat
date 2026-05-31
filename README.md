@@ -15,7 +15,12 @@
 
 A JavaScript/TypeScript compiler plugin for hot-path optimizations — function inlining, scalar-replacement of aggregates (SROA), and loop unrolling — driven by opt-in annotations.
 
-Built with Babel. Ships as a rollup-family plugin that runs in **bundle mode** via `renderChunk` — after the bundler has tree-shaken and concatenated modules, compilecat sees the chunk as a single program, so every `@inline` target is directly in scope without any cross-file resolver.
+Built with Babel. Ships as a rollup-family plugin with two execution modes:
+
+- **Whole-program** (`renderChunk`) — runs once on each tree-shaken, concatenated chunk. Every `@inline` target is already in the chunk, so no cross-file resolver is involved. Used by the rollup and rolldown adapters, and by the Vite adapter during `vite build`.
+- **Per-file** (`transform`) — runs on each source file. A cross-file resolver follows imports into donor modules, splices their bodies, and hoists the donor module-vars and imports the spliced body references. Used by the Vite adapter during `vite dev` (no bundle phase exists), with `addWatchFile` wired in so edits to a donor invalidate every consumer that inlined it.
+
+The Vite adapter routes automatically: per-file in dev, whole-program at build time (via Vite's `apply: 'serve' | 'build'`), so the two modes never both fire.
 
 ## Usage
 
@@ -173,7 +178,37 @@ corresponding `jscomp/*.java` files from Google Closure Compiler. See
 
 ```ts
 compilecat({
-    debug?: boolean,          // log each transformed chunk. default false
+    debug?: boolean,          // log each transformed chunk/file. default false
+})
+```
+
+The Vite adapter additionally accepts:
+
+```ts
+compilecatVite({
+    include: string | RegExp | (string | RegExp)[],   // REQUIRED. picomatch
+                                                      //  globs or RegExps
+    exclude?: string | RegExp | (string | RegExp)[],  // additional skips
+    debug?: boolean,
+    allowLibraryInline?: boolean, // permit per-file mode to follow imports
+                                  //  into node_modules when the call site
+                                  //  opts in via /* @inline */. default false
+})
+```
+
+`include` is required and there is no implicit default — you scope
+compilecat to your engine/hot-path code explicitly. `include` / `exclude`
+only affect Vite dev (per-file transform mode); they are plumbed through
+Rollup 4's hook-filter API, so under rolldown the test runs in Rust and
+non-matching files never enter the JS plugin handler at all. Combined
+with the built-in `code: /@(?:inline|flatten|sroa|unroll|optimize)\b/`
+filter, compilecat is effectively free on files it has no work to do for.
+
+```ts
+// e.g. only transform engine code; everything else (app code,
+// node_modules, etc.) is invisible to compilecat.
+compilecatVite({
+    include: ['src/engine/**'],
 })
 ```
 

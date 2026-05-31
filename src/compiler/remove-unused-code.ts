@@ -39,7 +39,14 @@ export type RemoveUnusedResult = {
     removedImportDeclarations: number;
 };
 
-export function removeUnusedCode(ast: t.File): RemoveUnusedResult {
+export type RemoveUnusedOptions = {
+    /** Declarators / function decls inside a function not in this set are
+     *  skipped. If omitted, every declarator is visited (legacy/test
+     *  behavior). */
+    touched?: WeakSet<t.Function>;
+};
+
+export function removeUnusedCode(ast: t.File, options: RemoveUnusedOptions = {}): RemoveUnusedResult {
     const total: RemoveUnusedResult = {
         removedDeclarators: 0,
         removedFunctionDecls: 0,
@@ -50,7 +57,7 @@ export function removeUnusedCode(ast: t.File): RemoveUnusedResult {
     // Iterate to fixpoint. Each round does a fresh `traverse()` so scope info
     // is rebuilt against the mutated AST.
     while (true) {
-        const round = sweep(ast);
+        const round = sweep(ast, options);
         if (sumOf(round) === 0) break;
         total.removedDeclarators += round.removedDeclarators;
         total.removedFunctionDecls += round.removedFunctionDecls;
@@ -64,12 +71,20 @@ function sumOf(r: RemoveUnusedResult): number {
     return r.removedDeclarators + r.removedFunctionDecls + r.removedImportSpecifiers + r.removedImportDeclarations;
 }
 
-function sweep(ast: t.File): RemoveUnusedResult {
+function sweep(ast: t.File, options: RemoveUnusedOptions): RemoveUnusedResult {
     const stats: RemoveUnusedResult = {
         removedDeclarators: 0,
         removedFunctionDecls: 0,
         removedImportSpecifiers: 0,
         removedImportDeclarations: 0,
+    };
+
+    const touched = options.touched;
+    const gateByEnclosingFn = (path: { getFunctionParent(): { node: t.Function } | null }): boolean => {
+        if (!touched) return true;
+        const fnParent = path.getFunctionParent();
+        if (!fnParent) return true; // top-level — always visit
+        return touched.has(fnParent.node);
     };
 
     traverse(ast, {
@@ -81,6 +96,7 @@ function sweep(ast: t.File): RemoveUnusedResult {
             path.scope.crawl();
         },
         VariableDeclarator(path) {
+            if (!gateByEnclosingFn(path)) return;
             // v1: only simple `let|const|var x = ...;` — skip destructuring.
             if (!t.isIdentifier(path.node.id)) return;
             const binding = path.scope.getBinding(path.node.id.name);
@@ -102,6 +118,7 @@ function sweep(ast: t.File): RemoveUnusedResult {
         },
 
         FunctionDeclaration(path) {
+            if (!gateByEnclosingFn(path)) return;
             const id = path.node.id;
             if (!id) return;
             // Don't strip exported function decls.
@@ -115,6 +132,7 @@ function sweep(ast: t.File): RemoveUnusedResult {
         },
 
         ClassDeclaration(path) {
+            if (!gateByEnclosingFn(path)) return;
             const id = path.node.id;
             if (!id) return;
             if (path.parent && t.isExportDeclaration(path.parent)) return;

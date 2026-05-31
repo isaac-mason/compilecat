@@ -1,7 +1,17 @@
 import * as t from '@babel/types';
-import { parse } from '@babel/parser';
 import _generate from '@babel/generator';
-import traverse$1 from '@babel/traverse';
+import _traverse from '@babel/traverse';
+import { parse } from '@babel/parser';
+import * as fs from 'node:fs';
+import * as nodePath from 'node:path';
+
+// Babel ships its packages as CJS with a `default` export. Under some
+// bundlers / loaders the ESM default-import lands as the function directly;
+// under others it lands as `{ default: fn }`. Centralised here so each
+// consumer just imports the unwrapped value.
+const unwrap = (mod) => mod.default ?? mod;
+const generate = unwrap(_generate);
+const traverse = unwrap(_traverse);
 
 // Authored `@*` directive vocabulary, ported from src/plugin/analyses/directives.ts.
 // Standalone — no cross-tree imports. Same regex shapes so behavior matches.
@@ -14,7 +24,7 @@ const DIRECTIVE_PATTERNS = {
 };
 const ANY_DIRECTIVE_IN_SOURCE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
 function commentIsInlineDirective(value) {
-    return (DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS.flatten.test(value) || DIRECTIVE_PATTERNS.optimize.test(value));
+    return DIRECTIVE_PATTERNS.inline.test(value) || DIRECTIVE_PATTERNS.flatten.test(value);
 }
 function commentIsFlattenDirective(value) {
     return DIRECTIVE_PATTERNS.flatten.test(value) || DIRECTIVE_PATTERNS.optimize.test(value);
@@ -45,14 +55,493 @@ function matchLeadingComment(n, pred) {
     }
     return false;
 }
+// Matches any directive that opts a function in to per-function cleanup
+// (simplifier / inline-variables / remove-unused-code gating). Notably
+// excludes `@inline` — that marks *callees*, not the functions that should
+// receive cleanup; their callers are added by the inliner instead.
+function commentIsAnyOptInDirective(value) {
+    return (DIRECTIVE_PATTERNS.optimize.test(value) ||
+        DIRECTIVE_PATTERNS.flatten.test(value) ||
+        DIRECTIVE_PATTERNS.sroa.test(value) ||
+        DIRECTIVE_PATTERNS.unroll.test(value));
+}
+function commentListHasOptIn(cs) {
+    if (!cs)
+        return false;
+    for (const c of cs) {
+        if (commentIsAnyOptInDirective(c.value))
+            return true;
+    }
+    return false;
+}
+// Walk every Function node in `ast` and add it to `touched` if the function
+// itself (or any statement inside its body, excluding nested functions) carries
+// an opt-in directive (`@optimize` / `@flatten` / `@sroa` / `@unroll`).
+//
+// The body-scan picks up block-level opt-in markers authored as
+// `function foo() { /* @optimize */ { ... } }`. Nested functions are skipped
+// by the inner walker because they get their own visitor call from
+// `traverse`, which handles their own membership independently.
+function collectOptIns(ast, touched) {
+    traverse(ast, {
+        Function(path) {
+            const node = path.node;
+            if (touched.has(node))
+                return;
+            if (hasLeadingDirective(node, path.parent, commentIsAnyOptInDirective)) {
+                touched.add(node);
+                return;
+            }
+            if (functionBodyHasOptIn(node)) {
+                touched.add(node);
+            }
+        },
+    });
+}
+function functionBodyHasOptIn(fn) {
+    let found = false;
+    const visit = (n) => {
+        if (found)
+            return;
+        // Don't descend into nested functions — they get their own visit.
+        if (n !== fn && t.isFunction(n))
+            return;
+        if (commentListHasOptIn(n.leadingComments) || commentListHasOptIn(n.innerComments)) {
+            found = true;
+            return;
+        }
+        for (const k of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = n[k];
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c && typeof c === 'object' && 'type' in c)
+                        visit(c);
+                    if (found)
+                        return;
+                }
+            }
+            else if (child && typeof child === 'object' && 'type' in child) {
+                visit(child);
+            }
+        }
+    };
+    visit(fn);
+    return found;
+}
 
-// Babel ships its packages as CJS with a `default` export. Under some
-// bundlers / loaders the ESM default-import lands as the function directly;
-// under others it lands as `{ default: fn }`. Centralised here so each
-// consumer just imports the unwrapped value.
-const unwrap = (mod) => mod.default ?? mod;
-const generate = unwrap(_generate);
-const traverse = unwrap(traverse$1);
+// Per-file index. Mirrors src/plugin/analyses/discover.ts; standalone — no
+// cross-tree imports. Surfaces the structural facts the cross-file inliner
+// needs:
+//   - Top-level functions (with annotations)
+//   - Module-scope variables (scratch buffers, constants)
+//   - Imports (named / default / namespace)
+//   - Namespace re-exports (`export * as X from './Y'`)
+//   - Per-function free references to top-level names
+//
+// Pure: parse + walk, no AST mutation. Re-invoke after mutations invalidate
+// the previous index.
+const INLINE_PATTERN = DIRECTIVE_PATTERNS.inline;
+const FLATTEN_PATTERN = DIRECTIVE_PATTERNS.flatten;
+const OPTIMIZE_PATTERN = DIRECTIVE_PATTERNS.optimize;
+function hasBlockAnnotation(node, pattern) {
+    if (!node)
+        return false;
+    const comments = node.leadingComments;
+    if (!comments)
+        return false;
+    return comments.some((c) => c.type === 'CommentBlock' && pattern.test(c.value));
+}
+function hasInlineAnnotation$1(node) {
+    return hasBlockAnnotation(node, INLINE_PATTERN);
+}
+function hasFlattenAnnotation$1(node) {
+    return (hasBlockAnnotation(node, FLATTEN_PATTERN) ||
+        hasBlockAnnotation(node, OPTIMIZE_PATTERN));
+}
+function indexFile(absolutePath, ast) {
+    const functions = new Map();
+    const moduleVars = new Map();
+    const imports = new Map();
+    const namespaceReexports = new Map();
+    for (const stmt of ast.program.body) {
+        collectStatement(stmt, absolutePath, functions, moduleVars, imports, namespaceReexports, false, false);
+    }
+    for (const fn of functions.values()) {
+        analyzeFreeRefs(fn, functions, moduleVars, imports, ast);
+    }
+    return { absolutePath, ast, functions, moduleVars, imports, namespaceReexports };
+}
+function collectStatement(stmt, sourceFile, functions, moduleVars, imports, namespaceReexports, inheritedInline, inheritedFlatten) {
+    const localInline = inheritedInline || hasInlineAnnotation$1(stmt);
+    const localFlatten = inheritedFlatten || hasFlattenAnnotation$1(stmt);
+    if (t.isImportDeclaration(stmt)) {
+        recordImports(stmt, imports);
+        return;
+    }
+    if (t.isExportNamedDeclaration(stmt)) {
+        if (stmt.source && stmt.specifiers.length > 0) {
+            for (const spec of stmt.specifiers) {
+                if (t.isExportNamespaceSpecifier(spec)) {
+                    namespaceReexports.set(spec.exported.name, stmt.source.value);
+                }
+            }
+        }
+        if (stmt.declaration) {
+            collectStatement(stmt.declaration, sourceFile, functions, moduleVars, imports, namespaceReexports, localInline, localFlatten);
+        }
+        return;
+    }
+    if (t.isExportDefaultDeclaration(stmt)) {
+        const decl = stmt.declaration;
+        if (t.isFunctionDeclaration(decl) ||
+            t.isFunctionExpression(decl) ||
+            t.isArrowFunctionExpression(decl)) {
+            functions.set('default', buildFunctionEntry('default', sourceFile, decl, localInline, localFlatten));
+        }
+        return;
+    }
+    if (t.isFunctionDeclaration(stmt) && stmt.id) {
+        functions.set(stmt.id.name, buildFunctionEntry(stmt.id.name, sourceFile, stmt, localInline, localFlatten));
+        return;
+    }
+    if (t.isTSEnumDeclaration(stmt)) {
+        moduleVars.set(stmt.id.name, { name: stmt.id.name, declaration: stmt, isExported: false });
+        return;
+    }
+    if (t.isVariableDeclaration(stmt)) {
+        for (const decl of stmt.declarations) {
+            if (!t.isIdentifier(decl.id))
+                continue;
+            const name = decl.id.name;
+            if (decl.init &&
+                (t.isArrowFunctionExpression(decl.init) || t.isFunctionExpression(decl.init))) {
+                functions.set(name, buildFunctionEntry(name, sourceFile, decl.init, localInline, localFlatten));
+            }
+            else {
+                moduleVars.set(name, { name, declaration: stmt, isExported: false });
+            }
+        }
+        return;
+    }
+}
+function buildFunctionEntry(name, sourceFile, fn, inlineAnnot, flattenAnnot) {
+    const body = t.isBlockStatement(fn.body)
+        ? fn.body
+        : t.blockStatement([t.returnStatement(fn.body)]);
+    const { isSimpleReturn, returnExpression } = classifyBody(body);
+    const kind = t.isFunctionDeclaration(fn)
+        ? 'declaration'
+        : t.isArrowFunctionExpression(fn)
+            ? 'arrow'
+            : 'expression';
+    return {
+        name,
+        sourceFile,
+        kind,
+        fnNode: fn,
+        params: fn.params,
+        body,
+        hasInlineAnnotation: inlineAnnot,
+        hasFlattenAnnotation: flattenAnnot,
+        isSimpleReturn,
+        returnExpression,
+        moduleVarRefs: new Set(),
+        functionRefs: new Set(),
+        importRefs: new Set(),
+        unresolvedRefs: new Set(),
+    };
+}
+function classifyBody(body) {
+    if (body.body.length !== 1)
+        return { isSimpleReturn: false, returnExpression: null };
+    const only = body.body[0];
+    if (!t.isReturnStatement(only))
+        return { isSimpleReturn: false, returnExpression: null };
+    if (!only.argument)
+        return { isSimpleReturn: false, returnExpression: null };
+    return { isSimpleReturn: true, returnExpression: only.argument };
+}
+function recordImports(decl, imports) {
+    const source = decl.source.value;
+    for (const spec of decl.specifiers) {
+        if (t.isImportSpecifier(spec)) {
+            const importedName = t.isIdentifier(spec.imported)
+                ? spec.imported.name
+                : spec.imported.value;
+            imports.set(spec.local.name, {
+                localName: spec.local.name,
+                importedName,
+                style: 'named',
+                source,
+            });
+        }
+        else if (t.isImportDefaultSpecifier(spec)) {
+            imports.set(spec.local.name, {
+                localName: spec.local.name,
+                importedName: 'default',
+                style: 'default',
+                source,
+            });
+        }
+        else if (t.isImportNamespaceSpecifier(spec)) {
+            imports.set(spec.local.name, {
+                localName: spec.local.name,
+                importedName: '*',
+                style: 'namespace',
+                source,
+            });
+        }
+    }
+}
+function analyzeFreeRefs(fn, functions, moduleVars, imports, ast) {
+    let rootPath = null;
+    traverse(ast, {
+        FunctionDeclaration(path) {
+            if (path.node.id?.name === fn.name) {
+                rootPath = path;
+                path.stop();
+            }
+        },
+        VariableDeclarator(path) {
+            if (t.isIdentifier(path.node.id) &&
+                path.node.id.name === fn.name &&
+                (t.isArrowFunctionExpression(path.node.init) ||
+                    t.isFunctionExpression(path.node.init))) {
+                rootPath = path.get('init');
+                path.stop();
+            }
+        },
+        ExportDefaultDeclaration(path) {
+            if (fn.name !== 'default')
+                return;
+            const decl = path.node.declaration;
+            if (t.isFunctionDeclaration(decl) ||
+                t.isFunctionExpression(decl) ||
+                t.isArrowFunctionExpression(decl)) {
+                rootPath = path.get('declaration');
+                path.stop();
+            }
+        },
+    });
+    if (!rootPath)
+        return;
+    const safePath = rootPath;
+    // Babel's scope plugin doesn't bind TSEnumDeclaration (and a few other TS-only
+    // forms), so `getBinding` is `null` for valid top-level enum refs. When the
+    // scope is silent, fall back to the top-level index — `getBinding` would have
+    // returned a *non-Program* binding if any inner local shadowed the name, so a
+    // null result is safe to resolve against module-scope.
+    safePath.traverse({
+        Identifier(innerPath) {
+            const name = innerPath.node.name;
+            if (!innerPath.isReferencedIdentifier())
+                return;
+            const scopeBinding = innerPath.scope.getBinding(name);
+            if (scopeBinding && scopeBinding.scope.block.type !== 'Program')
+                return;
+            if (functions.has(name))
+                fn.functionRefs.add(name);
+            else if (moduleVars.has(name))
+                fn.moduleVarRefs.add(name);
+            else if (imports.has(name))
+                fn.importRefs.add(name);
+            else if (scopeBinding)
+                fn.unresolvedRefs.add(name);
+        },
+    });
+}
+
+// Path resolution for cross-file inlining.
+//
+// Two modes:
+//   - Same-project (relative + absolute paths). Always allowed; probes
+//     extensions and index files.
+//   - Library (bare specifier `lodash`, `@scope/pkg/sub`). Only consulted
+//     when the call site explicitly opts in via `/* @inline */`. Walks up
+//     `node_modules`, honors package.json `exports` / `main` / `module`.
+//
+// FileReader abstraction lets tests inject a virtual filesystem. Library
+// resolution always reads package.json directly from disk.
+const defaultFileReader = (absolutePath) => {
+    try {
+        return fs.readFileSync(absolutePath, 'utf-8');
+    }
+    catch {
+        return null;
+    }
+};
+const SOURCE_EXTENSIONS = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'];
+function diskExists(path) {
+    try {
+        return fs.statSync(path).isFile();
+    }
+    catch {
+        return false;
+    }
+}
+function makeExists(reader) {
+    if (!reader)
+        return diskExists;
+    return (path) => reader(path) !== null;
+}
+function probeWithExtensions(base, exists) {
+    if (exists(base))
+        return base;
+    for (const ext of SOURCE_EXTENSIONS) {
+        if (exists(base + ext))
+            return base + ext;
+    }
+    for (const ext of SOURCE_EXTENSIONS) {
+        const p = nodePath.join(base, `index${ext}`);
+        if (exists(p))
+            return p;
+    }
+    return null;
+}
+function resolveRelativeImport(fromFile, specifier, reader) {
+    if (!specifier.startsWith('./') &&
+        !specifier.startsWith('../') &&
+        !specifier.startsWith('/')) {
+        return null;
+    }
+    const base = nodePath.isAbsolute(specifier)
+        ? specifier
+        : nodePath.resolve(nodePath.dirname(fromFile), specifier);
+    return probeWithExtensions(base, makeExists(reader));
+}
+function splitBareSpecifier(specifier) {
+    if (specifier.startsWith('@')) {
+        const parts = specifier.split('/');
+        if (parts.length < 2)
+            return [specifier, '.'];
+        const name = `${parts[0]}/${parts[1]}`;
+        const sub = parts.length > 2 ? `./${parts.slice(2).join('/')}` : '.';
+        return [name, sub];
+    }
+    const idx = specifier.indexOf('/');
+    if (idx < 0)
+        return [specifier, '.'];
+    return [specifier.slice(0, idx), `./${specifier.slice(idx + 1)}`];
+}
+function findPackageRoot(fromDir, pkgName) {
+    let dir = fromDir;
+    for (;;) {
+        const candidate = nodePath.join(dir, 'node_modules', pkgName);
+        if (diskExists(nodePath.join(candidate, 'package.json'))) {
+            return candidate;
+        }
+        const parent = nodePath.dirname(dir);
+        if (parent === dir)
+            return null;
+        dir = parent;
+    }
+}
+function readPackageJson(pkgRoot) {
+    try {
+        const raw = fs.readFileSync(nodePath.join(pkgRoot, 'package.json'), 'utf-8');
+        return JSON.parse(raw);
+    }
+    catch {
+        return null;
+    }
+}
+const EXPORT_CONDITIONS = ['import', 'module', 'default', 'require'];
+function resolveThroughExports(exportsField, subpath) {
+    if (!exportsField || typeof exportsField !== 'object')
+        return null;
+    const exps = exportsField;
+    if (typeof exportsField === 'string') {
+        return subpath === '.' ? exportsField : null;
+    }
+    const directKey = subpath === '.' ? '.' : subpath;
+    const entry = exps[directKey];
+    if (entry === undefined)
+        return null;
+    return resolveConditionEntry(entry);
+}
+function resolveConditionEntry(entry) {
+    if (typeof entry === 'string')
+        return entry;
+    if (!entry || typeof entry !== 'object')
+        return null;
+    const obj = entry;
+    for (const cond of EXPORT_CONDITIONS) {
+        if (cond in obj) {
+            const resolved = resolveConditionEntry(obj[cond]);
+            if (resolved)
+                return resolved;
+        }
+    }
+    return null;
+}
+function resolveLibraryImport(fromFile, specifier) {
+    const [pkgName, subpath] = splitBareSpecifier(specifier);
+    const pkgRoot = findPackageRoot(nodePath.dirname(fromFile), pkgName);
+    if (!pkgRoot)
+        return null;
+    const pkg = readPackageJson(pkgRoot);
+    if (!pkg)
+        return null;
+    const exists = diskExists;
+    const exportTarget = resolveThroughExports(pkg.exports, subpath);
+    if (exportTarget) {
+        return probeWithExtensions(nodePath.join(pkgRoot, exportTarget), exists);
+    }
+    if (subpath === '.') {
+        const target = pkg.module ?? pkg.main;
+        if (target)
+            return probeWithExtensions(nodePath.join(pkgRoot, target), exists);
+        return probeWithExtensions(nodePath.join(pkgRoot, 'index'), exists);
+    }
+    return probeWithExtensions(nodePath.join(pkgRoot, subpath), exists);
+}
+function resolveImportSource(fromFile, specifier, allowLibrary, reader) {
+    const rel = resolveRelativeImport(fromFile, specifier, reader);
+    if (rel)
+        return rel;
+    if (allowLibrary)
+        return resolveLibraryImport(fromFile, specifier);
+    return null;
+}
+
+// Lazy, cached cross-file indexing.
+//
+//   - createFileCache() returns a mutable cache; share across multiple
+//     transform calls in one build to amortize parse/index cost.
+//   - ensureIndexed(cache, path, reader) parses + indexes if not cached and
+//     returns the index. null when the file can't be read or parsed.
+//   - Cycle-guard sentinel ('in-progress') breaks A→B→A recursion.
+function createFileCache() {
+    return { entries: new Map() };
+}
+function ensureIndexed(cache, absolutePath, reader = defaultFileReader) {
+    const existing = cache.entries.get(absolutePath);
+    if (existing === 'in-progress')
+        return null;
+    if (existing)
+        return existing;
+    cache.entries.set(absolutePath, 'in-progress');
+    const code = reader(absolutePath);
+    if (code === null) {
+        cache.entries.delete(absolutePath);
+        return null;
+    }
+    let ast;
+    try {
+        ast = parse(code, {
+            sourceType: 'module',
+            plugins: ['typescript', 'jsx'],
+            sourceFilename: absolutePath,
+        });
+    }
+    catch {
+        cache.entries.delete(absolutePath);
+        return null;
+    }
+    const index = indexFile(absolutePath, ast);
+    cache.entries.set(absolutePath, index);
+    return index;
+}
 
 // Port of jscomp/NodeUtil.java (subset).
 //
@@ -1801,22 +2290,29 @@ function calleeName(fn) {
 
 // Port of jscomp/InlineFunctions.java (subset).
 //
-// Drives FunctionInjector: discovers candidate callees and call sites within
-// a single Program, classifies each, and performs the splice.
+// Drives FunctionInjector: discovers candidate callees and call sites,
+// classifies each, and performs the splice.
 //
-// Operates on a single Program — in bundle-mode this is the entire chunk
-// after rollup has resolved imports. No cross-file resolution; if you can
-// see the callee in the program, it's a candidate.
+// Operates on a single Program. In WholeProgram (bundle-mode) this is the
+// entire chunk after rollup has resolved imports — every callee in scope is
+// reachable directly. In PerFile (transform-mode) the Program is one source
+// file; passing a CrossFileCtx (consumerPath + fileCache) extends discovery
+// to follow imports into donor modules, splice donor bodies into the
+// consumer, and hoist the module-vars / imports the spliced body references.
 //
 //   - Candidate callees:
 //     - `function NAME(...) { ... }` declarations at any block scope
 //     - `const NAME = (...) => { ... }` / `const NAME = function (...) { ... }`
+//     - (cross-file) any of the above exported from a resolved donor module
 //   - Trigger:
 //     - declaration carries an `@inline` JSDoc / leading block comment, OR
 //     - call expression carries an `@inline` leading block comment, OR
 //     - call sits inside a `@flatten`-annotated function
 //   - Call sites:
-//     - `NAME(args)` — Identifier callee matching a known candidate
+//     - `NAME(args)` — Identifier callee matching a known candidate (local or
+//       cross-file via a named import)
+//     - `NS.NAME(args)` — namespace member call against a namespace import or
+//       namespace re-export
 //   - No method calls, no `this`/`arguments`, no recursion.
 //
 // Discovery is name-keyed. We don't model scope shadowing — if two callees
@@ -1824,16 +2320,27 @@ function calleeName(fn) {
 // outermost as the only candidate.
 // ---------------------------------------------------------------------------
 // Public entry.
-function inlineFunctions(root) {
-    const result = { inlined: 0, calls: 0, succeeded: 0 };
+function inlineFunctions(root, options = {}) {
+    const result = {
+        inlined: 0,
+        calls: 0,
+        succeeded: 0,
+        donorPaths: new Set(),
+    };
+    // Discover top-level (and nested) local candidate functions.
     const candidates = new Map();
     discoverCandidates(root, candidates);
-    if (candidates.size === 0)
+    // Cross-file context. Built once so the consumerIndex (free-ref analysis)
+    // is shared across every call-site lookup.
+    const xfile = buildCrossFileCtx(root, options);
+    if (candidates.size === 0 && !xfile)
         return result;
-    const sites = collectCallSites(root, candidates);
+    // Find call sites and inject. Pre-collected in a single pass so that
+    // injection-time AST mutation can't disturb the iteration.
+    const sites = collectCallSites(root, candidates, xfile);
     let nextId = 0;
     const opts = { nextId: () => nextId++ };
-    for (const { candidate, site } of sites) {
+    for (const { candidate, site, enclosingFunction } of sites) {
         const fn = candidate.callee.fn;
         const cls = classifyCallee(fn);
         if (cls.mode === 'NO')
@@ -1843,18 +2350,39 @@ function inlineFunctions(root) {
         if (cls.mode === 'DIRECT') {
             ok = inlineDirect(candidate.callee, site);
             if (!ok) {
+                // Fall back to BLOCK if DIRECT can't substitute (e.g. side-effect
+                // arg used twice).
                 ok = inlineBlock(candidate.callee, site, opts);
             }
         }
         else {
             ok = inlineBlock(candidate.callee, site, opts);
         }
-        if (ok)
+        if (ok) {
             result.succeeded++;
+            if (enclosingFunction)
+                options.touched?.add(enclosingFunction);
+            if (xfile && candidate.donor) {
+                trackDonorRefs(candidate, xfile);
+                xfile.donorPaths.add(candidate.donor.donorPath);
+            }
+        }
     }
     if (result.succeeded > 0)
         result.inlined = candidates.size;
+    // Strip declaration-annotated callees once consumed. Conservative: only
+    // strip if we successfully inlined at least one call AND no residual
+    // identifier reads remain in the same parent block.
     stripFullyInlinedDecls(candidates, sites);
+    // Hoist donor-side module-vars and imports referenced by spliced bodies.
+    if (xfile && t.isFile(root)) {
+        if (xfile.requiredImports.size > 0)
+            hoistRequiredImports(root, xfile);
+        if (xfile.requiredModuleVars.size > 0)
+            hoistRequiredModuleVars(root, xfile);
+        for (const p of xfile.donorPaths)
+            result.donorPaths.add(p);
+    }
     return result;
 }
 // ---------------------------------------------------------------------------
@@ -1914,13 +2442,40 @@ function hasInlineAnnotation(n, parent = null) {
 function hasFlattenAnnotation(n, parent = null) {
     return hasLeadingDirective(n, parent, commentIsFlattenDirective);
 }
-function collectCallSites(root, candidates) {
+// ---------------------------------------------------------------------------
+// Cross-file context bootstrap.
+function buildCrossFileCtx(root, opts) {
+    if (!opts.consumerPath || !opts.fileCache)
+        return null;
+    if (!t.isFile(root))
+        return null;
+    const reader = opts.fileReader ?? defaultFileReader;
+    const consumerIndex = indexFile(opts.consumerPath, root);
+    return {
+        consumerPath: opts.consumerPath,
+        consumerIndex,
+        cache: opts.fileCache,
+        reader,
+        allowLibrary: opts.allowLibraryInline === true,
+        memo: new Map(),
+        requiredModuleVars: new Map(),
+        requiredImports: new Map(),
+        donorPaths: new Set(),
+    };
+}
+function collectCallSites(root, candidates, xfile) {
     const sites = [];
+    // Track current enclosing function (for flatten propagation + downstream
+    // touched-set bookkeeping).
     const flattenStack = [false];
-    const walk = (n, parent, key, index, stmtCtx) => {
+    const fnStack = [null];
+    const walk = (n, parent, key, index, 
+    // Path of (statementParent, statementIndex, enclosingStatement).
+    stmtCtx) => {
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
             flattenStack.push(hasFlattenAnnotation(n, parent));
+            fnStack.push(n);
         }
         let nextStmtCtx = stmtCtx;
         if (parent &&
@@ -1935,7 +2490,7 @@ function collectCallSites(root, candidates) {
             };
         }
         if (t.isCallExpression(n) && nextStmtCtx !== null && parent !== null) {
-            const cand = resolveCandidateForCall(n, candidates);
+            const cand = resolveCandidateForCall(n, candidates, xfile);
             if (cand !== null) {
                 const callsiteAnnotated = hasInlineAnnotationOnCall(n, parent, key);
                 const enclosingFlatten = flattenStack[flattenStack.length - 1];
@@ -1951,6 +2506,7 @@ function collectCallSites(root, candidates) {
                             callKey: key,
                             callIndex: index,
                         },
+                        enclosingFunction: fnStack[fnStack.length - 1],
                     });
                 }
             }
@@ -1970,21 +2526,343 @@ function collectCallSites(root, candidates) {
                 walk(child, n, k, undefined, nextStmtCtx);
             }
         }
-        if (enteringFn)
+        if (enteringFn) {
             flattenStack.pop();
+            fnStack.pop();
+        }
     };
     walk(root, null, '', undefined, null);
     return sites;
 }
-function resolveCandidateForCall(call, candidates) {
+// ---------------------------------------------------------------------------
+// Candidate resolution at a call site (local or cross-file).
+function resolveCandidateForCall(call, localCandidates, xfile) {
     const callee = call.callee;
-    if (t.isIdentifier(callee))
-        return candidates.get(callee.name) ?? null;
+    if (t.isIdentifier(callee)) {
+        const name = callee.name;
+        const local = localCandidates.get(name);
+        if (local)
+            return local;
+        if (!xfile)
+            return null;
+        const binding = xfile.consumerIndex.imports.get(name);
+        if (!binding)
+            return null;
+        return resolveImportedCallee(binding.importedName, binding, xfile);
+    }
+    if (t.isMemberExpression(callee) && !callee.computed) {
+        if (!xfile)
+            return null;
+        if (!t.isIdentifier(callee.object))
+            return null;
+        if (!t.isIdentifier(callee.property))
+            return null;
+        const nsName = callee.object.name;
+        const fnName = callee.property.name;
+        const binding = xfile.consumerIndex.imports.get(nsName);
+        if (binding && binding.style === 'namespace') {
+            return resolveImportedCallee(fnName, binding, xfile);
+        }
+        const reexportSource = xfile.consumerIndex.namespaceReexports.get(nsName);
+        if (reexportSource) {
+            const fakeBinding = {
+                source: reexportSource,
+            };
+            return resolveImportedCallee(fnName, fakeBinding, xfile);
+        }
+        // `import { ns } from 'pkg'` where the donor file re-exports `ns` as a
+        // namespace (`export * as ns from './impl'` or
+        // `import * as ns from './impl'; export { ns };`). Follow through.
+        if (binding && binding.style === 'named') {
+            const donorPath = resolveImportSource(xfile.consumerPath, binding.source, xfile.allowLibrary, xfile.reader);
+            if (!donorPath)
+                return null;
+            const donorIndex = ensureIndexed(xfile.cache, donorPath, xfile.reader);
+            if (!donorIndex)
+                return null;
+            let nsSource = donorIndex.namespaceReexports.get(binding.importedName);
+            if (!nsSource) {
+                const nsImport = donorIndex.imports.get(binding.importedName);
+                if (nsImport?.style === 'namespace')
+                    nsSource = nsImport.source;
+            }
+            if (!nsSource)
+                return null;
+            const fakeBinding = {
+                source: nsSource,
+            };
+            // Resolve `fnName` from the *donor* file's perspective.
+            return resolveImportedCalleeFrom(donorPath, fnName, fakeBinding, xfile);
+        }
+    }
     return null;
 }
+function resolveImportedCallee(importedName, binding, xfile) {
+    return resolveImportedCalleeFrom(xfile.consumerPath, importedName, binding, xfile);
+}
+function resolveImportedCalleeFrom(fromFile, importedName, binding, xfile) {
+    const donorPath = resolveImportSource(fromFile, binding.source, xfile.allowLibrary, xfile.reader);
+    if (!donorPath)
+        return null;
+    const memoKey = `${donorPath}::${importedName}`;
+    if (xfile.memo.has(memoKey))
+        return xfile.memo.get(memoKey) ?? null;
+    const donorIndex = ensureIndexed(xfile.cache, donorPath, xfile.reader);
+    if (!donorIndex) {
+        xfile.memo.set(memoKey, null);
+        return null;
+    }
+    const donorFn = donorIndex.functions.get(importedName);
+    if (!donorFn) {
+        xfile.memo.set(memoKey, null);
+        return null;
+    }
+    const cand = buildCrossFileCandidate(donorFn, donorPath, donorIndex);
+    xfile.memo.set(memoKey, cand);
+    return cand;
+}
+/**
+ * Build a Candidate from a donor IndexedFunction. The body's references to
+ * donor module-vars and imports are tracked through `Candidate.donor`; on
+ * successful inline we register them so the post-pass can hoist clones into
+ * the consumer file. Calls to *other* donor functions cannot be hoisted
+ * (they would require pulling whole functions across), so we reject those.
+ */
+function buildCrossFileCandidate(donorFn, donorPath, donorIndex) {
+    // We don't pull donor function definitions across files. If the donor
+    // body calls another donor function, the splice would leave an unbound
+    // reference in the consumer. Bail.
+    if (donorFn.functionRefs.size > 0)
+        return null;
+    // Donor body references a top-level binding we can't classify
+    // (e.g. classes) — the hoister wouldn't know how to bring it along.
+    // Bail rather than emitting a broken inline.
+    if (donorFn.unresolvedRefs.size > 0)
+        return null;
+    const params = [];
+    for (const p of donorFn.params) {
+        if (!t.isIdentifier(p))
+            return null;
+        params.push(p.name);
+    }
+    return {
+        name: donorFn.name,
+        callee: { fn: donorFn.fnNode, paramNames: params },
+        declAnnotated: donorFn.hasInlineAnnotation,
+        donor: { donorPath, donorIndex, fn: donorFn },
+    };
+}
+function trackDonorRefs(candidate, xfile) {
+    if (!candidate.donor)
+        return;
+    const { donorPath, donorIndex, fn } = candidate.donor;
+    for (const name of fn.moduleVarRefs) {
+        const mv = donorIndex.moduleVars.get(name);
+        if (!mv)
+            continue;
+        const key = `${donorPath}::${name}`;
+        if (xfile.requiredModuleVars.has(key))
+            continue;
+        xfile.requiredModuleVars.set(key, { sourceFile: donorPath, name, moduleVar: mv });
+    }
+    for (const name of fn.importRefs) {
+        const b = donorIndex.imports.get(name);
+        if (!b)
+            continue;
+        const key = `${donorPath}::${name}`;
+        if (xfile.requiredImports.has(key))
+            continue;
+        xfile.requiredImports.set(key, { sourceFile: donorPath, localName: name, binding: b });
+    }
+}
+// ---------------------------------------------------------------------------
+// Hoisting donor module-vars + imports.
+//
+// Imports are rewritten relative to the consumer file (or kept as bare
+// specifiers for library imports). Module-var clones are inserted right
+// after the import block. Collisions are skipped — when the consumer
+// already has a binding by the same name, we leave the spliced body's
+// reference to bind to whatever is in scope.
+function hoistRequiredImports(ast, xfile) {
+    const consumerIndex = xfile.consumerIndex;
+    const reader = xfile.reader;
+    const consumerFile = xfile.consumerPath;
+    const existingBindings = new Set([
+        ...consumerIndex.imports.keys(),
+        ...consumerIndex.functions.keys(),
+        ...consumerIndex.moduleVars.keys(),
+    ]);
+    for (const stmt of ast.program.body) {
+        if (t.isImportDeclaration(stmt)) {
+            for (const spec of stmt.specifiers)
+                existingBindings.add(spec.local.name);
+        }
+    }
+    const byTarget = new Map();
+    const consumerDir = nodePath.dirname(consumerFile);
+    for (const req of xfile.requiredImports.values()) {
+        const binding = req.binding;
+        if (!binding)
+            continue;
+        if (existingBindings.has(binding.localName))
+            continue;
+        let rewrittenSource = binding.source;
+        if (binding.source.startsWith('./') || binding.source.startsWith('../') || binding.source.startsWith('/')) {
+            const abs = resolveRelativeImport(req.sourceFile, binding.source, reader);
+            if (abs) {
+                let rel = nodePath.relative(consumerDir, abs);
+                if (!rel.startsWith('.'))
+                    rel = `./${rel}`;
+                rel = rel.replace(/\.(ts|tsx|js|jsx|mjs|cjs)$/, '');
+                rewrittenSource = rel;
+            }
+        }
+        const bucket = byTarget.get(rewrittenSource) ?? { source: rewrittenSource, specs: [] };
+        bucket.specs.push({
+            localName: binding.localName,
+            importedName: binding.importedName,
+            style: binding.style,
+        });
+        byTarget.set(rewrittenSource, bucket);
+        existingBindings.add(binding.localName);
+    }
+    if (byTarget.size === 0)
+        return;
+    const importsToInsert = [];
+    for (const { source, specs } of byTarget.values()) {
+        const specifiers = [];
+        for (const s of specs) {
+            if (s.style === 'default') {
+                specifiers.push(t.importDefaultSpecifier(t.identifier(s.localName)));
+            }
+            else if (s.style === 'namespace') {
+                specifiers.push(t.importNamespaceSpecifier(t.identifier(s.localName)));
+            }
+            else {
+                specifiers.push(t.importSpecifier(t.identifier(s.localName), t.identifier(s.importedName)));
+            }
+        }
+        importsToInsert.push(t.importDeclaration(specifiers, t.stringLiteral(source)));
+    }
+    ast.program.body.unshift(...importsToInsert);
+}
+function hoistRequiredModuleVars(ast, xfile) {
+    const consumerIndex = xfile.consumerIndex;
+    const consumerLocals = new Set([
+        ...consumerIndex.moduleVars.keys(),
+        ...consumerIndex.functions.keys(),
+        ...consumerIndex.imports.keys(),
+    ]);
+    for (const stmt of ast.program.body) {
+        if (t.isImportDeclaration(stmt)) {
+            for (const spec of stmt.specifiers)
+                consumerLocals.add(spec.local.name);
+        }
+    }
+    const toInsert = [];
+    const insertedKeys = new Set();
+    for (const [key, req] of xfile.requiredModuleVars) {
+        if (insertedKeys.has(key))
+            continue;
+        if (consumerLocals.has(req.name))
+            continue;
+        const cloned = cloneModuleVarForHoisting(req.moduleVar, req.name);
+        if (!cloned)
+            continue;
+        toInsert.push(...cloned);
+        insertedKeys.add(key);
+    }
+    if (toInsert.length === 0)
+        return;
+    const body = ast.program.body;
+    let insertAt = 0;
+    for (let i = 0; i < body.length; i++) {
+        if (t.isImportDeclaration(body[i]))
+            insertAt = i + 1;
+        else
+            break;
+    }
+    body.splice(insertAt, 0, ...toInsert);
+}
+function cloneModuleVarForHoisting(moduleVar, name) {
+    const decl = moduleVar.declaration;
+    if (t.isTSEnumDeclaration(decl)) {
+        if (decl.id.name !== name)
+            return null;
+        return lowerTsEnumToJs$1(decl);
+    }
+    const matching = decl.declarations.find((d) => t.isIdentifier(d.id) && d.id.name === name);
+    if (!matching)
+        return null;
+    return [t.variableDeclaration(decl.kind, [t.cloneNode(matching, true, false)])];
+}
+// Lower a TSEnumDeclaration to the TypeScript-equivalent JS emit. Matches
+// `tsc --target esnext` output: numeric members get reverse-mapping; string
+// members get forward-only assignment. Returns null if any member has a
+// non-literal initializer we can't evaluate at compile time.
+//
+//   enum E { A = 0, B = 1 }
+// becomes:
+//   var E;
+//   (function (E) {
+//       E[E["A"] = 0] = "A";
+//       E[E["B"] = 1] = "B";
+//   })(E || (E = {}));
+function lowerTsEnumToJs$1(decl) {
+    const name = decl.id.name;
+    const resolved = [];
+    let nextNumeric = 0;
+    for (const m of decl.members) {
+        const keyName = t.isIdentifier(m.id) ? m.id.name : t.isStringLiteral(m.id) ? m.id.value : null;
+        if (keyName === null)
+            return null;
+        let value;
+        if (m.initializer) {
+            const init = m.initializer;
+            if (t.isNumericLiteral(init)) {
+                value = t.numericLiteral(init.value);
+                nextNumeric = init.value + 1;
+            }
+            else if (t.isUnaryExpression(init) && init.operator === '-' && t.isNumericLiteral(init.argument)) {
+                value = t.numericLiteral(-init.argument.value);
+                nextNumeric = value.value + 1;
+            }
+            else if (t.isStringLiteral(init)) {
+                value = t.stringLiteral(init.value);
+                // After a string init, auto-increment is no longer valid in TS.
+                nextNumeric = null;
+            }
+            else {
+                return null;
+            }
+        }
+        else {
+            if (nextNumeric === null)
+                return null;
+            value = t.numericLiteral(nextNumeric);
+            nextNumeric += 1;
+        }
+        resolved.push({ key: keyName, value });
+    }
+    const idRef = () => t.identifier(name);
+    const bodyStmts = resolved.map(({ key, value }) => {
+        if (t.isStringLiteral(value)) {
+            // E["KEY"] = "VAL";  (no reverse mapping for string members)
+            return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value));
+        }
+        // E[E["KEY"] = VAL] = "KEY";  (reverse mapping for numeric members)
+        return t.expressionStatement(t.assignmentExpression('=', t.memberExpression(idRef(), t.assignmentExpression('=', t.memberExpression(idRef(), t.stringLiteral(key), true), value), true), t.stringLiteral(key)));
+    });
+    const iife = t.expressionStatement(t.callExpression(t.functionExpression(null, [idRef()], t.blockStatement(bodyStmts)), [
+        t.logicalExpression('||', idRef(), t.assignmentExpression('=', idRef(), t.objectExpression([]))),
+    ]));
+    return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
+}
+// ---------------------------------------------------------------------------
 function hasInlineAnnotationOnCall(call, parent, key) {
     if (hasInlineAnnotation(call))
         return true;
+    // Comment may attach to enclosing ExpressionStatement.
     if (key === 'expression' && t.isExpressionStatement(parent) && hasInlineAnnotation(parent)) {
         return true;
     }
@@ -1998,6 +2876,8 @@ function stripFullyInlinedDecls(candidates, sites) {
         succeededByName.set(s.candidate.name, (succeededByName.get(s.candidate.name) ?? 0) + 1);
     }
     for (const [name, c] of candidates) {
+        if (c.donor)
+            continue;
         if (!c.declAnnotated)
             continue;
         if (!c.declRef)
@@ -2115,18 +2995,19 @@ function visitWithParents(root, fn) {
 //
 // Iterates to fixpoint: inlining one binding can make another's reference
 // count drop to 1, or unblock an alias chain (a → b → literal).
-function inlineVariables(ast) {
+function inlineVariables(ast, options = {}) {
     let total = 0;
     while (true) {
-        const round = sweep$1(ast);
+        const round = sweep$1(ast, options);
         if (round === 0)
             break;
         total += round;
     }
     return { inlined: total };
 }
-function sweep$1(ast) {
+function sweep$1(ast, options) {
     let inlined = 0;
+    const touched = options.touched;
     traverse(ast, {
         // Force a scope rebuild — our previous round's mutations may have
         // changed reference counts.
@@ -2134,6 +3015,13 @@ function sweep$1(ast) {
             path.scope.crawl();
         },
         VariableDeclarator(path) {
+            // Touched-set gate: only inline declarators inside an opted-in
+            // function. Top-level declarators are always considered.
+            if (touched) {
+                const fnParent = path.getFunctionParent();
+                if (fnParent && !touched.has(fnParent.node))
+                    return;
+            }
             // v1: only `const|let x = INIT` — skip destructuring.
             if (!t.isIdentifier(path.node.id))
                 return;
@@ -2517,19 +3405,19 @@ function useIsInsideLoopOutOfDef(defPath, usePath) {
 // declarations on the fly.
 const MAX_UNROLL_ITERATIONS = 1024;
 const MAX_UNROLL_PASSES = 16;
-function unrollLoops(root) {
+function unrollLoops(root, options = {}) {
     let total = 0;
     for (let pass = 0; pass < MAX_UNROLL_PASSES; pass++) {
-        const n = unrollPass(root);
+        const n = unrollPass(root, options.touched);
         if (n === 0)
             break;
         total += n;
     }
     return { unrolled: total };
 }
-function unrollPass(root) {
+function unrollPass(root, touched) {
     let count = 0;
-    walkStatementLists(root, (body, inOptimize) => {
+    walkStatementLists(root, (body, inOptimize, enclosingFn) => {
         for (let i = 0; i < body.length; i++) {
             const s = body[i];
             if (!hasUnrollAnnotation(s) && !inOptimize)
@@ -2539,6 +3427,8 @@ function unrollPass(root) {
                 if (out !== null) {
                     body.splice(i, 1, ...out);
                     count++;
+                    if (touched && enclosingFn)
+                        touched.add(enclosingFn);
                     i += out.length - 1;
                     continue;
                 }
@@ -2550,6 +3440,8 @@ function unrollPass(root) {
                 if (out !== null) {
                     body.splice(i, 1, ...out);
                     count++;
+                    if (touched && enclosingFn)
+                        touched.add(enclosingFn);
                     i += out.length - 1;
                     continue;
                 }
@@ -2875,15 +3767,17 @@ function blockDeclaresName(b, name) {
 // caller can splice in place.
 function walkStatementLists(root, cb) {
     const optimizeStack = [false];
+    const fnStack = [null];
     const visit = (n) => {
         if (n == null)
             return;
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
             optimizeStack.push(hasOptimizeAnnotation(n));
+            fnStack.push(n);
         }
         if (t.isBlockStatement(n) || t.isProgram(n)) {
-            cb(n.body, optimizeStack[optimizeStack.length - 1]);
+            cb(n.body, optimizeStack[optimizeStack.length - 1], fnStack[fnStack.length - 1]);
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
             const child = getSlot(n, k);
@@ -2899,8 +3793,10 @@ function walkStatementLists(root, cb) {
                 visit(child);
             }
         }
-        if (enteringFn)
+        if (enteringFn) {
             optimizeStack.pop();
+            fnStack.pop();
+        }
     };
     visit(root);
 }
@@ -3282,7 +4178,7 @@ function extractForInOfInitializer(loop) {
 // Babel already maintains references / constantViolations / kind, which is
 // what this pass consumes. Iterates to fixpoint because removing one
 // reference can make another binding unused.
-function removeUnusedCode(ast) {
+function removeUnusedCode(ast, options = {}) {
     const total = {
         removedDeclarators: 0,
         removedFunctionDecls: 0,
@@ -3292,7 +4188,7 @@ function removeUnusedCode(ast) {
     // Iterate to fixpoint. Each round does a fresh `traverse()` so scope info
     // is rebuilt against the mutated AST.
     while (true) {
-        const round = sweep(ast);
+        const round = sweep(ast, options);
         if (sumOf(round) === 0)
             break;
         total.removedDeclarators += round.removedDeclarators;
@@ -3305,12 +4201,21 @@ function removeUnusedCode(ast) {
 function sumOf(r) {
     return r.removedDeclarators + r.removedFunctionDecls + r.removedImportSpecifiers + r.removedImportDeclarations;
 }
-function sweep(ast) {
+function sweep(ast, options) {
     const stats = {
         removedDeclarators: 0,
         removedFunctionDecls: 0,
         removedImportSpecifiers: 0,
         removedImportDeclarations: 0,
+    };
+    const touched = options.touched;
+    const gateByEnclosingFn = (path) => {
+        if (!touched)
+            return true;
+        const fnParent = path.getFunctionParent();
+        if (!fnParent)
+            return true; // top-level — always visit
+        return touched.has(fnParent.node);
     };
     traverse(ast, {
         // Force a scope rebuild at the start of each sweep — `path.remove()`
@@ -3321,6 +4226,8 @@ function sweep(ast) {
             path.scope.crawl();
         },
         VariableDeclarator(path) {
+            if (!gateByEnclosingFn(path))
+                return;
             // v1: only simple `let|const|var x = ...;` — skip destructuring.
             if (!t.isIdentifier(path.node.id))
                 return;
@@ -3347,6 +4254,8 @@ function sweep(ast) {
             stats.removedDeclarators++;
         },
         FunctionDeclaration(path) {
+            if (!gateByEnclosingFn(path))
+                return;
             const id = path.node.id;
             if (!id)
                 return;
@@ -3364,6 +4273,8 @@ function sweep(ast) {
             stats.removedFunctionDecls++;
         },
         ClassDeclaration(path) {
+            if (!gateByEnclosingFn(path))
+                return;
             const id = path.node.id;
             if (!id)
                 return;
@@ -3458,7 +4369,7 @@ function classBodyMayHaveSideEffects(body) {
 // that isn't a constant-index member read or write.
 const MIN_FIELDS = 2;
 const MAX_FIELDS = 16;
-function applySroa(root) {
+function applySroa(root, options = {}) {
     const candidates = collectCandidates(root);
     if (candidates.length === 0)
         return { sroad: 0 };
@@ -3471,6 +4382,12 @@ function applySroa(root) {
         return { sroad: 0 };
     rewriteDeclarations(safe);
     rewriteAccesses(root, safe);
+    if (options.touched) {
+        for (const c of safe) {
+            if (t.isFunction(c.scope))
+                options.touched.add(c.scope);
+        }
+    }
     return { sroad: safe.length };
 }
 // ---------------------------------------------------------------------------
@@ -8792,6 +9709,32 @@ function isKnownNullish(n) {
 // TDZ-less semantics on locals, and *amplifies* normalize's `__N` suffix
 // proliferation by hoisting block-scoped decls into the function scope where
 // they collide. We keep `let`/`const` as-authored.
+function emptyTimings() {
+    return {
+        renameForFlatten: 0,
+        foldConstants: 0,
+        minimizeExitPoints: 0,
+        minimizeConditions: 0,
+        removeDeadCode: 0,
+        cfgBuild: 0,
+        localVarTable: 0,
+        flowInline: 0,
+        liveVars: 0,
+        deadAssigns: 0,
+    };
+}
+function addTimings(into, from) {
+    into.renameForFlatten += from.renameForFlatten;
+    into.foldConstants += from.foldConstants;
+    into.minimizeExitPoints += from.minimizeExitPoints;
+    into.minimizeConditions += from.minimizeConditions;
+    into.removeDeadCode += from.removeDeadCode;
+    into.cfgBuild += from.cfgBuild;
+    into.localVarTable += from.localVarTable;
+    into.flowInline += from.flowInline;
+    into.liveVars += from.liveVars;
+    into.deadAssigns += from.deadAssigns;
+}
 const MAX_ITERATIONS = 16;
 /**
  * Simplify a single function in place. Caller is responsible for picking
@@ -8805,17 +9748,23 @@ function simplifyFunction(fnPath, _options = {}) {
         inlined: 0,
         deadAssigns: 0,
         minimized: 0,
+        timings: emptyTimings(),
     };
+    const timings = stats.timings;
     const fn = fnPath.node;
     // Rename nested-block bindings that would collide on flatten. After this
     // pass, every let/const/class/function-declaration inside `fn` is uniquely
     // named within the function, so `PeepholeRemoveDeadCode` can splice nested
     // blocks into their parents with `ignoreBlockScopedDeclarations=true`.
+    const renameStart = performance.now();
     renameForFlatten(fnPath);
+    timings.renameForFlatten += performance.now() - renameStart;
     const normalized = true;
     for (let i = 0; i < MAX_ITERATIONS; i++) {
         let changed = false;
+        const foldStart = performance.now();
         const fold = runPeepholeFoldConstants(fn.body);
+        timings.foldConstants += performance.now() - foldStart;
         if (fold.folded > 0) {
             changed = true;
             stats.folded += fold.folded;
@@ -8823,36 +9772,56 @@ function simplifyFunction(fnPath, _options = {}) {
         // MinimizeExitPoints reshapes labeled-block / loop / function exits
         // into implicit fall-through. Run before PeepholeMinimizeConditions so
         // the resulting if/else gets collapsed to ternaries.
+        const exitsStart = performance.now();
         const exits = runMinimizeExitPoints(fn);
+        timings.minimizeExitPoints += performance.now() - exitsStart;
         if (exits.minimized > 0) {
             changed = true;
             stats.minimized += exits.minimized;
         }
+        const minStart = performance.now();
         const min = runPeepholeMinimizeConditions(fn.body);
+        timings.minimizeConditions += performance.now() - minStart;
         if (min.minimized > 0) {
             changed = true;
             stats.minimized += min.minimized;
         }
+        const deadStart = performance.now();
         const dead = runPeepholeRemoveDeadCode(fn.body, { normalized });
+        timings.removeDeadCode += performance.now() - deadStart;
         if (dead.removed > 0) {
             changed = true;
             stats.removed += dead.removed;
         }
+        const cfgStart = performance.now();
         const cfg = buildControlFlowGraph({ root: fn.body });
+        timings.cfgBuild += performance.now() - cfgStart;
         if (cfg !== null) {
+            const tableStart = performance.now();
             const table = buildLocalVariableTable(fnPath);
+            timings.localVarTable += performance.now() - tableStart;
+            const flowStart = performance.now();
             const inline = runFlowSensitiveInlineVariables(fn, cfg, table);
+            timings.flowInline += performance.now() - flowStart;
             if (inline.inlined > 0) {
                 changed = true;
                 stats.inlined += inline.inlined;
             }
             // DAE needs a fresh CFG+table after inline, since inline mutates.
             if (inline.inlined > 0) {
+                const cfg2Start = performance.now();
                 const cfg2 = buildControlFlowGraph({ root: fn.body });
+                timings.cfgBuild += performance.now() - cfg2Start;
+                const table2Start = performance.now();
                 const table2 = buildLocalVariableTable(fnPath);
+                timings.localVarTable += performance.now() - table2Start;
                 if (cfg2 !== null) {
+                    const liveStart = performance.now();
                     const live = runLiveVariablesAnalysis(cfg2, table2);
+                    timings.liveVars += performance.now() - liveStart;
+                    const daStart = performance.now();
                     const da = eliminateDeadAssignments(fn, cfg2, live);
+                    timings.deadAssigns += performance.now() - daStart;
                     if (da.removed > 0) {
                         changed = true;
                         stats.deadAssigns += da.removed;
@@ -8860,8 +9829,12 @@ function simplifyFunction(fnPath, _options = {}) {
                 }
             }
             else {
+                const liveStart = performance.now();
                 const live = runLiveVariablesAnalysis(cfg, table);
+                timings.liveVars += performance.now() - liveStart;
+                const daStart = performance.now();
                 const da = eliminateDeadAssignments(fn, cfg, live);
+                timings.deadAssigns += performance.now() - daStart;
                 if (da.removed > 0) {
                     changed = true;
                     stats.deadAssigns += da.removed;
@@ -8875,11 +9848,12 @@ function simplifyFunction(fnPath, _options = {}) {
     return stats;
 }
 /**
- * Walk the program and simplify every Function node bottom-up. Bottom-up so
- * inner functions are simplified before outer; outer simplification then sees
- * the already-cleaned inner shape.
+ * Walk the program and simplify every touched Function node bottom-up.
+ * Bottom-up so inner functions are simplified before outer; outer
+ * simplification then sees the already-cleaned inner shape.
  */
-function simplifyAll(root) {
+function simplifyAll(root, options = {}) {
+    const touched = options.touched;
     // Top-level rename is intentionally not performed — we only uniquify
     // names within each function (see `simplifyFunction`). At the program
     // level we leave `normalized=false` so PeepholeRemoveDeadCode keeps the
@@ -8892,10 +9866,13 @@ function simplifyAll(root) {
         inlined: 0,
         deadAssigns: 0,
         minimized: 0,
+        timings: emptyTimings(),
     };
     traverse(root, {
         Function: {
             exit(path) {
+                if (touched && !touched.has(path.node))
+                    return;
                 const s = simplifyFunction(path, { });
                 total.iterations += s.iterations;
                 total.folded += s.folded;
@@ -8903,26 +9880,34 @@ function simplifyAll(root) {
                 total.inlined += s.inlined;
                 total.deadAssigns += s.deadAssigns;
                 total.minimized += s.minimized;
+                addTimings(total.timings, s.timings);
             },
         },
     });
     // Program-level cleanup: AST-only peepholes (no CFG) over the whole tree
-    // for top-level statements outside any function.
+    // for top-level statements outside any function. Cheap relative to the
+    // per-function CFG-based work above, so we always run it.
     let topChanged = true;
     let topIters = 0;
     while (topChanged && topIters < MAX_ITERATIONS) {
         topChanged = false;
+        const fStart = performance.now();
         const f = runPeepholeFoldConstants(root);
+        total.timings.foldConstants += performance.now() - fStart;
         if (f.folded > 0) {
             topChanged = true;
             total.folded += f.folded;
         }
+        const mStart = performance.now();
         const m = runPeepholeMinimizeConditions(root);
+        total.timings.minimizeConditions += performance.now() - mStart;
         if (m.minimized > 0) {
             topChanged = true;
             total.minimized += m.minimized;
         }
+        const dStart = performance.now();
         const d = runPeepholeRemoveDeadCode(root, { normalized });
+        total.timings.removeDeadCode += performance.now() - dStart;
         if (d.removed > 0) {
             topChanged = true;
             total.removed += d.removed;
@@ -8975,7 +9960,7 @@ function stripDirectiveComments(file) {
         for (const c of arr)
             clean(c);
     };
-    traverse$1(file, {
+    traverse(file, {
         enter(p) {
             cleanList(p.node.leadingComments);
             cleanList(p.node.trailingComments);
@@ -8992,7 +9977,7 @@ function stripDirectiveComments(file) {
         }
         return arr;
     };
-    traverse$1(file, {
+    traverse(file, {
         enter(p) {
             removeDeleted(p.node.leadingComments);
             removeDeleted(p.node.trailingComments);
@@ -9144,47 +10129,104 @@ function lowerTsEnumToJs(decl) {
     return [t.variableDeclaration('var', [t.variableDeclarator(idRef())]), iife];
 }
 
-// Single-Program orchestration. Operates on a parsed AST representing one
-// program — in bundle-mode this is the entire chunk after rollup has
-// resolved imports.
+// Single-Program orchestration.
+//
+// Two modes:
+//   - WholeProgram (renderChunk / bundle-mode): operate on a parsed chunk
+//     that already contains every reachable callee. No cross-file context.
+//   - PerFile (transform-mode): operate on one source file. When passed a
+//     consumerPath + fileCache the inliner follows imports into donor
+//     modules, splices donor bodies, and hoists the module-vars / imports
+//     the spliced body references.
 //
 // Steps:
 //   1. Parse with @babel/parser (TS/JSX-aware).
 //   2. Strip TS-only syntax so downstream passes only see JS.
-//   3. Run InlineFunctions across the program.
-//   4. Run simplifyAll across the program.
-//   5. Generate code (and optional sourcemap).
+//   3. Normalize (makeDeclaredNamesUnique) — Closure runs Normalize before
+//      its optimization pass group; later passes depend on the structural
+//      invariants it establishes.
+//   4. inlineFunctions across the program (optionally cross-file).
+//   5. unrollLoops.
+//   6. inlineVariables (pre) — collapse alias temps so SROA sees direct
+//      `name[i]` uses.
+//   7. applySroa.
+//   8. simplifyAll (per-function peephole + DCE fixpoint).
+//   9. inlineVariables (post).
+//  10. removeUnusedCode.
+//  11. stripDirectiveComments.
+//  12. Generate code (and optional sourcemap).
+// Mode signals the unit of optimization. The pipeline's pass set is the same
+// in both modes; the difference is whether `inlineFunctions` is given a
+// cross-file context (resolver + donor cache + hoister). Pass `Mode.PerFile`
+// with a `consumerPath` + `fileCache` to enable cross-file behavior.
+const Mode = {
+    PerFile: 0,
+    WholeProgram: 1,
+};
 function transform(code, options = {}) {
+    const mode = options.mode ?? Mode.WholeProgram;
+    const totalStart = performance.now();
+    const parseStart = performance.now();
     const ast = parse(code, parserOptions(options.filename));
+    const parseEnd = performance.now();
+    const stripTypeScriptStart = performance.now();
     stripTypeScript(ast);
-    // Normalize first. Closure runs Normalize before the optimization pass
-    // group (DefaultPassConfig). The structural normalizations (blockify,
-    // split decls, extract for-init) establish invariants that every
-    // later pass depends on — most importantly that splice-target
-    // Statements always have a BlockStatement/Program parent.
+    const stripTypeScriptEnd = performance.now();
+    const normalizeStart = performance.now();
     makeDeclaredNamesUnique(ast);
-    const inl = inlineFunctions(ast);
-    const unr = unrollLoops(ast);
-    // Collapse `let aliasName = arg` temps emitted by FunctionArgumentInjector
-    // before SROA so its escape analysis sees only direct `name[i]` uses.
-    const ivarPre = inlineVariables(ast);
-    const sroa = applySroa(ast);
-    const simp = simplifyAll(ast);
-    const ivar = inlineVariables(ast);
+    const normalizeEnd = performance.now();
+    // Touched-set: every per-function pass below uses this to skip functions
+    // that no producing pass (inline / unroll / sroa) modified and that the
+    // author didn't opt in via `@optimize`/`@flatten`/`@sroa`/`@unroll`.
+    // Grows monotonically through the pipeline.
+    const touched = new WeakSet();
+    collectOptIns(ast, touched);
+    const inlineFunctionsStart = performance.now();
+    const inl = inlineFunctions(ast, mode === Mode.PerFile
+        ? {
+            consumerPath: options.filename,
+            fileCache: options.fileCache,
+            fileReader: options.fileReader,
+            allowLibraryInline: options.allowLibraryInline,
+            touched,
+        }
+        : { touched });
+    const inlineFunctionsEnd = performance.now();
+    const unrollLoopsStart = performance.now();
+    const unr = unrollLoops(ast, { touched });
+    const unrollLoopsEnd = performance.now();
+    const inlineVariablesPreStart = performance.now();
+    const ivarPre = inlineVariables(ast, { touched });
+    const inlineVariablesPreEnd = performance.now();
+    const sroaStart = performance.now();
+    const sroa = applySroa(ast, { touched });
+    const sroaEnd = performance.now();
+    const simplifyStart = performance.now();
+    const simp = simplifyAll(ast, { touched });
+    const simplifyEnd = performance.now();
+    const inlineVariablesPostStart = performance.now();
+    const ivar = inlineVariables(ast, { touched });
     ivar.inlined += ivarPre.inlined;
-    const ruc = removeUnusedCode(ast);
-    // Strip authored `@*` directive markers from comments after all passes
-    // have consumed them, so they don't bleed into the output.
+    const inlineVariablesPostEnd = performance.now();
+    const removeUnusedCodeStart = performance.now();
+    const ruc = removeUnusedCode(ast, { touched });
+    const removeUnusedCodeEnd = performance.now();
+    const stripDirectiveCommentsStart = performance.now();
     stripDirectiveComments(ast);
+    const stripDirectiveCommentsEnd = performance.now();
+    const generateStart = performance.now();
     const gen = generate;
     const out = gen(ast, {
         sourceMaps: options.sourceMaps === true,
         sourceFileName: options.filename,
         inputSourceMap: options.inputSourceMap,
     });
+    const generateEnd = performance.now();
+    const totalEnd = performance.now();
     return {
         code: out.code,
         map: out.map,
+        donorPaths: inl.donorPaths,
         stats: {
             inlined: inl.succeeded,
             unrolled: unr.unrolled,
@@ -9199,6 +10241,22 @@ function transform(code, options = {}) {
             removedFunctionDecls: ruc.removedFunctionDecls,
             removedImportSpecifiers: ruc.removedImportSpecifiers,
             removedImportDeclarations: ruc.removedImportDeclarations,
+        },
+        simplifyTimings: simp.timings,
+        timings: {
+            parse: parseEnd - parseStart,
+            stripTypeScript: stripTypeScriptEnd - stripTypeScriptStart,
+            normalize: normalizeEnd - normalizeStart,
+            inlineFunctions: inlineFunctionsEnd - inlineFunctionsStart,
+            unrollLoops: unrollLoopsEnd - unrollLoopsStart,
+            inlineVariablesPre: inlineVariablesPreEnd - inlineVariablesPreStart,
+            sroa: sroaEnd - sroaStart,
+            simplify: simplifyEnd - simplifyStart,
+            inlineVariablesPost: inlineVariablesPostEnd - inlineVariablesPostStart,
+            removeUnusedCode: removeUnusedCodeEnd - removeUnusedCodeStart,
+            stripDirectiveComments: stripDirectiveCommentsEnd - stripDirectiveCommentsStart,
+            generate: generateEnd - generateStart,
+            total: totalEnd - totalStart,
         },
     };
 }
@@ -9218,15 +10276,113 @@ function parserOptions(filename) {
     };
 }
 
-// Bundle-mode rollup plugin. Operates on whole chunks via `renderChunk`,
-// after the bundler has tree-shaken and concatenated modules. By the time
-// we run, the chunk is a single Program — every `@inline` function in
-// scope is directly reachable, no cross-file resolution needed.
+// Two plugin shapes:
+//
+//   - compilecat()         — bundle-mode. Operates on whole chunks via
+//                            `renderChunk`, after rollup/rolldown has
+//                            tree-shaken and concatenated modules. By the
+//                            time we run, the chunk is a single Program —
+//                            every `@inline` function in scope is directly
+//                            reachable, no cross-file resolution needed.
+//   - compilecatPerFile()  — transform-mode. Operates per source file via
+//                            `transform`, with a cross-file resolver +
+//                            donor-body hoister that brings in module-vars,
+//                            enums, and imports the spliced bodies need.
+//                            Required for Vite dev (no bundle phase).
 //
 // Compatible with rollup, vite, and rolldown (vite/rolldown share rollup's
-// plugin shape). esbuild + webpack are not supported in bundle-mode.
+// plugin shape). esbuild + webpack are not supported.
+// Source files we accept. Anything else (.css, .json, virtual ids, etc.) is
+// passed through untouched.
+const TRANSFORMABLE = /\.(?:js|ts|jsx|tsx|mjs|cjs)$/;
+function toArray(v) {
+    if (v === undefined)
+        return [];
+    return Array.isArray(v) ? v : [v];
+}
+const PHASE_ORDER = [
+    'parse',
+    'stripTypeScript',
+    'normalize',
+    'inlineFunctions',
+    'unrollLoops',
+    'inlineVariablesPre',
+    'sroa',
+    'simplify',
+    'inlineVariablesPost',
+    'removeUnusedCode',
+    'stripDirectiveComments',
+    'generate',
+    'total',
+];
+const SIMPLIFY_SUBPASS_ORDER = [
+    'renameForFlatten',
+    'foldConstants',
+    'minimizeExitPoints',
+    'minimizeConditions',
+    'removeDeadCode',
+    'cfgBuild',
+    'localVarTable',
+    'flowInline',
+    'liveVars',
+    'deadAssigns',
+];
+function emptySimplifyTimings() {
+    return {
+        renameForFlatten: 0,
+        foldConstants: 0,
+        minimizeExitPoints: 0,
+        minimizeConditions: 0,
+        removeDeadCode: 0,
+        cfgBuild: 0,
+        localVarTable: 0,
+        flowInline: 0,
+        liveVars: 0,
+        deadAssigns: 0,
+    };
+}
+function createAggregator() {
+    const totals = {};
+    const simplifyTotals = emptySimplifyTimings();
+    let calls = 0;
+    let totalBytesIn = 0;
+    return {
+        add(t, s, byteLen) {
+            calls++;
+            totalBytesIn += byteLen;
+            for (const k of PHASE_ORDER)
+                totals[k] = (totals[k] ?? 0) + t[k];
+            for (const k of SIMPLIFY_SUBPASS_ORDER)
+                simplifyTotals[k] += s[k];
+        },
+        report(label) {
+            if (calls === 0)
+                return;
+            const total = totals.total ?? 0;
+            const rows = PHASE_ORDER.filter((k) => k !== 'total').map((k) => {
+                const ms = totals[k] ?? 0;
+                const pct = total > 0 ? (ms / total) * 100 : 0;
+                return `  ${k.padEnd(24)} ${ms.toFixed(1).padStart(9)}ms  ${pct.toFixed(1).padStart(5)}%`;
+            });
+            const simplifyTotal = totals.simplify ?? 0;
+            const simplifyRows = SIMPLIFY_SUBPASS_ORDER.map((k) => {
+                const ms = simplifyTotals[k];
+                const pct = simplifyTotal > 0 ? (ms / simplifyTotal) * 100 : 0;
+                return `    ${k.padEnd(22)} ${ms.toFixed(1).padStart(9)}ms  ${pct.toFixed(1).padStart(5)}%`;
+            });
+            console.log(`[compilecat] ${label} aggregate over ${calls} call(s), ${(totalBytesIn / 1024).toFixed(1)} KiB in:\n` +
+                `${rows.join('\n')}\n  ${'TOTAL'.padEnd(24)} ${total.toFixed(1).padStart(9)}ms\n` +
+                `  simplify breakdown (of ${simplifyTotal.toFixed(1)}ms):\n${simplifyRows.join('\n')}`);
+        },
+    };
+}
+function formatTimings(t) {
+    const parts = PHASE_ORDER.filter((k) => k !== 'total' && t[k] >= 0.5).map((k) => `${k}=${t[k].toFixed(1)}ms`);
+    return `total=${t.total.toFixed(1)}ms [${parts.join(' ')}]`;
+}
 function compilecat(options = {}) {
     const debug = options.debug === true;
+    const agg = debug ? createAggregator() : null;
     return {
         name: 'compilecat',
         renderChunk(code, chunk) {
@@ -9239,9 +10395,11 @@ function compilecat(options = {}) {
                 const r = transform(code, {
                     sourceMaps: true,
                     filename: id,
+                    mode: Mode.WholeProgram,
                 });
                 if (debug) {
-                    console.log(`[compilecat] ${id}: inlined=${r.stats.inlined} folded=${r.stats.folded} dead=${r.stats.removedDeadCode}`);
+                    agg?.add(r.timings, r.simplifyTimings, code.length);
+                    console.log(`[compilecat] ${id}: inlined=${r.stats.inlined} folded=${r.stats.folded} dead=${r.stats.removedDeadCode}\n[compilecat] ${id}: ${formatTimings(r.timings)}`);
                 }
                 return { code: r.code, map: r.map };
             }
@@ -9250,8 +10408,91 @@ function compilecat(options = {}) {
                 return null;
             }
         },
+        closeBundle() {
+            agg?.report('bundle-mode');
+        },
+    };
+}
+function compilecatPerFile(options) {
+    const debug = options.debug === true;
+    const agg = debug ? createAggregator() : null;
+    // One FileCache per plugin instance amortizes parse + index across every
+    // transform call in the build. Donors only get parsed/indexed once.
+    const fileCache = createFileCache();
+    // Hook-filter declaration. Rollup 4 / rolldown invoke the handler only
+    // for ids matching this filter — in rolldown's case, the test happens in
+    // Rust without bouncing into JS at all. Big win because the typical
+    // project has far more directive-less files than annotated ones.
+    //
+    //   id.include — caller-supplied allowlist (required; no implicit default)
+    //   id.exclude — additional skips on top of include
+    //   code       — fast-path skip for files without any compilecat directive
+    const idFilter = {
+        include: toArray(options.include),
+    };
+    const userExclude = toArray(options.exclude);
+    if (userExclude.length > 0)
+        idFilter.exclude = userExclude;
+    return {
+        name: 'compilecat:per-file',
+        transform: {
+            filter: {
+                id: idFilter,
+                code: ANY_DIRECTIVE_IN_SOURCE,
+            },
+            handler(code, id) {
+                // Belt-and-braces extension check — the hook filter handles
+                // include/exclude and the directive content sniff, but the
+                // pipeline still expects a JS/TS source.
+                if (!TRANSFORMABLE.test(id))
+                    return null;
+                if (debug)
+                    console.log(`[compilecat] transforming ${id}`);
+                try {
+                    const r = transform(code, {
+                        sourceMaps: true,
+                        filename: id,
+                        mode: Mode.PerFile,
+                        fileCache,
+                        allowLibraryInline: options.allowLibraryInline === true,
+                    });
+                    // Register each donor so rollup/vite re-runs this transform
+                    // when a donor changes. Without this, `removeUnusedCode`
+                    // strips the donor's import from our output and the module
+                    // graph loses the consumer→donor edge — HMR goes stale.
+                    for (const donor of r.donorPaths)
+                        this.addWatchFile(donor);
+                    if (debug) {
+                        agg?.add(r.timings, r.simplifyTimings, code.length);
+                        console.log(`[compilecat] ${id}: inlined=${r.stats.inlined} folded=${r.stats.folded} dead=${r.stats.removedDeadCode} donors=${r.donorPaths.size}\n[compilecat] ${id}: ${formatTimings(r.timings)}`);
+                    }
+                    return { code: r.code, map: r.map };
+                }
+                catch (err) {
+                    console.error(`[compilecat] failed to transform ${id}:`, err);
+                    return null;
+                }
+            },
+        },
+        closeBundle() {
+            agg?.report('per-file');
+        },
     };
 }
 
-export { compilecat as default };
+// Vite adapter. Returns two plugin instances gated by Vite's `apply`:
+//
+//   - per-file transform during `vite dev` (apply: 'serve')
+//   - whole-program renderChunk during `vite build` (apply: 'build')
+//
+// Mutually exclusive — exactly one fires per Vite command, so the same code
+// never goes through both passes.
+function compilecatVite(options) {
+    return [
+        { ...compilecatPerFile(options), apply: 'serve' },
+        { ...compilecat(options), apply: 'build' },
+    ];
+}
+
+export { compilecat, compilecatPerFile, compilecatVite, compilecatVite as default };
 //# sourceMappingURL=vite.js.map

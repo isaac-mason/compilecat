@@ -21,6 +21,11 @@ export type SroaResult = {
     sroad: number;
 };
 
+export type SroaOptions = {
+    /** Set populated with the enclosing function of every SROA'd local. */
+    touched?: WeakSet<t.Function>;
+};
+
 type Candidate = {
     name: string;
     size: number;
@@ -32,7 +37,7 @@ type Candidate = {
     scope: t.Node;
 };
 
-export function applySroa(root: t.Node): SroaResult {
+export function applySroa(root: t.Node, options: SroaOptions = {}): SroaResult {
     const candidates = collectCandidates(root);
     if (candidates.length === 0) return { sroad: 0 };
 
@@ -44,6 +49,13 @@ export function applySroa(root: t.Node): SroaResult {
 
     rewriteDeclarations(safe);
     rewriteAccesses(root, safe);
+
+    if (options.touched) {
+        for (const c of safe) {
+            if (t.isFunction(c.scope)) options.touched.add(c.scope);
+        }
+    }
+
     return { sroad: safe.length };
 }
 

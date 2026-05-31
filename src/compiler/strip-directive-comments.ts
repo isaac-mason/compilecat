@@ -7,8 +7,9 @@
 // is *only* the marker (whitespace-only after strip), the comment node is
 // removed entirely.
 
-import traverse from '@babel/traverse';
 import type * as t from '@babel/types';
+
+import { traverse } from './babel-interop';
 
 const DIRECTIVE_RE = /@(?:inline|flatten|sroa|unroll|optimize)\b/g;
 

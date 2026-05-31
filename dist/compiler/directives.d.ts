@@ -8,3 +8,5 @@ export declare function commentIsFlattenDirective(value: string): boolean;
 export declare function commentIsSroaDirective(value: string): boolean;
 export declare function isExportWrapper(n: t.Node | null): boolean;
 export declare function hasLeadingDirective(n: t.Node, parent: t.Node | null, pred: (commentValue: string) => boolean): boolean;
+export declare function commentIsAnyOptInDirective(value: string): boolean;
+export declare function collectOptIns(ast: t.File, touched: WeakSet<t.Function>): void;

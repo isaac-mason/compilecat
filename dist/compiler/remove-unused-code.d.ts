@@ -9,4 +9,10 @@ export type RemoveUnusedResult = {
     /** Whole `import ... from '…'` statements removed. */
     removedImportDeclarations: number;
 };
-export declare function removeUnusedCode(ast: t.File): RemoveUnusedResult;
+export type RemoveUnusedOptions = {
+    /** Declarators / function decls inside a function not in this set are
+     *  skipped. If omitted, every declarator is visited (legacy/test
+     *  behavior). */
+    touched?: WeakSet<t.Function>;
+};
+export declare function removeUnusedCode(ast: t.File, options?: RemoveUnusedOptions): RemoveUnusedResult;

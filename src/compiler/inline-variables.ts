@@ -40,18 +40,25 @@ export type InlineVariablesResult = {
     inlined: number;
 };
 
-export function inlineVariables(ast: t.File): InlineVariablesResult {
+export type InlineVariablesOptions = {
+    /** Declarators inside a function not in this set are skipped. If omitted,
+     *  every declarator is visited (legacy/test behavior). */
+    touched?: WeakSet<t.Function>;
+};
+
+export function inlineVariables(ast: t.File, options: InlineVariablesOptions = {}): InlineVariablesResult {
     let total = 0;
     while (true) {
-        const round = sweep(ast);
+        const round = sweep(ast, options);
         if (round === 0) break;
         total += round;
     }
     return { inlined: total };
 }
 
-function sweep(ast: t.File): number {
+function sweep(ast: t.File, options: InlineVariablesOptions): number {
     let inlined = 0;
+    const touched = options.touched;
 
     traverse(ast, {
         // Force a scope rebuild — our previous round's mutations may have
@@ -61,6 +68,13 @@ function sweep(ast: t.File): number {
         },
 
         VariableDeclarator(path) {
+            // Touched-set gate: only inline declarators inside an opted-in
+            // function. Top-level declarators are always considered.
+            if (touched) {
+                const fnParent = path.getFunctionParent();
+                if (fnParent && !touched.has(fnParent.node)) return;
+            }
+
             // v1: only `const|let x = INIT` — skip destructuring.
             if (!t.isIdentifier(path.node.id)) return;
             const init = path.node.init;
