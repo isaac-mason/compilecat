@@ -2245,16 +2245,24 @@ function substituteIdentifiers(root, subs) {
         if (t.isFunction(n))
             return; // shadowed
         if (t.isIdentifier(n) && subs.has(n.name)) {
-            // Skip Identifier in write contexts. For root expression
+            // Skip Identifier in non-reference contexts (non-computed member
+            // `.prop`, object property key, etc.). Without this guard, inlining
+            // `clamp(x, 0, 1)` into `Math.max(min, Math.min(max, value))` would
+            // rewrite the `max`/`min` property identifiers into NumericLiterals,
+            // producing `Math[1](0, Math[0](1, x))`.
+            // Skip Identifier in write contexts too. For root expression
             // substitution, we're typically in a read context; LHS-of-assign
             // would mean we're rewriting params, which our classifier rejects
             // for v1 (parameter mutation in callee → BLOCK or NO).
-            const sub = t.cloneNode(subs.get(n.name), true);
-            if (parent === null)
-                rootReplacement = sub;
-            else
-                setSlot(parent, key, index, sub);
-            return;
+            if (parent !== null && !isReferenceContext$1(parent, key)) ;
+            else {
+                const sub = t.cloneNode(subs.get(n.name), true);
+                if (parent === null)
+                    rootReplacement = sub;
+                else
+                    setSlot(parent, key, index, sub);
+                return;
+            }
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
             const child = getSlot(n, k);

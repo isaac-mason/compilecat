@@ -216,6 +216,42 @@ describe('InlineFunctions', () => {
         expect(r.code).not.toContain('_compilecat_inline_label_dbl_0');
     });
 
+    it('DIRECT does not substitute params into non-computed member property positions', () => {
+        // Regression: `clamp(_, 0, 1)` inlined into a body that references
+        // `Math.max(min, Math.min(max, value))` would rewrite the property
+        // identifiers `max` and `min`, producing `Math[1](0, Math[0](1, ...))`.
+        // The non-computed `.prop` slot is not a value-bearing reference and
+        // must be skipped by the substituter.
+        const r = inl(`
+            /** @inline */
+            function clamp(value, min, max) {
+                return Math.max(min, Math.min(max, value));
+            }
+            var v = clamp(expr, 0, 1);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('Math.max(0, Math.min(1, expr))');
+        expect(r.code).not.toMatch(/Math\[\s*[01]\s*\]/);
+    });
+
+    it('BLOCK does not substitute params into non-computed member property positions', () => {
+        // Same regression as the DIRECT variant, but through the BLOCK path
+        // (multi-statement body). Goes through the rename pass, which already
+        // guards member properties; this test pins that behavior too.
+        const r = inl(`
+            /** @inline */
+            function clampSink(value, min, max) {
+                sink(Math.max(min, Math.min(max, value)));
+                sink(Math.max(min, Math.min(max, value)));
+            }
+            clampSink(expr, 0, 1);
+        `);
+        expect(r.succeeded).toBe(1);
+        expect(r.code).toContain('Math.max');
+        expect(r.code).toContain('Math.min');
+        expect(r.code).not.toMatch(/Math\[\s*[a-zA-Z0-9_]+\s*\]/);
+    });
+
     it('renames param when an arg references it as a free var', () => {
         // The shadow class: arg `x.method()` references the same name as the
         // param `x`. Without rename, splice would emit `let x = x.method();`
