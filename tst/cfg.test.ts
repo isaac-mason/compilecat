@@ -163,6 +163,32 @@ describe('ControlFlowAnalysis', () => {
         expect(t.isSwitchCase(target)).toBe(true);
     });
 
+    it('bare-case statements fall through to next sibling in the same consequent (not next case)', () => {
+        // Regression: computeFollowNode for SwitchCase-parented statements
+        // used to skip the within-consequent sibling walk and jump straight
+        // to the next case. That breaks the CFG for bare `case X: stmt; break;`
+        // form (no `{ ... }` wrapper) — `stmt` would appear to flow into the
+        // next case's first statement, bypassing the trailing `break`. Live-
+        // variables analysis then misreports liveness across the switch and
+        // dead-assignment elimination strips real writes.
+        const cfg = buildFor(
+            'function f(x) { let v; switch (x) { case 1: v = 1; break; case 2: v = 2; break; } return v; }',
+        );
+        const case1Assign = findCfgNode(
+            cfg,
+            (n) =>
+                t.isExpressionStatement(n) &&
+                t.isAssignmentExpression(n.expression) &&
+                t.isNumericLiteral(n.expression.right) &&
+                n.expression.right.value === 1,
+        );
+        const succs = succsOf(cfg, case1Assign);
+        // Must land on the BreakStatement next to it, not on the case-2
+        // ExpressionStatement (which would mean we silently fell through).
+        expect(succs.length).toBe(1);
+        expect(t.isBreakStatement(succs[0][0] as t.Node)).toBe(true);
+    });
+
     it('skips nested function bodies in outer CFG', () => {
         const cfg = buildFor('function f() { var g = function() { inner; }; outer; }');
         // The outer CFG should reach `outer;`, but `inner;` should NOT be a

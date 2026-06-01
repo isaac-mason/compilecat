@@ -486,19 +486,27 @@ function computeFollowNode(cfa: Cfa, fromNode: t.Node, node: t.Node): t.Node | n
         return computeFollowNode(cfa, fromNode, parent);
     }
     if (t.isSwitchCase(parent)) {
-        // After a case body, control passes to the next case's body
-        // (fall-through) — case condition is skipped.
+        // Bare `case X: stmt1; stmt2; break;` cases put statements directly
+        // in `parent.consequent` (no BlockStatement wrapper). Each statement
+        // falls through to the NEXT statement in the same consequent first;
+        // only when we run off the end of the consequent does control pass
+        // (JS fall-through) to the next case's body.
+        const siblings = parent.consequent;
+        const idx = siblings.indexOf(node as t.Statement);
+        for (let i = idx + 1; i < siblings.length; i++) {
+            const s = siblings[i];
+            if (s && !t.isFunctionDeclaration(s)) return computeFallThrough(s);
+        }
         const grand = parentOf(cfa, parent);
         if (!t.isSwitchStatement(grand)) {
             return computeFollowNode(cfa, fromNode, parent);
         }
-        const idx = grand.cases.indexOf(parent);
-        const nextCase = grand.cases[idx + 1];
+        const caseIdx = grand.cases.indexOf(parent);
+        const nextCase = grand.cases[caseIdx + 1];
         if (nextCase) {
             if (nextCase.consequent.length > 0) {
                 return computeFallThrough(nextCase.consequent[0]);
             }
-            // Empty case — fall through again.
             return computeFollowNode(cfa, fromNode, nextCase);
         }
         return computeFollowNode(cfa, fromNode, parent);

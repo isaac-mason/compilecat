@@ -21,6 +21,7 @@ import { ANY_DIRECTIVE_IN_SOURCE } from './compiler/directives';
 import { createFileCache } from './compiler/file-index';
 import { Mode, type Timings, transform } from './compiler/pipeline';
 import type { SimplifyTimings } from './compiler/simplifier';
+import { flowInlineInnerTimings } from './compiler/flow-sensitive-inline-variables';
 
 export type FilterPattern = StringOrRegExp | StringOrRegExp[];
 
@@ -132,10 +133,17 @@ function createAggregator() {
                 const pct = simplifyTotal > 0 ? (ms / simplifyTotal) * 100 : 0;
                 return `    ${k.padEnd(22)} ${ms.toFixed(1).padStart(9)}ms  ${pct.toFixed(1).padStart(5)}%`;
             });
+            const inner = flowInlineInnerTimings as Record<string, number>;
+            const innerRows = ['mustDef', 'mayUse', 'parents', 'gather', 'canInline', 'perform'].map((k) => {
+                const ms = inner[k];
+                return `      ${k.padEnd(20)} ${ms.toFixed(1).padStart(9)}ms`;
+            });
             console.log(
                 `[compilecat] ${label} aggregate over ${calls} call(s), ${(totalBytesIn / 1024).toFixed(1)} KiB in:\n` +
                     `${rows.join('\n')}\n  ${'TOTAL'.padEnd(24)} ${total.toFixed(1).padStart(9)}ms\n` +
-                    `  simplify breakdown (of ${simplifyTotal.toFixed(1)}ms):\n${simplifyRows.join('\n')}`,
+                    `  simplify breakdown (of ${simplifyTotal.toFixed(1)}ms):\n${simplifyRows.join('\n')}\n` +
+                    `    flowInline breakdown:\n${innerRows.join('\n')}\n` +
+                    `      candidates=${inner.candidateCount} inlined=${inner.inlineCount}`,
             );
         },
     };

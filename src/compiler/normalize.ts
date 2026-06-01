@@ -140,6 +140,13 @@ export function renameForFlatten(fnPath: NodePath<t.Function>): number {
                     if (allNames.has(baseName)) {
                         // Already declared somewhere in this function
                         // (ancestor or earlier-visited sibling) — rename.
+                        // Use Babel's Scope.rename which traverses the live
+                        // AST. Earlier optimization rewrote via cached
+                        // binding.referencePaths / constantViolations, but
+                        // those caches go stale when prior pipeline phases
+                        // (inline-functions, sroa, inline-variables-pre)
+                        // splice in new Identifier nodes without a scope
+                        // crawl — missed refs then leak the pre-rename name.
                         const newName = pickFreshName(baseName, allNames);
                         p.scope.rename(baseName, newName);
                         active.add(newName);

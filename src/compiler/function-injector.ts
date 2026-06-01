@@ -111,17 +111,23 @@ export type CallSite = {
     /** The CallExpression to inline. */
     call: t.CallExpression;
     /** The statement that contains the CallExpression — used as the splice
-     *  point for BLOCK mode hoisting. Must be inside a BlockStatement body. */
+     *  point for BLOCK mode hoisting. Must sit in a statement-list container. */
     enclosingStatement: t.Statement;
-    /** The BlockStatement (or Program) holding the enclosing statement, plus
-     *  the index of the enclosing statement inside it. */
-    statementParent: t.BlockStatement | t.Program;
+    /** The container holding the enclosing statement (Block/Program body, or
+     *  SwitchCase consequent), plus the index of the enclosing statement. */
+    statementParent: t.BlockStatement | t.Program | t.SwitchCase;
     statementIndex: number;
     /** Parent of the CallExpression and key/index for in-place replacement. */
     callParent: t.Node;
     callKey: string;
     callIndex?: number;
 };
+
+/** Resolve the statement-list array on a CallSite.statementParent. Block and
+ *  Program expose it as `.body`; SwitchCase as `.consequent`. */
+function stmtList(parent: t.BlockStatement | t.Program | t.SwitchCase): t.Statement[] {
+    return t.isSwitchCase(parent) ? parent.consequent : parent.body;
+}
 
 // ---------------------------------------------------------------------------
 // Splice — DIRECT.
@@ -348,7 +354,8 @@ export function inlineBlock(callee: Callee, site: CallSite, options: InjectorOpt
     // Look up the enclosing statement's index dynamically — earlier inlines
     // on sibling statements may have shifted the array since `site` was
     // collected, making `site.statementIndex` stale.
-    const insertIdx = site.statementParent.body.indexOf(site.enclosingStatement);
+    const list = stmtList(site.statementParent);
+    const insertIdx = list.indexOf(site.enclosingStatement);
     if (insertIdx < 0) return false;
     const breadcrumb = breadcrumbFor(site.call);
 
@@ -356,7 +363,7 @@ export function inlineBlock(callee: Callee, site: CallSite, options: InjectorOpt
         case 'statement': {
             // Replace `foo();` with the labeled block.
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx, 1, out.block);
+            list.splice(insertIdx, 1, out.block);
             return true;
         }
         case 'init': {
@@ -364,13 +371,13 @@ export function inlineBlock(callee: Callee, site: CallSite, options: InjectorOpt
             // Drop the initializer in place; insert the block after.
             shape.declarator.init = null;
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx + 1, 0, out.block);
+            list.splice(insertIdx + 1, 0, out.block);
             return true;
         }
         case 'assign': {
             // `x = foo();` → labeled block (which writes `x` on each return).
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx, 1, out.block);
+            list.splice(insertIdx, 1, out.block);
             return true;
         }
         case 'expression': {
@@ -381,7 +388,7 @@ export function inlineBlock(callee: Callee, site: CallSite, options: InjectorOpt
             tagInlined(tempDecl, breadcrumb);
             const inserts: t.Statement[] = [tempDecl, out.block];
             replaceCall(site, t.identifier(resultName));
-            site.statementParent.body.splice(insertIdx, 0, ...inserts);
+            list.splice(insertIdx, 0, ...inserts);
             return true;
         }
     }

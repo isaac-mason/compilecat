@@ -22,6 +22,12 @@
 // here key by slot, not by name; this is what makes shadowing correct.
 //
 // Used by FlowSensitiveInlineVariables.
+//
+// Performance: the per-CFG-node transfer function is structurally invariant
+// across worklist visits — only the input lattice changes. We precompute a
+// flat event list per CFG node once (see buildMustTransfer) and the
+// fixpoint loop's flowThrough becomes a tight iteration over that list.
+// Eliminates the deep AST recursion that previously ran on every visit.
 
 import * as t from '@babel/types';
 
@@ -41,29 +47,33 @@ export type Definition = {
     unknownDependencies: boolean;
 };
 
+/** Per-slot reaching def, indexed by slot id. `undefined` = TOP (no def
+ *  recorded), `null` = BOTTOM (multiple distinct defs), `Definition` = the
+ *  unique reaching def. Flat array (not Map) so clone is a `.slice()` and
+ *  join/equals are tight index loops. */
 export type MustDef = {
-    /** Per-slot reaching def. Missing key = TOP, null value = BOTTOM. */
-    reachingDef: Map<number, Definition | null>;
+    reachingDef: (Definition | null | undefined)[];
 };
 
-function newMustDef(): MustDef {
-    return { reachingDef: new Map() };
+function newMustDef(size: number): MustDef {
+    // Pre-sized + filled to keep the array dense (V8 fast path).
+    return { reachingDef: new Array(size).fill(undefined) };
 }
 
 function cloneMustDef(d: MustDef): MustDef {
-    return { reachingDef: new Map(d.reachingDef) };
+    return { reachingDef: d.reachingDef.slice() };
 }
 
 function entryMustDef(table: LocalVariableTable, fnRoot: t.Node): MustDef {
-    const m = newMustDef();
+    const arr: (Definition | null | undefined)[] = new Array(table.size);
     for (let slot = 0; slot < table.size; slot++) {
-        m.reachingDef.set(slot, {
+        arr[slot] = {
             node: fnRoot,
             depends: new Set(),
             unknownDependencies: false,
-        });
+        };
     }
-    return m;
+    return { reachingDef: arr };
 }
 
 function defsEqual(a: Definition | null, b: Definition | null): boolean {
@@ -73,34 +83,43 @@ function defsEqual(a: Definition | null, b: Definition | null): boolean {
 }
 
 function mustDefEquals(a: MustDef, b: MustDef): boolean {
-    if (a.reachingDef.size !== b.reachingDef.size) return false;
-    for (const [k, va] of a.reachingDef) {
-        if (!b.reachingDef.has(k)) return false;
-        if (!defsEqual(va, b.reachingDef.get(k) ?? null)) return false;
+    const aa = a.reachingDef;
+    const bb = b.reachingDef;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    for (let i = 0; i < len; i++) {
+        const va = aa[i];
+        const vb = bb[i];
+        if (va === vb) continue;
+        // TOP vs anything-non-TOP and BOTTOM vs Definition are all distinct.
+        if (va === undefined || vb === undefined) return false;
+        if (!defsEqual(va, vb)) return false;
     }
     return true;
 }
 
 function mustDefJoin(a: MustDef, b: MustDef): MustDef {
-    const result = newMustDef();
-    const merge = (input: MustDef) => {
-        for (const [k, vIn] of input.reachingDef) {
-            if (vIn === null) {
-                result.reachingDef.set(k, null);
-                continue;
-            }
-            if (!result.reachingDef.has(k)) {
-                result.reachingDef.set(k, vIn);
-                continue;
-            }
-            const cur = result.reachingDef.get(k)!;
-            if (defsEqual(cur, vIn)) continue;
-            result.reachingDef.set(k, null);
+    const aa = a.reachingDef;
+    const bb = b.reachingDef;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    const out: (Definition | null | undefined)[] = new Array(len);
+    for (let i = 0; i < len; i++) {
+        const va = aa[i];
+        const vb = bb[i];
+        // Closure lattice: TOP ⊔ x = x; BOTTOM ⊔ x = BOTTOM; D ⊔ D = D;
+        // D1 ⊔ D2 = BOTTOM (when D1.node !== D2.node).
+        if (va === undefined) {
+            out[i] = vb;
+        } else if (vb === undefined) {
+            out[i] = va;
+        } else if (va === null || vb === null) {
+            out[i] = null;
+        } else if (defsEqual(va, vb)) {
+            out[i] = va;
+        } else {
+            out[i] = null;
         }
-    };
-    merge(a);
-    merge(b);
-    return result;
+    }
+    return { reachingDef: out };
 }
 
 // ---------------------------------------------------------------------------
@@ -118,12 +137,28 @@ export type MustReachResult = {
 };
 
 export function runMustReachingDef(fn: t.Function, cfg: ControlFlowGraph, table: LocalVariableTable): MustReachResult {
+    // Precompute the transfer function for each CFG node once. flowThrough
+    // then becomes a tight loop over events; no AST recursion per visit.
+    const transfers = new WeakMap<CfgNode, MustTransfer>();
+    for (const node of cfg.nodes.values()) {
+        if (node === cfg.implicitReturn) continue;
+        const value = node.value;
+        if (typeof value === 'symbol') continue;
+        transfers.set(node, buildMustTransfer(value as t.Node, table));
+    }
+
+    const size = table.size;
     const config: DataFlowConfig<MustDef> = {
         direction: 'forward',
-        flowThrough: (node, input) => flowThrough(fn, node, input, table),
+        flowThrough: (node, input) => {
+            const out = cloneMustDef(input);
+            const transfer = transfers.get(node);
+            if (transfer !== undefined) applyMustTransfer(transfer, out, table);
+            return out;
+        },
         joinFlows: mustDefJoin,
         equals: mustDefEquals,
-        bottom: newMustDef,
+        bottom: () => newMustDef(size),
         entry: () => entryMustDef(table, fn),
     };
     analyze(cfg, config);
@@ -146,160 +181,167 @@ export function runMustReachingDef(fn: t.Function, cfg: ControlFlowGraph, table:
             if (m === undefined) return undefined;
             const slot = table.resolve(id);
             if (slot === undefined) return undefined;
-            return m.reachingDef.get(slot);
+            return m.reachingDef[slot];
         },
     };
 }
 
 // ---------------------------------------------------------------------------
-// flowThrough
+// Precomputed transfer
+//
+// The semantics of computeMustDef (the previous per-visit walker) decompose
+// into a flat list of events in evaluation order. We extract them once.
+//
+// Event kinds:
+//   Write          — a local binding was rebound. The Definition object is
+//                    precomputed (its node + depends + unknownDeps are
+//                    invariant across visits). `conditional` selects between
+//                    "set to this def" and "set to BOTTOM"; invalidation of
+//                    dependents on `slot` happens either way.
+//   InvalidateAll  — `arguments` was read, so Closure's escapeParameters
+//                    rule wipes every slot to BOTTOM. (Closure ignores
+//                    conditionality for this case; we mirror.)
 
-function flowThrough(fn: t.Function, cfgNode: CfgNode, input: MustDef, table: LocalVariableTable): MustDef {
-    const output = cloneMustDef(input);
-    const value = cfgNode.value;
-    if (typeof value !== 'symbol') {
-        computeMustDef(fn, value as t.Node, value as t.Node, output, false, table);
-    }
-    return output;
-}
+type MustEvent =
+    | { kind: 'write'; slot: number; conditional: boolean; def: Definition }
+    | { kind: 'invalidateAll' };
 
-function computeMustDef(
-    fn: t.Function,
-    n: t.Node,
-    cfgNode: t.Node,
-    out: MustDef,
-    conditional: boolean,
-    table: LocalVariableTable,
-): void {
-    if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) {
-        return;
-    }
-    if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
-        computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isForStatement(n)) {
-        if (n.test) computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isForInStatement(n) || t.isForOfStatement(n)) {
-        const lhs = n.left;
-        if (t.isVariableDeclaration(lhs)) {
-            const last = lhs.declarations[lhs.declarations.length - 1];
-            if (last && t.isIdentifier(last.id)) {
-                addToDefIfLocal(last.id, conditional ? null : cfgNode, n.right, out, table);
-            }
-        } else if (t.isIdentifier(lhs)) {
-            addToDefIfLocal(lhs, conditional ? null : cfgNode, n.right, out, table);
-        }
-        return;
-    }
-    if (t.isLogicalExpression(n)) {
-        computeMustDef(fn, n.left, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.right, cfgNode, out, /* conditional */ true, table);
-        return;
-    }
-    if (t.isConditionalExpression(n)) {
-        computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.consequent, cfgNode, out, true, table);
-        computeMustDef(fn, n.alternate, cfgNode, out, true, table);
-        return;
-    }
-    if (t.isOptionalMemberExpression(n)) {
-        computeMustDef(fn, n.object, cfgNode, out, conditional, table);
-        if (n.computed) computeMustDef(fn, n.property, cfgNode, out, true, table);
-        return;
-    }
-    if (t.isOptionalCallExpression(n)) {
-        computeMustDef(fn, n.callee, cfgNode, out, conditional, table);
-        for (const arg of n.arguments) {
-            if (t.isExpression(arg)) computeMustDef(fn, arg, cfgNode, out, true, table);
-        }
-        return;
-    }
-    if (t.isVariableDeclaration(n)) {
-        for (const d of n.declarations) {
-            if (d.init && t.isIdentifier(d.id)) {
-                computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-                addToDefIfLocal(d.id, conditional ? null : cfgNode, d.init, out, table);
-            } else if (d.init) {
-                computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-            }
-        }
-        return;
-    }
-    if (t.isAssignmentExpression(n)) {
-        if (t.isIdentifier(n.left)) {
-            computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-            addToDefIfLocal(n.left, conditional ? null : cfgNode, n.right, out, table);
-            return;
-        }
-        // Member or destructure assign — descend defensively.
-        if ('type' in n.left) computeMustDef(fn, n.left as t.Node, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isUpdateExpression(n)) {
-        if (t.isIdentifier(n.argument)) {
-            // Treat ++/-- as a self-referencing redefinition with depends={x}.
-            addToDefIfLocal(n.argument, conditional ? null : cfgNode, n.argument, out, table);
-            return;
-        }
-    }
-    if (t.isIdentifier(n) && n.name === 'arguments') {
-        // Closure's escapeParameters: lose all parameter knowledge. We can't
-        // tell which slots are params from the table, so invalidate all
-        // slots. (escaped slots are filtered downstream.)
-        for (let slot = 0; slot < table.size; slot++) {
-            out.reachingDef.set(slot, null);
-        }
-        void fn;
-        return;
-    }
+type MustTransfer = MustEvent[];
 
-    for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        const child = getSlot(n, key);
-        if (child === null || child === undefined) continue;
-        if (Array.isArray(child)) {
-            for (const c of child) {
-                if (c) computeMustDef(fn, c, cfgNode, out, conditional, table);
-            }
-        } else {
-            computeMustDef(fn, child, cfgNode, out, conditional, table);
+function applyMustTransfer(events: MustTransfer, out: MustDef, table: LocalVariableTable): void {
+    const arr = out.reachingDef;
+    for (const e of events) {
+        if (e.kind === 'invalidateAll') {
+            const n = arr.length;
+            for (let s = 0; s < n; s++) arr[s] = null;
+            continue;
         }
+        // Write: invalidate dependents, then write self.
+        const slot = e.slot;
+        const n = arr.length;
+        for (let k = 0; k < n; k++) {
+            const def = arr[k];
+            if (def === null || def === undefined) continue;
+            if (def.depends.has(slot)) arr[k] = null;
+        }
+        if (table.escaped.has(slot)) continue;
+        arr[slot] = e.conditional ? null : e.def;
     }
 }
 
-function addToDefIfLocal(
-    id: t.Identifier,
-    cfgNode: t.Node | null,
-    rhs: t.Node | null,
-    out: MustDef,
-    table: LocalVariableTable,
-): void {
-    const slot = table.resolve(id);
-    if (slot === undefined) return;
+function buildMustTransfer(cfgNodeValue: t.Node, table: LocalVariableTable): MustTransfer {
+    const events: MustEvent[] = [];
 
-    // Invalidate any existing def that depends on `slot` (we just rebound it).
-    for (const [k, def] of out.reachingDef) {
-        if (def === null) continue;
-        if (def.depends.has(slot)) out.reachingDef.set(k, null);
-    }
-
-    if (table.escaped.has(slot)) return;
-
-    if (cfgNode === null) {
-        out.reachingDef.set(slot, null);
-        return;
-    }
-
-    const def: Definition = {
-        node: cfgNode,
-        depends: new Set(),
-        unknownDependencies: false,
+    const emitWrite = (id: t.Identifier, rhs: t.Node | null, conditional: boolean) => {
+        const slot = table.resolve(id);
+        if (slot === undefined) return;
+        // The Definition's node is the CFG-node value (invariant identity).
+        // depends/unknownDeps come from a one-time RHS walk.
+        const def: Definition = {
+            node: cfgNodeValue,
+            depends: new Set(),
+            unknownDependencies: false,
+        };
+        if (rhs !== null) computeDependence(def, rhs, table);
+        events.push({ kind: 'write', slot, conditional, def });
     };
-    if (rhs !== null) computeDependence(def, rhs, table);
-    out.reachingDef.set(slot, def);
+
+    const visit = (n: t.Node, conditional: boolean) => {
+        if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) {
+            return;
+        }
+        if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
+            visit(n.test, conditional);
+            return;
+        }
+        if (t.isForStatement(n)) {
+            if (n.test) visit(n.test, conditional);
+            return;
+        }
+        if (t.isForInStatement(n) || t.isForOfStatement(n)) {
+            const lhs = n.left;
+            if (t.isVariableDeclaration(lhs)) {
+                const last = lhs.declarations[lhs.declarations.length - 1];
+                if (last && t.isIdentifier(last.id)) {
+                    emitWrite(last.id, n.right, conditional);
+                }
+            } else if (t.isIdentifier(lhs)) {
+                emitWrite(lhs, n.right, conditional);
+            }
+            return;
+        }
+        if (t.isLogicalExpression(n)) {
+            visit(n.left, conditional);
+            visit(n.right, true);
+            return;
+        }
+        if (t.isConditionalExpression(n)) {
+            visit(n.test, conditional);
+            visit(n.consequent, true);
+            visit(n.alternate, true);
+            return;
+        }
+        if (t.isOptionalMemberExpression(n)) {
+            visit(n.object, conditional);
+            if (n.computed) visit(n.property, true);
+            return;
+        }
+        if (t.isOptionalCallExpression(n)) {
+            visit(n.callee, conditional);
+            for (const arg of n.arguments) {
+                if (t.isExpression(arg)) visit(arg, true);
+            }
+            return;
+        }
+        if (t.isVariableDeclaration(n)) {
+            for (const d of n.declarations) {
+                if (d.init && t.isIdentifier(d.id)) {
+                    visit(d.init, conditional);
+                    emitWrite(d.id, d.init, conditional);
+                } else if (d.init) {
+                    visit(d.init, conditional);
+                }
+            }
+            return;
+        }
+        if (t.isAssignmentExpression(n)) {
+            if (t.isIdentifier(n.left)) {
+                visit(n.right, conditional);
+                emitWrite(n.left, n.right, conditional);
+                return;
+            }
+            // Member or destructure assign — descend defensively.
+            if ('type' in n.left) visit(n.left as t.Node, conditional);
+            visit(n.right, conditional);
+            return;
+        }
+        if (t.isUpdateExpression(n)) {
+            if (t.isIdentifier(n.argument)) {
+                // Treat ++/-- as a self-referencing redefinition with depends={x}.
+                emitWrite(n.argument, n.argument, conditional);
+                return;
+            }
+        }
+        if (t.isIdentifier(n) && n.name === 'arguments') {
+            events.push({ kind: 'invalidateAll' });
+            return;
+        }
+
+        for (const key of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, key);
+            if (child === null || child === undefined) continue;
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c) visit(c, conditional);
+                }
+            } else {
+                visit(child, conditional);
+            }
+        }
+    };
+
+    visit(cfgNodeValue, false);
+    return events;
 }
 
 function computeDependence(def: Definition, rhs: t.Node, table: LocalVariableTable): void {

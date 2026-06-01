@@ -10,9 +10,12 @@ export type Definition = {
      *  reason about whether the def is invariant across reorderings. */
     unknownDependencies: boolean;
 };
+/** Per-slot reaching def, indexed by slot id. `undefined` = TOP (no def
+ *  recorded), `null` = BOTTOM (multiple distinct defs), `Definition` = the
+ *  unique reaching def. Flat array (not Map) so clone is a `.slice()` and
+ *  join/equals are tight index loops. */
 export type MustDef = {
-    /** Per-slot reaching def. Missing key = TOP, null value = BOTTOM. */
-    reachingDef: Map<number, Definition | null>;
+    reachingDef: (Definition | null | undefined)[];
 };
 export type MustReachResult = {
     /** True if the analysis ran (false if too many vars). */

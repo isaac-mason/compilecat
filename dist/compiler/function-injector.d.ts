@@ -18,11 +18,11 @@ export type CallSite = {
     /** The CallExpression to inline. */
     call: t.CallExpression;
     /** The statement that contains the CallExpression — used as the splice
-     *  point for BLOCK mode hoisting. Must be inside a BlockStatement body. */
+     *  point for BLOCK mode hoisting. Must sit in a statement-list container. */
     enclosingStatement: t.Statement;
-    /** The BlockStatement (or Program) holding the enclosing statement, plus
-     *  the index of the enclosing statement inside it. */
-    statementParent: t.BlockStatement | t.Program;
+    /** The container holding the enclosing statement (Block/Program body, or
+     *  SwitchCase consequent), plus the index of the enclosing statement. */
+    statementParent: t.BlockStatement | t.Program | t.SwitchCase;
     statementIndex: number;
     /** Parent of the CallExpression and key/index for in-place replacement. */
     callParent: t.Node;

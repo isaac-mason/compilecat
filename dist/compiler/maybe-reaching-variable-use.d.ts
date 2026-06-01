@@ -1,20 +1,24 @@
 import * as t from '@babel/types';
 import type { CfgNode, ControlFlowGraph } from './control-flow-graph';
 import type { LocalVariableTable } from './local-variable-table';
+/** Per-slot 3-state reach. Indexed by slot id.
+ *    `undefined` = TOP (no use reaches),
+ *    `Identifier` = exactly that single use might reach,
+ *    `null` = BOTTOM (multiple distinct uses might reach).
+ *  Flat array for fast clone (slice) and equality (index loop). */
 export type ReachingUses = {
-    /** Per-slot set of identifier nodes whose read might be reached
-     *  from this program point. */
-    uses: Map<number, Set<t.Node>>;
+    uses: (t.Identifier | null | undefined)[];
 };
 export type MaybeReachResult = {
     ran: boolean;
     table: LocalVariableTable;
     cfg: ControlFlowGraph;
-    /** At the OUT of `cfgNode` (= just after this node executes — equivalently,
-     *  the in-set of its CFG successor), which use sites of the binding behind
-     *  `id` might be reached? Used by FSIV to count uses of a def. */
-    getUsesAfter: (id: t.Identifier, cfgNode: CfgNode) => Set<t.Node>;
-    /** Slot-keyed variant — used when the caller already has a slot in hand. */
-    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => Set<t.Node>;
+    /** Returns the unique Identifier that might be read for `id`'s slot at the
+     *  start of `cfgNode`'s successor (= just after `cfgNode` executes), OR
+     *  `null` (BOTTOM — multiple distinct uses) OR `undefined` (TOP — no use).
+     *  FSIV accepts iff the returned identifier === the target use. */
+    getUsesAfter: (id: t.Identifier, cfgNode: CfgNode) => t.Identifier | null | undefined;
+    /** Slot-keyed variant. */
+    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => t.Identifier | null | undefined;
 };
 export declare function runMaybeReachingUse(cfg: ControlFlowGraph, table: LocalVariableTable): MaybeReachResult;

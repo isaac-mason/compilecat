@@ -1740,6 +1740,11 @@ function bodyHasUnsupportedConstruct(body) {
         return undefined;
     });
 }
+/** Resolve the statement-list array on a CallSite.statementParent. Block and
+ *  Program expose it as `.body`; SwitchCase as `.consequent`. */
+function stmtList(parent) {
+    return t.isSwitchCase(parent) ? parent.consequent : parent.body;
+}
 // ---------------------------------------------------------------------------
 // Splice — DIRECT.
 //
@@ -1933,7 +1938,8 @@ function inlineBlock(callee, site, options) {
     // Look up the enclosing statement's index dynamically — earlier inlines
     // on sibling statements may have shifted the array since `site` was
     // collected, making `site.statementIndex` stale.
-    const insertIdx = site.statementParent.body.indexOf(site.enclosingStatement);
+    const list = stmtList(site.statementParent);
+    const insertIdx = list.indexOf(site.enclosingStatement);
     if (insertIdx < 0)
         return false;
     const breadcrumb = breadcrumbFor(site.call);
@@ -1941,7 +1947,7 @@ function inlineBlock(callee, site, options) {
         case 'statement': {
             // Replace `foo();` with the labeled block.
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx, 1, out.block);
+            list.splice(insertIdx, 1, out.block);
             return true;
         }
         case 'init': {
@@ -1949,13 +1955,13 @@ function inlineBlock(callee, site, options) {
             // Drop the initializer in place; insert the block after.
             shape.declarator.init = null;
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx + 1, 0, out.block);
+            list.splice(insertIdx + 1, 0, out.block);
             return true;
         }
         case 'assign': {
             // `x = foo();` → labeled block (which writes `x` on each return).
             tagInlined(out.block, breadcrumb);
-            site.statementParent.body.splice(insertIdx, 1, out.block);
+            list.splice(insertIdx, 1, out.block);
             return true;
         }
         case 'expression': {
@@ -1966,7 +1972,7 @@ function inlineBlock(callee, site, options) {
             tagInlined(tempDecl, breadcrumb);
             const inserts = [tempDecl, out.block];
             replaceCall(site, t.identifier(resultName));
-            site.statementParent.body.splice(insertIdx, 0, ...inserts);
+            list.splice(insertIdx, 0, ...inserts);
             return true;
         }
     }
@@ -2254,15 +2260,14 @@ function substituteIdentifiers(root, subs) {
             // substitution, we're typically in a read context; LHS-of-assign
             // would mean we're rewriting params, which our classifier rejects
             // for v1 (parameter mutation in callee → BLOCK or NO).
-            if (parent !== null && !isReferenceContext$1(parent, key)) ;
-            else {
-                const sub = t.cloneNode(subs.get(n.name), true);
-                if (parent === null)
-                    rootReplacement = sub;
-                else
-                    setSlot(parent, key, index, sub);
+            if (parent !== null && !isReferenceContext$1(parent, key))
                 return;
-            }
+            const sub = t.cloneNode(subs.get(n.name), true);
+            if (parent === null)
+                rootReplacement = sub;
+            else
+                setSlot(parent, key, index, sub);
+            return;
         }
         for (const k of t.VISITOR_KEYS[n.type] ?? []) {
             const child = getSlot(n, k);
@@ -2483,16 +2488,25 @@ function collectCallSites(root, candidates, xfile) {
             fnStack.push(n);
         }
         let nextStmtCtx = stmtCtx;
-        if (parent &&
-            (t.isBlockStatement(parent) || t.isProgram(parent)) &&
-            key === 'body' &&
-            index !== undefined &&
-            t.isStatement(n)) {
-            nextStmtCtx = {
-                parent: parent,
-                index,
-                stmt: n,
-            };
+        if (parent && index !== undefined && t.isStatement(n)) {
+            if ((t.isBlockStatement(parent) || t.isProgram(parent)) && key === 'body') {
+                nextStmtCtx = {
+                    parent: parent,
+                    index,
+                    stmt: n,
+                };
+            }
+            else if (t.isSwitchCase(parent) && key === 'consequent') {
+                // SwitchCase.consequent is a Statement[] just like Block.body —
+                // bare `case X: stmt; break;` cases (no `{ ... }` wrapper) need
+                // the same statement-context tracking so inlines splice inside
+                // the case, not before the enclosing switch.
+                nextStmtCtx = {
+                    parent: parent,
+                    index,
+                    stmt: n,
+                };
+            }
         }
         if (t.isCallExpression(n) && nextStmtCtx !== null && parent !== null) {
             const cand = resolveCandidateForCall(n, candidates, xfile);
@@ -3934,6 +3948,13 @@ function renameForFlatten(fnPath) {
                     if (allNames.has(baseName)) {
                         // Already declared somewhere in this function
                         // (ancestor or earlier-visited sibling) — rename.
+                        // Use Babel's Scope.rename which traverses the live
+                        // AST. Earlier optimization rewrote via cached
+                        // binding.referencePaths / constantViolations, but
+                        // those caches go stale when prior pipeline phases
+                        // (inline-functions, sroa, inline-variables-pre)
+                        // splice in new Identifier nodes without a scope
+                        // crawl — missed refs then leak the pre-rename name.
                         const newName = pickFreshName(baseName, allNames);
                         p.scope.rename(baseName, newName);
                         active.add(newName);
@@ -5333,19 +5354,28 @@ function computeFollowNode(cfa, fromNode, node) {
         return computeFollowNode(cfa, fromNode, parent);
     }
     if (t.isSwitchCase(parent)) {
-        // After a case body, control passes to the next case's body
-        // (fall-through) — case condition is skipped.
+        // Bare `case X: stmt1; stmt2; break;` cases put statements directly
+        // in `parent.consequent` (no BlockStatement wrapper). Each statement
+        // falls through to the NEXT statement in the same consequent first;
+        // only when we run off the end of the consequent does control pass
+        // (JS fall-through) to the next case's body.
+        const siblings = parent.consequent;
+        const idx = siblings.indexOf(node);
+        for (let i = idx + 1; i < siblings.length; i++) {
+            const s = siblings[i];
+            if (s && !t.isFunctionDeclaration(s))
+                return computeFallThrough(s);
+        }
         const grand = parentOf(cfa, parent);
         if (!t.isSwitchStatement(grand)) {
             return computeFollowNode(cfa, fromNode, parent);
         }
-        const idx = grand.cases.indexOf(parent);
-        const nextCase = grand.cases[idx + 1];
+        const caseIdx = grand.cases.indexOf(parent);
+        const nextCase = grand.cases[caseIdx + 1];
         if (nextCase) {
             if (nextCase.consequent.length > 0) {
                 return computeFallThrough(nextCase.consequent[0]);
             }
-            // Empty case — fall through again.
             return computeFollowNode(cfa, fromNode, nextCase);
         }
         return computeFollowNode(cfa, fromNode, parent);
@@ -5734,7 +5764,7 @@ function runLiveVariablesAnalysis(cfg, table) {
     }
     const config = {
         direction: 'backward',
-        flowThrough: (node, output) => flowThrough$2(node, output, table),
+        flowThrough: (node, output) => flowThrough(node, output, table),
         joinFlows: (a, b) => {
             const r = bsClone(a);
             bsOr(r, b);
@@ -5756,7 +5786,7 @@ function runLiveVariablesAnalysis(cfg, table) {
 }
 // ---------------------------------------------------------------------------
 // flowThrough — compute GEN/KILL for `node`, then L_in = (L_out − KILL) | GEN
-function flowThrough$2(node, out, table) {
+function flowThrough(node, out, table) {
     const gen = newLattice(table);
     const kill = newLattice(table);
     const value = node.value;
@@ -6478,66 +6508,96 @@ function checkSomePathsWithoutBackEdges(s, a) {
     return false;
 }
 
-// Port of jscomp/MaybeReachingVariableUse.java
+// Port of jscomp/MaybeReachingVariableUse.java, simplified.
 //
 // Backward may-reach analysis. At every program point, for each local
-// variable v, what is the set of "upward exposed" use sites that might
-// read v's current value? Use sites are Identifier nodes.
+// variable v, what use might be reached next?
 //
-// Lattice per variable: a Set<Node>. Bigger = "more uses might reach".
-// Join (over multiple successors) = union. Kill = an unconditional write to
-// v removes v's set entirely (the prior value can no longer reach those uses
-// from this point). Reads add to the set.
+// FlowSensitiveInlineVariables — the only caller — only ever asks
+// "is there exactly one use that reaches, and is it this particular
+// Identifier node?" So we collapse Closure's Set<Node> per-slot lattice
+// to a 3-state lattice mirroring MustBeReachingVariableDef:
 //
-// Variable identity is by binding-slot — see local-variable-table.ts. Maps
-// here key by slot, not by name.
+//   TOP        = undefined  (no use is recorded as reaching yet)
+//   Identifier = exactly this single use might reach
+//   BOTTOM     = null       (multiple distinct uses might reach)
 //
-// Used by FlowSensitiveInlineVariables to check the "exactly one use of this
-// def" condition.
-function newReachingUses() {
-    return { uses: new Map() };
+// Join (over successors): TOP ⊔ x = x. BOTTOM ⊔ x = BOTTOM. I ⊔ I = I.
+// I ⊔ J = BOTTOM. Same shape as must-reach, with `Identifier` substituted
+// for `Definition`. Eliminates per-flow Set cloning, which previously
+// dominated the simplifier's runtime on large functions.
+//
+// Variable identity is by binding-slot — see local-variable-table.ts.
+//
+// Performance: like the must-def analysis, per-CFG-node transfer is
+// invariant across worklist visits — we precompute a flat event list of
+// kills and uses in reverse-eval order, filtered to in-table non-escaped
+// slots. flowThrough is then a tight event loop with no AST recursion.
+function newReachingUses(size) {
+    return { uses: new Array(size).fill(undefined) };
 }
 function cloneReachingUses(r) {
-    const out = newReachingUses();
-    for (const [k, set] of r.uses)
-        out.uses.set(k, new Set(set));
-    return out;
+    return { uses: r.uses.slice() };
 }
 function reachingEquals(a, b) {
-    if (a.uses.size !== b.uses.size)
-        return false;
-    for (const [k, sa] of a.uses) {
-        const sb = b.uses.get(k);
-        if (sb === undefined)
+    const aa = a.uses;
+    const bb = b.uses;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    for (let i = 0; i < len; i++) {
+        if (aa[i] !== bb[i])
             return false;
-        if (sa.size !== sb.size)
-            return false;
-        for (const node of sa)
-            if (!sb.has(node))
-                return false;
     }
     return true;
 }
 function reachingJoin(a, b) {
-    const out = cloneReachingUses(a);
-    for (const [k, sb] of b.uses) {
-        const dst = out.uses.get(k);
-        if (dst === undefined)
-            out.uses.set(k, new Set(sb));
-        else
-            for (const n of sb)
-                dst.add(n);
+    const aa = a.uses;
+    const bb = b.uses;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    const out = new Array(len);
+    for (let i = 0; i < len; i++) {
+        const va = aa[i];
+        const vb = bb[i];
+        if (va === vb) {
+            out[i] = va;
+        }
+        else if (va === undefined) {
+            out[i] = vb;
+        }
+        else if (vb === undefined) {
+            out[i] = va;
+        }
+        else {
+            // Either at least one is BOTTOM (null), or two distinct Identifiers.
+            // Both cases collapse to BOTTOM.
+            out[i] = null;
+        }
     }
-    return out;
+    return { uses: out };
 }
 function runMaybeReachingUse(cfg, table) {
+    const transfers = new WeakMap();
+    for (const node of cfg.nodes.values()) {
+        if (node === cfg.implicitReturn)
+            continue;
+        const value = node.value;
+        if (typeof value === 'symbol')
+            continue;
+        transfers.set(node, buildMayUseTransfer(value, table));
+    }
+    const size = table.size;
     const config = {
         direction: 'backward',
-        flowThrough: (node, output) => flowThrough$1(node, output, table),
+        flowThrough: (node, output) => {
+            const result = cloneReachingUses(output);
+            const transfer = transfers.get(node);
+            if (transfer !== undefined)
+                applyMayUseTransfer(transfer, result);
+            return result;
+        },
         joinFlows: reachingJoin,
         equals: reachingEquals,
-        bottom: newReachingUses,
-        entry: newReachingUses, // function-end: no use is reached.
+        bottom: () => newReachingUses(size),
+        entry: () => newReachingUses(size), // function-end: no use reaches.
     };
     analyze(cfg, config);
     const snapshot = new WeakMap();
@@ -6550,8 +6610,8 @@ function runMaybeReachingUse(cfg, table) {
     const getUsesAfterSlot = (slot, cfgNode) => {
         const r = snapshot.get(cfgNode);
         if (r === undefined)
-            return new Set();
-        return r.uses.get(slot) ?? new Set();
+            return undefined;
+        return r.uses[slot];
     };
     return {
         ran: true,
@@ -6561,158 +6621,163 @@ function runMaybeReachingUse(cfg, table) {
         getUsesAfter: (id, cfgNode) => {
             const slot = table.resolve(id);
             if (slot === undefined)
-                return new Set();
+                return undefined;
             return getUsesAfterSlot(slot, cfgNode);
         },
     };
 }
-// ---------------------------------------------------------------------------
-// flowThrough — compute IN from OUT by walking the node's expression. We
-// process in reverse evaluation order so writes (that kill) and reads (that
-// add) land in their correct relative order.
-function flowThrough$1(cfgNode, out, table) {
-    const result = cloneReachingUses(out);
-    const value = cfgNode.value;
-    if (typeof value !== 'symbol') {
-        computeMayUse(value, result, /* conditional */ false, table);
+function applyMayUseTransfer(events, out) {
+    const arr = out.uses;
+    for (const e of events) {
+        if (e.kind === 'kill') {
+            arr[e.slot] = undefined;
+            continue;
+        }
+        const cur = arr[e.slot];
+        if (cur === undefined) {
+            arr[e.slot] = e.id;
+        }
+        else if (cur !== e.id) {
+            // Either BOTTOM already (null) or a different Identifier — collapse
+            // to BOTTOM. Note: same Identifier won't appear twice (each AST
+            // node is unique), so the cur===e.id case is unreachable in
+            // practice; we keep the branch for safety.
+            arr[e.slot] = null;
+        }
     }
-    return result;
 }
-function computeMayUse(n, out, conditional, table) {
-    if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n))
-        return;
-    if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
-        computeMayUse(n.test, out, conditional, table);
-        return;
-    }
-    if (t.isForStatement(n)) {
-        if (n.test)
-            computeMayUse(n.test, out, conditional, table);
-        return;
-    }
-    if (t.isForInStatement(n) || t.isForOfStatement(n)) {
-        const lhs = n.left;
-        if (t.isVariableDeclaration(lhs)) {
-            const last = lhs.declarations[lhs.declarations.length - 1];
-            if (last && t.isIdentifier(last.id) && !conditional) {
-                killUse(last.id, out, table);
-            }
+function buildMayUseTransfer(cfgNodeValue, table) {
+    const events = [];
+    const emitKill = (id) => {
+        const slot = table.resolve(id);
+        if (slot === undefined)
+            return;
+        if (table.escaped.has(slot))
+            return;
+        events.push({ kind: 'kill', slot });
+    };
+    const emitUse = (id) => {
+        const slot = table.resolve(id);
+        if (slot === undefined)
+            return;
+        if (table.escaped.has(slot))
+            return;
+        events.push({ kind: 'use', slot, id });
+    };
+    const visit = (n, conditional) => {
+        if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n))
+            return;
+        if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
+            visit(n.test, conditional);
+            return;
         }
-        else if (t.isIdentifier(lhs) && !conditional) {
-            killUse(lhs, out, table);
+        if (t.isForStatement(n)) {
+            if (n.test)
+                visit(n.test, conditional);
+            return;
         }
-        computeMayUse(n.right, out, conditional, table);
-        return;
-    }
-    if (t.isLogicalExpression(n)) {
-        // Reverse eval order: RHS conditional, LHS unconditional.
-        computeMayUse(n.right, out, /* conditional */ true, table);
-        computeMayUse(n.left, out, conditional, table);
-        return;
-    }
-    if (t.isConditionalExpression(n)) {
-        computeMayUse(n.alternate, out, true, table);
-        computeMayUse(n.consequent, out, true, table);
-        computeMayUse(n.test, out, conditional, table);
-        return;
-    }
-    if (t.isOptionalMemberExpression(n)) {
-        if (n.computed)
-            computeMayUse(n.property, out, true, table);
-        computeMayUse(n.object, out, conditional, table);
-        return;
-    }
-    if (t.isOptionalCallExpression(n)) {
-        for (let i = n.arguments.length - 1; i >= 0; i--) {
-            const a = n.arguments[i];
-            if (t.isExpression(a))
-                computeMayUse(a, out, true, table);
-        }
-        computeMayUse(n.callee, out, conditional, table);
-        return;
-    }
-    if (t.isVariableDeclaration(n)) {
-        for (let i = n.declarations.length - 1; i >= 0; i--) {
-            const d = n.declarations[i];
-            if (t.isIdentifier(d.id)) {
-                if (d.init) {
-                    if (!conditional)
-                        killUse(d.id, out, table);
-                    computeMayUse(d.init, out, conditional, table);
+        if (t.isForInStatement(n) || t.isForOfStatement(n)) {
+            const lhs = n.left;
+            if (t.isVariableDeclaration(lhs)) {
+                const last = lhs.declarations[lhs.declarations.length - 1];
+                if (last && t.isIdentifier(last.id) && !conditional) {
+                    emitKill(last.id);
                 }
             }
-            else if (d.init) {
-                computeMayUse(d.init, out, conditional, table);
+            else if (t.isIdentifier(lhs) && !conditional) {
+                emitKill(lhs);
             }
-        }
-        return;
-    }
-    if (t.isAssignmentExpression(n)) {
-        if (t.isIdentifier(n.left)) {
-            if (!conditional)
-                killUse(n.left, out, table);
-            // Compound assign reads x first.
-            if (n.operator !== '=')
-                addUse(n.left, out, table);
-            computeMayUse(n.right, out, conditional, table);
+            visit(n.right, conditional);
             return;
         }
-        // Member or destructure — descend.
-        computeMayUse(n.right, out, conditional, table);
-        if ('type' in n.left)
-            computeMayUse(n.left, out, conditional, table);
-        return;
-    }
-    if (t.isUpdateExpression(n)) {
-        if (t.isIdentifier(n.argument)) {
-            if (!conditional)
-                killUse(n.argument, out, table);
-            addUse(n.argument, out, table);
+        if (t.isLogicalExpression(n)) {
+            // Reverse eval order: RHS conditional, LHS unconditional.
+            visit(n.right, true);
+            visit(n.left, conditional);
             return;
         }
-    }
-    if (t.isIdentifier(n)) {
-        addUse(n, out, table);
-        return;
-    }
-    // Default: walk children in reverse order.
-    const keys = t.VISITOR_KEYS[n.type] ?? [];
-    for (let ki = keys.length - 1; ki >= 0; ki--) {
-        const child = getSlot(n, keys[ki]);
-        if (child === null || child === undefined)
-            continue;
-        if (Array.isArray(child)) {
-            for (let i = child.length - 1; i >= 0; i--) {
-                const c = child[i];
-                if (c)
-                    computeMayUse(c, out, conditional, table);
+        if (t.isConditionalExpression(n)) {
+            visit(n.alternate, true);
+            visit(n.consequent, true);
+            visit(n.test, conditional);
+            return;
+        }
+        if (t.isOptionalMemberExpression(n)) {
+            if (n.computed)
+                visit(n.property, true);
+            visit(n.object, conditional);
+            return;
+        }
+        if (t.isOptionalCallExpression(n)) {
+            for (let i = n.arguments.length - 1; i >= 0; i--) {
+                const a = n.arguments[i];
+                if (t.isExpression(a))
+                    visit(a, true);
+            }
+            visit(n.callee, conditional);
+            return;
+        }
+        if (t.isVariableDeclaration(n)) {
+            for (let i = n.declarations.length - 1; i >= 0; i--) {
+                const d = n.declarations[i];
+                if (t.isIdentifier(d.id)) {
+                    if (d.init) {
+                        if (!conditional)
+                            emitKill(d.id);
+                        visit(d.init, conditional);
+                    }
+                }
+                else if (d.init) {
+                    visit(d.init, conditional);
+                }
+            }
+            return;
+        }
+        if (t.isAssignmentExpression(n)) {
+            if (t.isIdentifier(n.left)) {
+                if (!conditional)
+                    emitKill(n.left);
+                if (n.operator !== '=')
+                    emitUse(n.left);
+                visit(n.right, conditional);
+                return;
+            }
+            visit(n.right, conditional);
+            if ('type' in n.left)
+                visit(n.left, conditional);
+            return;
+        }
+        if (t.isUpdateExpression(n)) {
+            if (t.isIdentifier(n.argument)) {
+                if (!conditional)
+                    emitKill(n.argument);
+                emitUse(n.argument);
+                return;
             }
         }
-        else {
-            computeMayUse(child, out, conditional, table);
+        if (t.isIdentifier(n)) {
+            emitUse(n);
+            return;
         }
-    }
-}
-function addUse(id, out, table) {
-    const slot = table.resolve(id);
-    if (slot === undefined)
-        return;
-    if (table.escaped.has(slot))
-        return;
-    let set = out.uses.get(slot);
-    if (set === undefined) {
-        set = new Set();
-        out.uses.set(slot, set);
-    }
-    set.add(id);
-}
-function killUse(id, out, table) {
-    const slot = table.resolve(id);
-    if (slot === undefined)
-        return;
-    if (table.escaped.has(slot))
-        return;
-    out.uses.delete(slot);
+        const keys = t.VISITOR_KEYS[n.type] ?? [];
+        for (let ki = keys.length - 1; ki >= 0; ki--) {
+            const child = getSlot(n, keys[ki]);
+            if (child === null || child === undefined)
+                continue;
+            if (Array.isArray(child)) {
+                for (let i = child.length - 1; i >= 0; i--) {
+                    const c = child[i];
+                    if (c)
+                        visit(c, conditional);
+                }
+            }
+            else {
+                visit(child, conditional);
+            }
+        }
+    };
+    visit(cfgNodeValue, false);
+    return events;
 }
 
 // Port of jscomp/MustBeReachingVariableDef.java
@@ -6739,22 +6804,29 @@ function killUse(id, out, table) {
 // here key by slot, not by name; this is what makes shadowing correct.
 //
 // Used by FlowSensitiveInlineVariables.
-function newMustDef() {
-    return { reachingDef: new Map() };
+//
+// Performance: the per-CFG-node transfer function is structurally invariant
+// across worklist visits — only the input lattice changes. We precompute a
+// flat event list per CFG node once (see buildMustTransfer) and the
+// fixpoint loop's flowThrough becomes a tight iteration over that list.
+// Eliminates the deep AST recursion that previously ran on every visit.
+function newMustDef(size) {
+    // Pre-sized + filled to keep the array dense (V8 fast path).
+    return { reachingDef: new Array(size).fill(undefined) };
 }
 function cloneMustDef(d) {
-    return { reachingDef: new Map(d.reachingDef) };
+    return { reachingDef: d.reachingDef.slice() };
 }
 function entryMustDef(table, fnRoot) {
-    const m = newMustDef();
+    const arr = new Array(table.size);
     for (let slot = 0; slot < table.size; slot++) {
-        m.reachingDef.set(slot, {
+        arr[slot] = {
             node: fnRoot,
             depends: new Set(),
             unknownDependencies: false,
-        });
+        };
     }
-    return m;
+    return { reachingDef: arr };
 }
 function defsEqual(a, b) {
     // Closure: definitions are equal iff their cfg-node identity matches.
@@ -6763,45 +6835,75 @@ function defsEqual(a, b) {
     return a.node === b.node;
 }
 function mustDefEquals(a, b) {
-    if (a.reachingDef.size !== b.reachingDef.size)
-        return false;
-    for (const [k, va] of a.reachingDef) {
-        if (!b.reachingDef.has(k))
+    const aa = a.reachingDef;
+    const bb = b.reachingDef;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    for (let i = 0; i < len; i++) {
+        const va = aa[i];
+        const vb = bb[i];
+        if (va === vb)
+            continue;
+        // TOP vs anything-non-TOP and BOTTOM vs Definition are all distinct.
+        if (va === undefined || vb === undefined)
             return false;
-        if (!defsEqual(va, b.reachingDef.get(k) ?? null))
+        if (!defsEqual(va, vb))
             return false;
     }
     return true;
 }
 function mustDefJoin(a, b) {
-    const result = newMustDef();
-    const merge = (input) => {
-        for (const [k, vIn] of input.reachingDef) {
-            if (vIn === null) {
-                result.reachingDef.set(k, null);
-                continue;
-            }
-            if (!result.reachingDef.has(k)) {
-                result.reachingDef.set(k, vIn);
-                continue;
-            }
-            const cur = result.reachingDef.get(k);
-            if (defsEqual(cur, vIn))
-                continue;
-            result.reachingDef.set(k, null);
+    const aa = a.reachingDef;
+    const bb = b.reachingDef;
+    const len = aa.length > bb.length ? aa.length : bb.length;
+    const out = new Array(len);
+    for (let i = 0; i < len; i++) {
+        const va = aa[i];
+        const vb = bb[i];
+        // Closure lattice: TOP ⊔ x = x; BOTTOM ⊔ x = BOTTOM; D ⊔ D = D;
+        // D1 ⊔ D2 = BOTTOM (when D1.node !== D2.node).
+        if (va === undefined) {
+            out[i] = vb;
         }
-    };
-    merge(a);
-    merge(b);
-    return result;
+        else if (vb === undefined) {
+            out[i] = va;
+        }
+        else if (va === null || vb === null) {
+            out[i] = null;
+        }
+        else if (defsEqual(va, vb)) {
+            out[i] = va;
+        }
+        else {
+            out[i] = null;
+        }
+    }
+    return { reachingDef: out };
 }
 function runMustReachingDef(fn, cfg, table) {
+    // Precompute the transfer function for each CFG node once. flowThrough
+    // then becomes a tight loop over events; no AST recursion per visit.
+    const transfers = new WeakMap();
+    for (const node of cfg.nodes.values()) {
+        if (node === cfg.implicitReturn)
+            continue;
+        const value = node.value;
+        if (typeof value === 'symbol')
+            continue;
+        transfers.set(node, buildMustTransfer(value, table));
+    }
+    const size = table.size;
     const config = {
         direction: 'forward',
-        flowThrough: (node, input) => flowThrough(fn, node, input, table),
+        flowThrough: (node, input) => {
+            const out = cloneMustDef(input);
+            const transfer = transfers.get(node);
+            if (transfer !== undefined)
+                applyMustTransfer(transfer, out, table);
+            return out;
+        },
         joinFlows: mustDefJoin,
         equals: mustDefEquals,
-        bottom: newMustDef,
+        bottom: () => newMustDef(size),
         entry: () => entryMustDef(table, fn),
     };
     analyze(cfg, config);
@@ -6825,151 +6927,154 @@ function runMustReachingDef(fn, cfg, table) {
             const slot = table.resolve(id);
             if (slot === undefined)
                 return undefined;
-            return m.reachingDef.get(slot);
+            return m.reachingDef[slot];
         },
     };
 }
-// ---------------------------------------------------------------------------
-// flowThrough
-function flowThrough(fn, cfgNode, input, table) {
-    const output = cloneMustDef(input);
-    const value = cfgNode.value;
-    if (typeof value !== 'symbol') {
-        computeMustDef(fn, value, value, output, false, table);
-    }
-    return output;
-}
-function computeMustDef(fn, n, cfgNode, out, conditional, table) {
-    if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) {
-        return;
-    }
-    if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
-        computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isForStatement(n)) {
-        if (n.test)
-            computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isForInStatement(n) || t.isForOfStatement(n)) {
-        const lhs = n.left;
-        if (t.isVariableDeclaration(lhs)) {
-            const last = lhs.declarations[lhs.declarations.length - 1];
-            if (last && t.isIdentifier(last.id)) {
-                addToDefIfLocal(last.id, conditional ? null : cfgNode, n.right, out, table);
-            }
-        }
-        else if (t.isIdentifier(lhs)) {
-            addToDefIfLocal(lhs, conditional ? null : cfgNode, n.right, out, table);
-        }
-        return;
-    }
-    if (t.isLogicalExpression(n)) {
-        computeMustDef(fn, n.left, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.right, cfgNode, out, /* conditional */ true, table);
-        return;
-    }
-    if (t.isConditionalExpression(n)) {
-        computeMustDef(fn, n.test, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.consequent, cfgNode, out, true, table);
-        computeMustDef(fn, n.alternate, cfgNode, out, true, table);
-        return;
-    }
-    if (t.isOptionalMemberExpression(n)) {
-        computeMustDef(fn, n.object, cfgNode, out, conditional, table);
-        if (n.computed)
-            computeMustDef(fn, n.property, cfgNode, out, true, table);
-        return;
-    }
-    if (t.isOptionalCallExpression(n)) {
-        computeMustDef(fn, n.callee, cfgNode, out, conditional, table);
-        for (const arg of n.arguments) {
-            if (t.isExpression(arg))
-                computeMustDef(fn, arg, cfgNode, out, true, table);
-        }
-        return;
-    }
-    if (t.isVariableDeclaration(n)) {
-        for (const d of n.declarations) {
-            if (d.init && t.isIdentifier(d.id)) {
-                computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-                addToDefIfLocal(d.id, conditional ? null : cfgNode, d.init, out, table);
-            }
-            else if (d.init) {
-                computeMustDef(fn, d.init, cfgNode, out, conditional, table);
-            }
-        }
-        return;
-    }
-    if (t.isAssignmentExpression(n)) {
-        if (t.isIdentifier(n.left)) {
-            computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-            addToDefIfLocal(n.left, conditional ? null : cfgNode, n.right, out, table);
-            return;
-        }
-        // Member or destructure assign — descend defensively.
-        if ('type' in n.left)
-            computeMustDef(fn, n.left, cfgNode, out, conditional, table);
-        computeMustDef(fn, n.right, cfgNode, out, conditional, table);
-        return;
-    }
-    if (t.isUpdateExpression(n)) {
-        if (t.isIdentifier(n.argument)) {
-            // Treat ++/-- as a self-referencing redefinition with depends={x}.
-            addToDefIfLocal(n.argument, conditional ? null : cfgNode, n.argument, out, table);
-            return;
-        }
-    }
-    if (t.isIdentifier(n) && n.name === 'arguments') {
-        // Closure's escapeParameters: lose all parameter knowledge. We can't
-        // tell which slots are params from the table, so invalidate all
-        // slots. (escaped slots are filtered downstream.)
-        for (let slot = 0; slot < table.size; slot++) {
-            out.reachingDef.set(slot, null);
-        }
-        return;
-    }
-    for (const key of t.VISITOR_KEYS[n.type] ?? []) {
-        const child = getSlot(n, key);
-        if (child === null || child === undefined)
+function applyMustTransfer(events, out, table) {
+    const arr = out.reachingDef;
+    for (const e of events) {
+        if (e.kind === 'invalidateAll') {
+            const n = arr.length;
+            for (let s = 0; s < n; s++)
+                arr[s] = null;
             continue;
-        if (Array.isArray(child)) {
-            for (const c of child) {
-                if (c)
-                    computeMustDef(fn, c, cfgNode, out, conditional, table);
-            }
         }
-        else {
-            computeMustDef(fn, child, cfgNode, out, conditional, table);
+        // Write: invalidate dependents, then write self.
+        const slot = e.slot;
+        const n = arr.length;
+        for (let k = 0; k < n; k++) {
+            const def = arr[k];
+            if (def === null || def === undefined)
+                continue;
+            if (def.depends.has(slot))
+                arr[k] = null;
         }
+        if (table.escaped.has(slot))
+            continue;
+        arr[slot] = e.conditional ? null : e.def;
     }
 }
-function addToDefIfLocal(id, cfgNode, rhs, out, table) {
-    const slot = table.resolve(id);
-    if (slot === undefined)
-        return;
-    // Invalidate any existing def that depends on `slot` (we just rebound it).
-    for (const [k, def] of out.reachingDef) {
-        if (def === null)
-            continue;
-        if (def.depends.has(slot))
-            out.reachingDef.set(k, null);
-    }
-    if (table.escaped.has(slot))
-        return;
-    if (cfgNode === null) {
-        out.reachingDef.set(slot, null);
-        return;
-    }
-    const def = {
-        node: cfgNode,
-        depends: new Set(),
-        unknownDependencies: false,
+function buildMustTransfer(cfgNodeValue, table) {
+    const events = [];
+    const emitWrite = (id, rhs, conditional) => {
+        const slot = table.resolve(id);
+        if (slot === undefined)
+            return;
+        // The Definition's node is the CFG-node value (invariant identity).
+        // depends/unknownDeps come from a one-time RHS walk.
+        const def = {
+            node: cfgNodeValue,
+            depends: new Set(),
+            unknownDependencies: false,
+        };
+        if (rhs !== null)
+            computeDependence(def, rhs, table);
+        events.push({ kind: 'write', slot, conditional, def });
     };
-    if (rhs !== null)
-        computeDependence(def, rhs, table);
-    out.reachingDef.set(slot, def);
+    const visit = (n, conditional) => {
+        if (t.isProgram(n) || t.isFile(n) || t.isFunction(n) || t.isBlockStatement(n)) {
+            return;
+        }
+        if (t.isWhileStatement(n) || t.isDoWhileStatement(n) || t.isIfStatement(n)) {
+            visit(n.test, conditional);
+            return;
+        }
+        if (t.isForStatement(n)) {
+            if (n.test)
+                visit(n.test, conditional);
+            return;
+        }
+        if (t.isForInStatement(n) || t.isForOfStatement(n)) {
+            const lhs = n.left;
+            if (t.isVariableDeclaration(lhs)) {
+                const last = lhs.declarations[lhs.declarations.length - 1];
+                if (last && t.isIdentifier(last.id)) {
+                    emitWrite(last.id, n.right, conditional);
+                }
+            }
+            else if (t.isIdentifier(lhs)) {
+                emitWrite(lhs, n.right, conditional);
+            }
+            return;
+        }
+        if (t.isLogicalExpression(n)) {
+            visit(n.left, conditional);
+            visit(n.right, true);
+            return;
+        }
+        if (t.isConditionalExpression(n)) {
+            visit(n.test, conditional);
+            visit(n.consequent, true);
+            visit(n.alternate, true);
+            return;
+        }
+        if (t.isOptionalMemberExpression(n)) {
+            visit(n.object, conditional);
+            if (n.computed)
+                visit(n.property, true);
+            return;
+        }
+        if (t.isOptionalCallExpression(n)) {
+            visit(n.callee, conditional);
+            for (const arg of n.arguments) {
+                if (t.isExpression(arg))
+                    visit(arg, true);
+            }
+            return;
+        }
+        if (t.isVariableDeclaration(n)) {
+            for (const d of n.declarations) {
+                if (d.init && t.isIdentifier(d.id)) {
+                    visit(d.init, conditional);
+                    emitWrite(d.id, d.init, conditional);
+                }
+                else if (d.init) {
+                    visit(d.init, conditional);
+                }
+            }
+            return;
+        }
+        if (t.isAssignmentExpression(n)) {
+            if (t.isIdentifier(n.left)) {
+                visit(n.right, conditional);
+                emitWrite(n.left, n.right, conditional);
+                return;
+            }
+            // Member or destructure assign — descend defensively.
+            if ('type' in n.left)
+                visit(n.left, conditional);
+            visit(n.right, conditional);
+            return;
+        }
+        if (t.isUpdateExpression(n)) {
+            if (t.isIdentifier(n.argument)) {
+                // Treat ++/-- as a self-referencing redefinition with depends={x}.
+                emitWrite(n.argument, n.argument, conditional);
+                return;
+            }
+        }
+        if (t.isIdentifier(n) && n.name === 'arguments') {
+            events.push({ kind: 'invalidateAll' });
+            return;
+        }
+        for (const key of t.VISITOR_KEYS[n.type] ?? []) {
+            const child = getSlot(n, key);
+            if (child === null || child === undefined)
+                continue;
+            if (Array.isArray(child)) {
+                for (const c of child) {
+                    if (c)
+                        visit(c, conditional);
+                }
+            }
+            else {
+                visit(child, conditional);
+            }
+        }
+    };
+    visit(cfgNodeValue, false);
+    return events;
 }
 function computeDependence(def, rhs, table) {
     const visit = (n, parent) => {
@@ -7035,20 +7140,50 @@ function dependsOnOuterScopeVars(def) {
 //
 // Drives MustBeReachingVariableDef + MaybeReachingVariableUse + the
 // CheckPathsBetweenNodes graph utility.
+const flowInlineInnerTimings = {
+    mustDef: 0,
+    mayUse: 0,
+    parents: 0,
+    gather: 0,
+    canInline: 0,
+    perform: 0,
+    candidateCount: 0,
+    inlineCount: 0,
+};
 function runFlowSensitiveInlineVariables(fn, cfg, table) {
     if (table.size === 0)
         return { ran: true, inlined: 0 };
+    const t0 = performance.now();
     const reachDef = runMustReachingDef(fn, cfg, table);
+    const t1 = performance.now();
     const reachUse = runMaybeReachingUse(cfg, table);
+    const t2 = performance.now();
     const parents = buildParentMap(fn);
+    const t3 = performance.now();
     const candidates = gatherCandidates(fn, cfg, table, reachDef.getDef, parents);
+    const t4 = performance.now();
     let inlined = 0;
+    let canInlineTime = 0;
+    let performTime = 0;
     for (const c of candidates) {
-        if (canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents)) {
+        const c0 = performance.now();
+        const ok = canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents);
+        const c1 = performance.now();
+        canInlineTime += c1 - c0;
+        if (ok) {
             performInline(c, table, parents);
+            performTime += performance.now() - c1;
             inlined++;
         }
     }
+    flowInlineInnerTimings.mustDef += t1 - t0;
+    flowInlineInnerTimings.mayUse += t2 - t1;
+    flowInlineInnerTimings.parents += t3 - t2;
+    flowInlineInnerTimings.gather += t4 - t3;
+    flowInlineInnerTimings.canInline += canInlineTime;
+    flowInlineInnerTimings.perform += performTime;
+    flowInlineInnerTimings.candidateCount += candidates.length;
+    flowInlineInnerTimings.inlineCount += inlined;
     return { ran: true, inlined };
 }
 function gatherCandidates(fn, cfg, table, getDef, parents) {
@@ -7109,14 +7244,14 @@ function canInline(c, fn, cfg, table, getUsesAfterSlot, parents) {
     // 5. Use not inside a loop.
     if (isWithinLoop(c.use, fn, parents))
         return false;
-    // 6. Reaching-use set at the def's CFG node has exactly one element.
+    // 6. Exactly one use reaches after the def's CFG node, and it's c.use.
+    // 3-state lattice: undefined = no use, null = BOTTOM (multiple), else
+    // the unique reaching Identifier.
     const defCfg = cfg.nodes.get(c.def.node);
     if (defCfg === undefined)
         return false;
     const usesAfter = getUsesAfterSlot(c.slot, defCfg);
-    if (usesAfter.size !== 1)
-        return false;
-    if (!usesAfter.has(c.use))
+    if (usesAfter !== c.use)
         return false;
     // 7. Path side-effect check, unless def and use are immediate siblings.
     if (!areAdjacentSiblings(c.def.node, c.useCfgNode.value, parents)) {
@@ -10367,9 +10502,16 @@ function createAggregator() {
                 const pct = simplifyTotal > 0 ? (ms / simplifyTotal) * 100 : 0;
                 return `    ${k.padEnd(22)} ${ms.toFixed(1).padStart(9)}ms  ${pct.toFixed(1).padStart(5)}%`;
             });
+            const inner = flowInlineInnerTimings;
+            const innerRows = ['mustDef', 'mayUse', 'parents', 'gather', 'canInline', 'perform'].map((k) => {
+                const ms = inner[k];
+                return `      ${k.padEnd(20)} ${ms.toFixed(1).padStart(9)}ms`;
+            });
             console.log(`[compilecat] ${label} aggregate over ${calls} call(s), ${(totalBytesIn / 1024).toFixed(1)} KiB in:\n` +
                 `${rows.join('\n')}\n  ${'TOTAL'.padEnd(24)} ${total.toFixed(1).padStart(9)}ms\n` +
-                `  simplify breakdown (of ${simplifyTotal.toFixed(1)}ms):\n${simplifyRows.join('\n')}`);
+                `  simplify breakdown (of ${simplifyTotal.toFixed(1)}ms):\n${simplifyRows.join('\n')}\n` +
+                `    flowInline breakdown:\n${innerRows.join('\n')}\n` +
+                `      candidates=${inner.candidateCount} inlined=${inner.inlineCount}`);
         },
     };
 }

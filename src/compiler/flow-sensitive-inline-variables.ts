@@ -45,6 +45,17 @@ export type FlowInlineResult = {
     inlined: number;
 };
 
+export const flowInlineInnerTimings = {
+    mustDef: 0,
+    mayUse: 0,
+    parents: 0,
+    gather: 0,
+    canInline: 0,
+    perform: 0,
+    candidateCount: 0,
+    inlineCount: 0,
+};
+
 export function runFlowSensitiveInlineVariables(
     fn: t.Function,
     cfg: ControlFlowGraph,
@@ -52,19 +63,41 @@ export function runFlowSensitiveInlineVariables(
 ): FlowInlineResult {
     if (table.size === 0) return { ran: true, inlined: 0 };
 
+    const t0 = performance.now();
     const reachDef = runMustReachingDef(fn, cfg, table);
+    const t1 = performance.now();
     const reachUse = runMaybeReachingUse(cfg, table);
+    const t2 = performance.now();
     const parents = buildParentMap(fn);
+    const t3 = performance.now();
 
     const candidates = gatherCandidates(fn, cfg, table, reachDef.getDef, parents);
+    const t4 = performance.now();
 
     let inlined = 0;
+    let canInlineTime = 0;
+    let performTime = 0;
     for (const c of candidates) {
-        if (canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents)) {
+        const c0 = performance.now();
+        const ok = canInline(c, fn, cfg, table, reachUse.getUsesAfterSlot, parents);
+        const c1 = performance.now();
+        canInlineTime += c1 - c0;
+        if (ok) {
             performInline(c, table, parents);
+            performTime += performance.now() - c1;
             inlined++;
         }
     }
+
+    flowInlineInnerTimings.mustDef += t1 - t0;
+    flowInlineInnerTimings.mayUse += t2 - t1;
+    flowInlineInnerTimings.parents += t3 - t2;
+    flowInlineInnerTimings.gather += t4 - t3;
+    flowInlineInnerTimings.canInline += canInlineTime;
+    flowInlineInnerTimings.perform += performTime;
+    flowInlineInnerTimings.candidateCount += candidates.length;
+    flowInlineInnerTimings.inlineCount += inlined;
+
     return { ran: true, inlined };
 }
 
@@ -115,7 +148,7 @@ function canInline(
     fn: t.Function,
     cfg: ControlFlowGraph,
     table: LocalVariableTable,
-    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => Set<t.Node>,
+    getUsesAfterSlot: (slot: number, cfgNode: CfgNode) => t.Identifier | null | undefined,
     parents: ParentMap,
 ): boolean {
     const defLoc = locateDefExpr(c.def, c.slot, table, parents);
@@ -150,12 +183,13 @@ function canInline(
     // 5. Use not inside a loop.
     if (isWithinLoop(c.use, fn, parents)) return false;
 
-    // 6. Reaching-use set at the def's CFG node has exactly one element.
+    // 6. Exactly one use reaches after the def's CFG node, and it's c.use.
+    // 3-state lattice: undefined = no use, null = BOTTOM (multiple), else
+    // the unique reaching Identifier.
     const defCfg = cfg.nodes.get(c.def.node);
     if (defCfg === undefined) return false;
     const usesAfter = getUsesAfterSlot(c.slot, defCfg);
-    if (usesAfter.size !== 1) return false;
-    if (!usesAfter.has(c.use)) return false;
+    if (usesAfter !== c.use) return false;
 
     // 7. Path side-effect check, unless def and use are immediate siblings.
     if (!areAdjacentSiblings(c.def.node, c.useCfgNode.value as t.Node, parents)) {

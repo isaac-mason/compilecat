@@ -269,7 +269,11 @@ function collectCallSites(root: t.Node, candidates: Map<string, Candidate>, xfil
         key: string,
         index: number | undefined,
         // Path of (statementParent, statementIndex, enclosingStatement).
-        stmtCtx: { parent: t.BlockStatement | t.Program; index: number; stmt: t.Statement } | null,
+        stmtCtx: {
+            parent: t.BlockStatement | t.Program | t.SwitchCase;
+            index: number;
+            stmt: t.Statement;
+        } | null,
     ): void => {
         const enteringFn = t.isFunction(n);
         if (enteringFn) {
@@ -278,18 +282,24 @@ function collectCallSites(root: t.Node, candidates: Map<string, Candidate>, xfil
         }
 
         let nextStmtCtx = stmtCtx;
-        if (
-            parent &&
-            (t.isBlockStatement(parent) || t.isProgram(parent)) &&
-            key === 'body' &&
-            index !== undefined &&
-            t.isStatement(n)
-        ) {
-            nextStmtCtx = {
-                parent: parent as t.BlockStatement | t.Program,
-                index,
-                stmt: n as t.Statement,
-            };
+        if (parent && index !== undefined && t.isStatement(n)) {
+            if ((t.isBlockStatement(parent) || t.isProgram(parent)) && key === 'body') {
+                nextStmtCtx = {
+                    parent: parent as t.BlockStatement | t.Program,
+                    index,
+                    stmt: n as t.Statement,
+                };
+            } else if (t.isSwitchCase(parent) && key === 'consequent') {
+                // SwitchCase.consequent is a Statement[] just like Block.body —
+                // bare `case X: stmt; break;` cases (no `{ ... }` wrapper) need
+                // the same statement-context tracking so inlines splice inside
+                // the case, not before the enclosing switch.
+                nextStmtCtx = {
+                    parent: parent as t.SwitchCase,
+                    index,
+                    stmt: n as t.Statement,
+                };
+            }
         }
 
         if (t.isCallExpression(n) && nextStmtCtx !== null && parent !== null) {
