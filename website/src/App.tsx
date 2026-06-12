@@ -3,21 +3,9 @@ import CodeMirror from '@uiw/react-codemirror';
 import { type TransformResult, transform } from 'compilecat';
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 
-const STARTER = `// Predator/prey ecosystem with EIGHT entity types — each a distinct hidden
-// class. Tiny geometry helpers (dist2, pushAway, pushToward, integrate, …)
-// are called from every behaviour with every type pair.
-//
-// Baseline: each helper's \`.x\` / \`.y\` / \`.vx\` loads see many hidden
-// classes → ICs go megamorphic → property loads fall off V8's fast path.
-//
-// compilecat: @optimize on step()/render() inlines every helper call inside
-// them. Each expansion sees ONE concrete type → ICs stay monomorphic.
-//
-// Watch the side-by-side frame-time graphs.
-
-const W = self.innerWidth;   // world size auto-fits the iframe
-const H = self.innerHeight;  // sim resets on resize
-const N = 500;               // fish count (the slider)
+const STARTER = `const W = self.innerWidth;
+const H = self.innerHeight;
+const N = 500;
 const N_PREDATOR = 2;
 const N_WHALE = 1;
 const N_ROCK = 4;
@@ -29,10 +17,6 @@ const N_CURRENT = 3;
 const FISH_MAX_V = 1.6;
 const PREDATOR_MAX_V = 1.1;
 const WHALE_MAX_V = 0.4;
-
-// ── geometry helpers — the polymorphic-IC hotspots ────────────────────────
-// @optimize on each caller (step / render) inlines these at every call site,
-// so each expansion sees one concrete (a, b) type pair → monomorphic loads.
 
 function dist2(a, b) {
   const dx = a.x - b.x;
@@ -93,15 +77,11 @@ function respawn(entity) {
   entity.y = Math.random() * H;
 }
 
-// Wrap-aware lerp: when prev and curr straddle a wrap boundary, render at
-// the destination rather than streaking across the screen.
 function lerpWrap(a, b, t, max) {
   const d = b - a;
   if (d > max * 0.5 || d < -max * 0.5) return b;
   return a + d * t;
 }
-
-// ── entity factories — DISTINCT field sets = DISTINCT hidden classes ──────
 
 function makeFish() {
   const x = Math.random() * W;
@@ -200,8 +180,6 @@ for (let i = 0; i < N_REEF; i++) reefs.push(makeReef());
 for (let i = 0; i < N_PELLET; i++) pellets.push(makePellet());
 for (let i = 0; i < N_MOTE; i++) motes.push(makeMote());
 for (let i = 0; i < N_CURRENT; i++) currents.push(makeCurrent());
-
-// ── physics ────────────────────────────────────────────────────────────────
 
 /* @optimize */
 function step(dt) {
