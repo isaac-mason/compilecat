@@ -13,12 +13,12 @@
 
 > ⚠️ This is highly experimental! It's not clear yet if this tool is even a good idea! Browse to your heart's content but expect no stability right now.
 
-A JavaScript/TypeScript compiler plugin for hot-path optimizations — function inlining, scalar-replacement of aggregates (SROA), and loop unrolling — driven by opt-in annotations.
+A JavaScript/TypeScript compiler plugin for hot-path optimizations, driven by opt-in annotations. It does function inlining, scalar-replacement of aggregates (SROA), and loop unrolling.
 
 Built with Babel. Ships as a rollup-family plugin with two execution modes:
 
-- **Whole-program** (`renderChunk`) — runs once on each tree-shaken, concatenated chunk. Every `@inline` target is already in the chunk, so no cross-file resolver is involved. Used by the rollup and rolldown adapters, and by the Vite adapter during `vite build`.
-- **Per-file** (`transform`) — runs on each source file. A cross-file resolver follows imports into donor modules, splices their bodies, and hoists the donor module-vars and imports the spliced body references. Used by the Vite adapter during `vite dev` (no bundle phase exists), with `addWatchFile` wired in so edits to a donor invalidate every consumer that inlined it.
+- **Whole-program** (`renderChunk`) runs once on each tree-shaken, concatenated chunk. Every `@inline` target is already in the chunk, so no cross-file resolver is involved. Used by the rollup and rolldown adapters, and by the Vite adapter during `vite build`.
+- **Per-file** (`transform`) runs on each source file. A cross-file resolver follows imports into donor modules, splices their bodies, and hoists the donor module-vars and imports the spliced body references. Used by the Vite adapter during `vite dev` (no bundle phase exists), with `addWatchFile` wired in so edits to a donor invalidate every consumer that inlined it.
 
 The Vite adapter routes automatically: per-file in dev, whole-program at build time (via Vite's `apply: 'serve' | 'build'`), so the two modes never both fire.
 
@@ -39,9 +39,9 @@ Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compileca
 
 All optimizations are opt-in via `/* @* */` block comments.
 
-### `@inline` — inline at the call site
+### `@inline`: inline at the call site
 
-On a function declaration, every call within the chunk is replaced with the function body. In bundle mode the chunk is the whole tree-shaken program, so callers from other source files reach the annotated function naturally — no cross-file resolver involved.
+On a function declaration, every call within the chunk is replaced with the function body. In bundle mode the chunk is the whole tree-shaken program, so callers from other source files reach the annotated function naturally, with no cross-file resolver involved.
 
 ```ts
 /* @inline */
@@ -65,7 +65,7 @@ function step(result: Vec3, v1: Vec3, v2: Vec3) {
 }
 ```
 
-On a call site, inlines just that call — useful for one-off forcing of a particular call:
+On a call site, inlines just that call. This is useful for one-off forcing of a particular call:
 
 ```ts
 import { vec3 } from 'mathcat';
@@ -75,9 +75,9 @@ function step(out: Vec3, v: Vec3) {
 }
 ```
 
-Library code from `node_modules` is eligible for inlining whenever it ends up in the chunk and carries (or is targeted by) a directive — the resolver isn't doing anything special for libraries because bundling already pulled the body in.
+Library code from `node_modules` is eligible for inlining whenever it ends up in the chunk and carries (or is targeted by) a directive. The resolver isn't doing anything special for libraries because bundling already pulled the body in.
 
-### `@flatten` — inline every call inside this function
+### `@flatten`: inline every call inside this function
 
 A caller-side bulk directive. Every resolvable call inside the annotated function's body is treated as if its call site had `/* @inline */`.
 
@@ -89,7 +89,7 @@ function step(out: Vec3, v: Vec3) {
 }
 ```
 
-### `@sroa` — break an array-literal local into scalars
+### `@sroa`: break an array-literal local into scalars
 
 Scalar Replacement of Aggregates. Converts `const v = [a, b, c]` plus constant-index accesses (`v[0]`, `v[1]`, ...) into scalar locals. Useful for tuple-shaped data (vec3, quat, mat4) in hot loops.
 
@@ -112,11 +112,11 @@ function step(dt: number) {
 }
 ```
 
-Escape analysis bails silently if the array leaks — passed to a function, spread, non-constant indexing, aliased, or accessed via `.length`.
+Escape analysis bails silently if the array leaks, whether by being passed to a function, spread, indexed non-constantly, aliased, or accessed via `.length`.
 
 Can also be placed on an enclosing function to opt in every qualifying declaration inside it.
 
-### `@unroll` — unroll a loop with a static trip count
+### `@unroll`: unroll a loop with a static trip count
 
 ```ts
 /* @unroll */
@@ -157,7 +157,7 @@ parse
   → loop-unroller
   → inline-variables (pre)  (collapse alias temps so SROA sees direct `name[i]` uses)
   → scalar-replace-aggregates
-  → normalize               (MakeDeclaredNamesUnique — flips `isASTNormalized`)
+  → normalize               (MakeDeclaredNamesUnique, flips `isASTNormalized`)
   → simplify (per-function fixpoint):
       peephole-fold-constants
       minimize-exit-points
@@ -196,7 +196,7 @@ compilecatVite({
 })
 ```
 
-`include` is required and there is no implicit default — you scope
+`include` is required and there is no implicit default, so you scope
 compilecat to your engine/hot-path code explicitly. `include` / `exclude`
 only affect Vite dev (per-file transform mode); they are plumbed through
 Rollup 4's hook-filter API, so under rolldown the test runs in Rust and
