@@ -1,1 +1,1 @@
-export { compilecat as default } from './plugin';
+export { compilecat, compilecat as default } from './plugin';

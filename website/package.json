@@ -10,10 +10,12 @@
   },
   "dependencies": {
     "@codemirror/lang-javascript": "^6.2.2",
+    "@rollup/browser": "^4.62.0",
     "@uiw/react-codemirror": "^4.23.7",
     "compilecat": "workspace:*",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "sucrase": "^3.35.1"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",

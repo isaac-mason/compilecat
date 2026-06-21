@@ -1,0 +1,23 @@
+[package]
+name = "compilecat_core"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# rlib so the napi crate can link it; no cdylib here — the napi crate owns the
+# .node artifact.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_ast_visit = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_codegen = { workspace = true }
+oxc_semantic = { workspace = true }
+oxc_span = { workspace = true }
+oxc_sourcemap = { workspace = true }
+self_cell = "1.2.2"

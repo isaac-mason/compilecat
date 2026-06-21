@@ -1,0 +1,35 @@
+{
+  "name": "compilecat-napi",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Rust/oxc core for compilecat, exposed as a napi addon. Build tool only — not published; its loader is folded into `compilecat` and its binaries ship as @compilecat/core-<triple> platform packages.",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "napi": {
+    "binaryName": "compilecat",
+    "packageName": "@compilecat/core",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "wasm32-wasip1-threads"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0",
+    "@napi-rs/wasm-runtime": "^1.1.5",
+    "@emnapi/core": "1.11.1",
+    "@emnapi/runtime": "1.11.1"
+  }
+}

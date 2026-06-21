@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/isaac-mason/compilecat"
+
+# Pinned to versions proven to build together (see rust/README.md). Bump with
+# `cargo update` once the scaffold compiles in your environment.
+[workspace.dependencies]
+oxc_allocator = "0.135.0"
+oxc_ast = "0.135.0"
+oxc_ast_visit = "0.135.0"
+oxc_parser = "0.135.0"
+oxc_codegen = "0.135.0"
+oxc_semantic = "0.135.0"
+oxc_span = "0.135.0"
+oxc_sourcemap = "7.0.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

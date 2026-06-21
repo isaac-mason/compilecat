@@ -1,0 +1,22 @@
+/target
+# napi build artifacts. The platform binaries are generated per-build and ship
+# as @compilecat/core-<triple> packages — never committed. The loader
+# (index.js/index.d.ts) IS committed (the binding interface — platform-
+# independent, deterministic), so a CI publish runner has it without a native
+# build, and `build:loader` can fold it into dist/core.
+**/*.node
+# wasm fallback build outputs (ship in @compilecat/core-wasm32-wasi, built in CI)
+**/*.wasm
+crates/compilecat_napi/compilecat.wasi*.cjs
+crates/compilecat_napi/compilecat.wasi-browser.js
+crates/compilecat_napi/wasi-worker*.mjs
+# generated browser-loader variant — the node-only package doesn't ship it
+crates/compilecat_napi/browser.js
+# transient staging dir for `napi artifacts` (build:all / CI download)
+crates/compilecat_napi/artifacts/
+# binaries assembled into the platform packages (built per-release, never committed)
+crates/compilecat_napi/npm/*/*.node
+crates/compilecat_napi/npm/*/*.wasm
+crates/compilecat_napi/npm/*/*.cjs
+crates/compilecat_napi/npm/*/*.mjs
+crates/compilecat_napi/npm/*/*.wasi-browser.js

@@ -212,10 +212,25 @@ body {
 
 .panes {
   flex: 0 0 auto;
-  display: grid;
-  grid-template-columns: 1fr;
-  grid-template-rows: 18rem 18rem 32rem;
+  display: flex;
+  flex-direction: column;
   gap: 0.75rem;
+}
+
+.panes > .pane {
+  height: 18rem;
+}
+
+/* Middle column: "js without" stacked over "js with". */
+.pane-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  min-height: 0;
+}
+
+.pane-col > .pane {
+  height: 16rem;
 }
 
 .pane {
@@ -240,8 +255,23 @@ body {
   border-bottom: 1px solid #444444;
 }
 
+/* Source pane: the header IS the scenario tab bar. Zero padding so tabs sit
+ * flush; stretch so the active tab's fill spans the full strip height. */
+.pane-header--tabs {
+  padding: 0;
+  align-items: stretch;
+}
+
+.pane-header--tabs .tab {
+  display: flex;
+  align-items: center;
+}
+
 .editor {
-  flex: 1 1 auto;
+  /* `flex-basis: 0` so the (possibly long) editor content can't drive the box's
+   * height — that's what made the pane resize as you scroll. The editor takes
+   * its flex share; CodeMirror fills it (height: 100%) and scrolls internally. */
+  flex: 1 1 0;
   min-height: 0;
   font-size: 0.8rem;
 }
@@ -253,6 +283,7 @@ body {
 
 .editor .cm-scroller {
   font-family: 'Roboto Mono', monospace;
+  overflow: auto;
 }
 
 .editor .cm-gutters {
@@ -474,11 +505,24 @@ body {
   }
 
   .panes {
+    display: grid;
     flex: 1 1 auto;
     min-height: 0;
     grid-template-columns: 1fr 1fr 1fr;
     grid-template-rows: 1fr;
     grid-auto-rows: 1fr;
+  }
+
+  .panes > .pane,
+  .pane-col {
+    height: auto;
+    min-height: 0;
+  }
+
+  .pane-col > .pane {
+    flex: 1 1 0;
+    height: auto;
+    min-height: 0;
   }
 
   .preview-pane {

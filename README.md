@@ -15,12 +15,12 @@
 
 A JavaScript/TypeScript compiler plugin for hot-path optimizations, driven by opt-in annotations. It does function inlining, scalar-replacement of aggregates (SROA), and loop unrolling.
 
-Built with Babel. Ships as a rollup-family plugin with two execution modes:
-
-- **Whole-program** (`renderChunk`) runs once on each tree-shaken, concatenated chunk. Every `@inline` target is already in the chunk, so no cross-file resolver is involved. Used by the rollup and rolldown adapters, and by the Vite adapter during `vite build`.
-- **Per-file** (`transform`) runs on each source file. A cross-file resolver follows imports into donor modules, splices their bodies, and hoists the donor module-vars and imports the spliced body references. Used by the Vite adapter during `vite dev` (no bundle phase exists), with `addWatchFile` wired in so edits to a donor invalidate every consumer that inlined it.
-
-The Vite adapter routes automatically: per-file in dev, whole-program at build time (via Vite's `apply: 'serve' | 'build'`), so the two modes never both fire.
+Built on a Rust/oxc core. Ships as a rollup-family `transform` plugin: it
+optimizes each source file *before* bundling, keeping TypeScript. It is
+**cross-module aware** — when a file imports an `@inline` donor, the plugin
+resolves and reads the donor module and inlines across the module boundary,
+dropping the now-unused import. `addWatchFile` is wired in, so editing a donor
+re-transforms every consumer that inlined it.
 
 ## Usage
 
@@ -29,11 +29,15 @@ The Vite adapter routes automatically: per-file in dev, whole-program at build t
 import compilecat from 'compilecat/rollup';
 
 export default {
-    plugins: [compilecat()],
+    plugins: [compilecat({ include: [/\/src\//] })],
 };
 ```
 
-Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compilecat/rolldown`. Currently other bundlers are not supported.
+`include` scopes which module ids compilecat transforms and reads as donors
+(picomatch globs and/or RegExps) — required, so `node_modules` is never trawled
+unless a package is listed explicitly. Swap the subpath for other rollup-family
+bundlers: `compilecat/vite`, `compilecat/rolldown`. A browser/edge wasm backend
+is available at `compilecat/wasm`.
 
 ## Directives
 

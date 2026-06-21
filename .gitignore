@@ -1,3 +1,7 @@
 node_modules
 example/dist
 llm
+
+# The dev .node copied next to the folded loader. The committed dist ships the
+# loader only; platform binaries ship as @compilecat/core-<triple> packages.
+dist/core/*.node

@@ -1,0 +1,95 @@
+# Build the napi core for every target and publish:
+#   • @compilecat/core-<triple>  (one per platform — the .node binaries)
+#   • compilecat                  (the JS plugin + folded loader; binaries excluded)
+#
+# PREREQUISITES (one-time, outside this file):
+#   1. The `@compilecat` npm org exists (public).
+#   2. Repo secret `NPM_TOKEN` = an npm automation token with publish rights on
+#      both `compilecat` and `@compilecat/*`.
+#
+# Triggered by pushing a tag `v*` (cut a release: bump version, `napi version`,
+# commit, tag, push).
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write   # npm provenance
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-latest,   target: aarch64-apple-darwin }
+          - { runner: macos-latest,   target: x86_64-apple-darwin }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-gnu, cross: true }
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc }
+          # The universal wasm fallback (@compilecat/core-wasm32-wasi). No zig;
+          # needs the emnapi/wasm-runtime devDeps (installed below).
+          - { runner: ubuntu-latest,  target: wasm32-wasip1-threads }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
+      - run: pnpm install --frozen-lockfile
+      # The napi crate is standalone (own lockfile, not a workspace member), so
+      # install it directly — this brings in @napi-rs/cli + the wasm build deps.
+      - run: pnpm -C rust/crates/compilecat_napi install --ignore-workspace --frozen-lockfile
+      # Native targets build directly; aarch64-linux cross-compiles via zig; the
+      # wasm target builds without either.
+      - name: build ${{ matrix.target }}
+        working-directory: rust/crates/compilecat_napi
+        run: pnpm exec napi build --platform --release --target ${{ matrix.target }} ${{ matrix.cross && '--cross-compile' || '' }}
+      # Upload .node (native) or the .wasm + .cjs wrappers (wasm); skip debug.wasm.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: |
+            rust/crates/compilecat_napi/*.node
+            rust/crates/compilecat_napi/*.wasm
+            rust/crates/compilecat_napi/*.cjs
+            rust/crates/compilecat_napi/wasi-worker*.mjs
+            !rust/crates/compilecat_napi/*.debug.wasm
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: pnpm, registry-url: 'https://registry.npmjs.org' }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -C rust/crates/compilecat_napi install --ignore-workspace --frozen-lockfile
+      # Pull every target's binary back in, then let napi sort them into npm/<triple>/.
+      - uses: actions/download-artifact@v4
+        with:
+          path: rust/crates/compilecat_napi/artifacts
+      - name: assemble platform packages
+        working-directory: rust/crates/compilecat_napi
+        run: pnpm exec napi artifacts --output-dir ./artifacts   # moves each .node into npm/<triple>/
+      # 1. Publish the platform packages (@compilecat/core-<triple>).
+      - name: publish @compilecat/core-*
+        working-directory: rust/crates/compilecat_napi
+        run: pnpm exec napi prepublish -t npm --no-gh-release
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # 2. Build the JS package (folds the loader into dist/core, sans .node) and
+      #    publish the main `compilecat` package, which optionally-depends on them.
+      - name: build + publish compilecat
+        run: |
+          pnpm build:ts && pnpm build:loader
+          npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

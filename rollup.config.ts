@@ -7,17 +7,18 @@ const external = [
 	'node:fs',
 	'node:crypto',
 	'node:path',
+	'node:module',
 	'tty',
 	'util',
 	'os',
-	'@babel/generator',
-	'@babel/parser',
-	'@babel/traverse',
-	'@babel/types',
+	'@rollup/pluginutils',
 	'rollup',
+	// wasm core: resolved by the consumer (the website aliases it to the
+	// wasm-pack `pkg/`); never bundled into the package.
+	'compilecat-wasm',
 ];
 
-const entries = ['index', 'vite', 'rollup', 'rolldown'];
+const entries = ['index', 'vite', 'rollup', 'rolldown', 'plugin', 'wasm'];
 
 export default entries.map((entry) => ({
 	input: `./src/${entry}.ts`,

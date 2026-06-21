@@ -1,6 +1,6 @@
 {
 	"name": "compilecat",
-	"version": "0.0.0",
+	"version": "0.0.1",
 	"description": "compiler plugin that helps you write high performance javascript.",
 	"author": "Isaac Mason <isaac@isaacmason.com>",
 	"license": "MIT",
@@ -25,33 +25,47 @@
 		"./rolldown": {
 			"types": "./dist/rolldown.d.ts",
 			"import": "./dist/rolldown.js"
+		},
+		"./wasm": {
+			"types": "./dist/wasm.d.ts",
+			"import": "./dist/wasm.js"
 		}
 	},
 	"files": [
 		"dist",
+		"!dist/core/*.node",
 		"README.md",
 		"LICENSE",
 		"NOTICE"
 	],
 	"scripts": {
-		"build": "rm -rf ./dist && rollup --config rollup.config.ts",
+		"build": "pnpm build:rust && pnpm build:ts && pnpm build:loader",
+		"clean": "node scripts/clean.mjs",
+		"release": "pnpm clean && pnpm build:native && pnpm test && pnpm build:all && pnpm build:ts && pnpm build:loader && node -e \"console.log('\\n✓ ready to publish — run:\\n  (cd rust/crates/compilecat_napi && napi prepublish -t npm)   # @compilecat/core-*\\n  npm publish --access public                                # compilecat')\"",
+		"build:ts": "rm -rf ./dist && rollup --config rollup.config.ts",
+		"build:loader": "mkdir -p dist/core && cp rust/crates/compilecat_napi/index.js rust/crates/compilecat_napi/index.d.ts dist/core/ && node -e \"require('fs').writeFileSync('dist/core/package.json', JSON.stringify({ type: 'commonjs' }))\" && (cp rust/crates/compilecat_napi/*.node dist/core/ 2>/dev/null || true)",
+		"build:all": "node scripts/build-all.mjs",
+		"build:rust": "pnpm build:native && pnpm build:wasm",
+		"build:native": "pnpm -C rust/crates/compilecat_napi run build",
+		"build:native:debug": "pnpm -C rust/crates/compilecat_napi run build:debug",
+		"build:wasm": "wasm-pack build rust/crates/compilecat_wasm --target web --release",
+		"build:wasm:debug": "wasm-pack build rust/crates/compilecat_wasm --target web --dev",
 		"format": "biome format --write src/. tst/.",
 		"lint": "biome lint --write src/. tst/.",
-		"test": "vitest"
+		"test": "pnpm test:rust && pnpm test:js",
+		"test:rust": "cargo test --manifest-path rust/Cargo.toml -p compilecat_core",
+		"test:js": "vitest run",
+		"version:all": "node scripts/bump-version.mjs"
 	},
 	"devDependencies": {
-		"@babel/generator": "^7.28.5",
-		"@babel/parser": "^7.28.5",
-		"@babel/traverse": "^7.28.5",
-		"@babel/types": "^7.28.5",
 		"@biomejs/biome": "^2.2.0",
 		"@rollup/plugin-node-resolve": "^16.0.1",
 		"@rollup/plugin-typescript": "^12.1.4",
-		"@types/babel__generator": "^7.27.0",
-		"@types/babel__traverse": "^7.28.0",
+		"@rollup/pluginutils": "^5.4.0",
 		"@types/node": "latest",
 		"chalk": "^5.6.2",
 		"esbuild": "^0.25.10",
+		"rolldown": "^1.1.1",
 		"rollup": "^4.46.2",
 		"rollup-plugin-copy": "^3.5.0",
 		"rollup-plugin-esbuild": "^6.2.1",
@@ -62,10 +76,15 @@
 		"vitest": "^3.2.4"
 	},
 	"peerDependencies": {
-		"@babel/parser": "^7.26.3",
-		"@babel/traverse": "^7.26.4",
-		"@babel/types": "^7.26.3",
 		"rollup": "^4.0.0"
+	},
+	"optionalDependencies": {
+		"@compilecat/core-darwin-arm64": "0.0.1",
+		"@compilecat/core-darwin-x64": "0.0.1",
+		"@compilecat/core-linux-x64-gnu": "0.0.1",
+		"@compilecat/core-linux-arm64-gnu": "0.0.1",
+		"@compilecat/core-win32-x64-msvc": "0.0.1",
+		"@compilecat/core-wasm32-wasi": "0.0.1"
 	},
 	"packageManager": "pnpm@9.15.3+sha512.1f79bc245a66eb0b07c5d4d83131240774642caaa86ef7d0434ab47c0d16f66b04e21e0c086eb61e62c77efc4d7f7ec071afad3796af64892fae66509173893a"
 }
