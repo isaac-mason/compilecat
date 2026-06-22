@@ -41,6 +41,7 @@
 	"scripts": {
 		"build": "pnpm build:rust && pnpm build:ts && pnpm build:loader",
 		"clean": "node scripts/clean.mjs",
+		"release:publish": "node scripts/publish.mjs",
 		"release": "pnpm clean && pnpm build:native && pnpm test && pnpm build:all && pnpm build:ts && pnpm build:loader && node -e \"console.log('\\n✓ ready to publish — run:\\n  (cd rust/crates/compilecat_napi && napi prepublish -t npm)   # @compilecat/core-*\\n  npm publish --access public                                # compilecat')\"",
 		"build:ts": "rm -rf ./dist && rollup --config rollup.config.ts",
 		"build:loader": "mkdir -p dist/core && cp rust/crates/compilecat_napi/index.js rust/crates/compilecat_napi/index.d.ts dist/core/ && node -e \"require('fs').writeFileSync('dist/core/package.json', JSON.stringify({ type: 'commonjs' }))\" && (cp rust/crates/compilecat_napi/*.node dist/core/ 2>/dev/null || true)",
