@@ -101,7 +101,10 @@ impl<'a> Flattener<'a> {
         let mut avoid = collect_all_names(list);
         avoid.extend(scope_seed.iter().cloned());
         let mut scope = scope_seed;
-        self.rename_list(list, &mut scope, &mut avoid);
+        // Function body is a merging list (no enclosing scope to shadow): empty
+        // `seed`, so a `let x` redeclaring a param renames unconditionally.
+        let no_seed = HashSet::new();
+        self.rename_list(list, &mut scope, &no_seed, &mut avoid);
         self.merge_list(list);
     }
 
@@ -111,13 +114,16 @@ impl<'a> Flattener<'a> {
     /// already committed to it (`scope`), top-down. A bare block shares this scope
     /// (phase 2 lifts it in), so its bindings are renamed against the same set;
     /// control-flow bodies, switch, try and hoisted-decl blocks each open their
-    /// own child scope — their bindings stay nested and never collide here, so
-    /// they keep their names (cleaner output than a function-wide pass). `avoid`
-    /// is the function-wide set used only to pick collision-free fresh names.
+    /// own child scope SEEDED with this one (`rename_child_scope`), so a child
+    /// binding that *shadows* an enclosing name is renamed (it would otherwise put
+    /// the block in that name's TDZ — see `rename_child_scope`) while a child
+    /// binding with a fresh name keeps it. `avoid` is the function-wide set used
+    /// only to pick collision-free fresh names.
     fn rename_list(
         &mut self,
         list: &mut oxc_allocator::Vec<'a, Statement<'a>>,
         scope: &mut HashSet<String>,
+        seed: &HashSet<String>,
         avoid: &mut HashSet<String>,
     ) {
         // This list's own top-level lexical bindings, in source order. Track the
@@ -131,17 +137,34 @@ impl<'a> Flattener<'a> {
         // each rename must be scoped to the statements from its declarator
         // onward: references after a redeclaration bind to the later declarator;
         // the earlier one keeps its name.
+        //
+        // `seed` is the subset of `scope` made of NON-merging *enclosing* bindings
+        // (a child scope's parent — see `rename_child_scope`); empty for a merging
+        // list (function body / bare block), where every collision must rename. A
+        // collision with a `seed` name that this list hasn't itself re-declared is
+        // a pure *shadow* the block scoping already isolates — it only needs
+        // renaming when an earlier statement references the enclosing binding (the
+        // reference would otherwise fall into the shadow's TDZ). A shadow with no
+        // prior reference keeps its clean name.
+        let mut declared_here: HashSet<String> = HashSet::new();
         let mut renames: Vec<(String, String, usize)> = Vec::new();
         for (i, stmt) in list.iter().enumerate() {
             for name in top_level_lexical_bindings(stmt) {
-                if scope.contains(&name) {
+                let collides = scope.contains(&name);
+                let pure_shadow =
+                    collides && seed.contains(&name) && !declared_here.contains(&name);
+                let needs_rename =
+                    collides && (!pure_shadow || references_name_before(list, i, &name));
+                if needs_rename {
                     let fresh = pick_fresh(&name, avoid);
                     avoid.insert(fresh.clone());
                     scope.insert(fresh.clone());
+                    declared_here.insert(fresh.clone());
                     renames.push((name, fresh, i));
                 } else {
                     avoid.insert(name.clone());
-                    scope.insert(name);
+                    scope.insert(name.clone());
+                    declared_here.insert(name);
                 }
             }
         }
@@ -171,24 +194,27 @@ impl<'a> Flattener<'a> {
         avoid: &mut HashSet<String>,
     ) {
         match stmt {
-            // Bare block: merges into the current scope (phase 2), so share it.
+            // Bare block: merges into the current scope (phase 2), so share it —
+            // its bindings join this scope, so every collision must rename (empty
+            // `seed`).
             Statement::BlockStatement(b) if !block_has_hoisted_decl(&b.body) => {
-                self.rename_list(&mut b.body, scope, avoid)
+                let no_seed = HashSet::new();
+                self.rename_list(&mut b.body, scope, &no_seed, avoid)
             }
             // Hoisted-decl block: kept intact → its own child scope.
-            Statement::BlockStatement(b) => self.rename_child_scope(&mut b.body, avoid),
+            Statement::BlockStatement(b) => self.rename_child_scope(&mut b.body, scope, avoid),
             Statement::IfStatement(s) => {
-                self.rename_body_childscope(&mut s.consequent, avoid);
+                self.rename_body_childscope(&mut s.consequent, scope, avoid);
                 if let Some(alt) = &mut s.alternate {
-                    self.rename_body_childscope(alt, avoid);
+                    self.rename_body_childscope(alt, scope, avoid);
                 }
             }
-            Statement::ForStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
-            Statement::ForInStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
-            Statement::ForOfStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
-            Statement::WhileStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
-            Statement::DoWhileStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
-            Statement::LabeledStatement(s) => self.rename_body_childscope(&mut s.body, avoid),
+            Statement::ForStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            Statement::ForInStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            Statement::ForOfStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            Statement::WhileStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            Statement::DoWhileStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            Statement::LabeledStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
             Statement::SwitchStatement(s) => {
                 // Each case gets its own scope: phase 2 keeps a case's top-level
                 // block (it scopes that case's bindings — see the merge's
@@ -197,48 +223,63 @@ impl<'a> Flattener<'a> {
                 // shared switch scope) avoids minting needless `x$1` cross-case
                 // suffixes — each case keeps its clean names.
                 for case in &mut s.cases {
-                    let mut cs = HashSet::new();
-                    self.rename_list(&mut case.consequent, &mut cs, avoid);
+                    let mut cs = scope.clone();
+                    self.rename_list(&mut case.consequent, &mut cs, scope, avoid);
                 }
             }
             Statement::TryStatement(s) => {
-                self.rename_child_scope(&mut s.block.body, avoid);
+                self.rename_child_scope(&mut s.block.body, scope, avoid);
                 if let Some(handler) = &mut s.handler {
                     // The catch param is in the handler body's lexical scope.
-                    let mut h = HashSet::new();
+                    let mut h = scope.clone();
                     if let Some(p) = &handler.param {
                         let mut names = Vec::new();
                         collect_pattern_names(&p.pattern, &mut names);
                         h.extend(names);
                     }
-                    self.rename_list(&mut handler.body.body, &mut h, avoid);
+                    self.rename_list(&mut handler.body.body, &mut h, scope, avoid);
                 }
                 if let Some(finalizer) = &mut s.finalizer {
-                    self.rename_child_scope(&mut finalizer.body, avoid);
+                    self.rename_child_scope(&mut finalizer.body, scope, avoid);
                 }
             }
             _ => {} // expression statements (incl. nested functions) — own scopes
         }
     }
 
-    /// Recurse into a child scope: a fresh lexical set (so its bindings don't
-    /// collide with — or get renamed against — the parent's), sharing `avoid`.
+    /// Recurse into a child scope, SEEDED with the parent's in-scope bindings
+    /// (`parent`). A child `let x`/`const x` that shadows an enclosing binding
+    /// (e.g. an inlined helper's `let out` inside a loop, shadowing the host's
+    /// `out` param) must be renamed: otherwise the shadow puts the *whole* child
+    /// block in `x`'s TDZ, so an earlier reference to the enclosing `x` throws
+    /// `Cannot access 'x' before initialization`. Seeding makes such a binding a
+    /// collision; `rename_list` renames it (and its later uses) while leaving the
+    /// earlier enclosing-`x` references untouched. Non-shadowing child bindings
+    /// don't collide, so they keep their names.
     fn rename_child_scope(
         &mut self,
         list: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+        parent: &HashSet<String>,
         avoid: &mut HashSet<String>,
     ) {
-        let mut scope = HashSet::new();
-        self.rename_list(list, &mut scope, avoid);
+        let mut scope = parent.clone();
+        self.rename_list(list, &mut scope, parent, avoid);
     }
 
     /// A control-flow body: if a block, its contents are a child scope; otherwise
-    /// recurse into whatever child scopes the single statement contains.
-    fn rename_body_childscope(&mut self, stmt: &mut Statement<'a>, avoid: &mut HashSet<String>) {
+    /// recurse into whatever child scopes the single statement contains. Threads
+    /// the parent scope through so shadowing bindings are renamed (see
+    /// `rename_child_scope`).
+    fn rename_body_childscope(
+        &mut self,
+        stmt: &mut Statement<'a>,
+        parent: &HashSet<String>,
+        avoid: &mut HashSet<String>,
+    ) {
         if let Statement::BlockStatement(b) = stmt {
-            self.rename_child_scope(&mut b.body, avoid);
+            self.rename_child_scope(&mut b.body, parent, avoid);
         } else {
-            let mut scope = HashSet::new();
+            let mut scope = parent.clone();
             self.rename_child_scopes(stmt, &mut scope, avoid);
         }
     }
@@ -344,6 +385,33 @@ fn collect_all_names(list: &[Statement]) -> HashSet<String> {
         oxc_ast_visit::Visit::visit_statement(&mut v, s);
     }
     v.names
+}
+
+/// `true` if `name` occurs as an identifier *reference* anywhere in `list[..end]`.
+/// A shadowing `let name`/`const name` at index `end` puts its whole block in
+/// `name`'s TDZ, so such a prior reference (which meant the enclosing binding)
+/// would throw — the shadow must be renamed. Conservative: counts references in
+/// nested functions too (renaming them is always safe).
+fn references_name_before(list: &[Statement], end: usize, name: &str) -> bool {
+    struct V<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a> oxc_ast_visit::Visit<'a> for V<'_> {
+        fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+            if id.name == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut v = V { name, found: false };
+    for s in &list[..end] {
+        oxc_ast_visit::Visit::visit_statement(&mut v, s);
+        if v.found {
+            return true;
+        }
+    }
+    false
 }
 
 fn merge_body<'a>(f: &mut Flattener<'a>, stmt: &mut Statement<'a>) {
