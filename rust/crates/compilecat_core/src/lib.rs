@@ -271,15 +271,16 @@ mod tests {
     }
 
     #[test]
-    fn inline_duplicated_side_effect_arg_falls_back_to_block() {
-        // `g()` (impure) used twice → DIRECT bails; BLOCK fallback hoists it from
-        // the `return` (expression) position, evaluating `g()` exactly once.
+    fn inline_duplicated_side_effect_arg_binds_as_const() {
+        // `g()` (impure) used twice → the DIRECT path binds it to an init-position
+        // `const _inl_arg_N` from the `return` (expression) position, evaluating
+        // `g()` exactly once.
         let out = inline(
             "/* @inline */ function twice(a) { return a + a; }\nexport function s() { return twice(g()); }\n",
         );
-        assert!(!out.contains("twice(g())"), "inlined via fallback: {out}");
+        assert!(!out.contains("twice(g())"), "inlined: {out}");
         assert_eq!(out.matches("g()").count(), 1, "side effect evaluated once: {out}");
-        assert!(out.contains("a + a"), "body spliced: {out}");
+        assert!(out.contains("_inl_arg"), "arg bound to an init-position const: {out}");
     }
 
     fn unroll(src: &str) -> String {

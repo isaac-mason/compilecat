@@ -127,6 +127,8 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
                 allocator,
                 candidates: &all_direct,
                 count: 0,
+                next_id: 0,
+                hoists: Vec::new(),
                 trigger: Some(inline_spans.clone()),
                 local_names: local_names.clone(),
             };
@@ -275,16 +277,20 @@ pub(crate) fn flatten_into_hosts<'a>(
             _ => None,
         };
         let Some(body) = body else { continue };
+        let mut direct_id = 0u32;
         if !direct.is_empty() {
             let mut di = Inliner {
                 allocator,
                 candidates: direct,
                 count: 0,
+                next_id: direct_id,
+                hoists: Vec::new(),
                 trigger: None,
                 local_names: local_names.clone(),
             };
             di.visit_function_body(body);
             count += di.count;
+            direct_id = di.next_id;
         }
         if !block.is_empty() {
             let mut bi = BlockInliner {
@@ -298,6 +304,26 @@ pub(crate) fn flatten_into_hosts<'a>(
             bi.visit_function_body(body);
             count += bi.count;
             next_id = bi.next_id;
+            // Second DIRECT pass: inline single-return helpers (e.g. `len`) that
+            // the BLOCK pass just spliced in from a multi-statement callee's body
+            // (`normalize`). A single DIRECT-then-BLOCK ordering leaves those
+            // un-inlined, keeping any aggregate they read-whole alive past SROA.
+            // One extra pass resolves one level of BLOCK→DIRECT nesting; it can't
+            // expand a recursive callee (DIRECT recursion still inlines one level
+            // per pass). `direct_id` continues so arg-binding temps stay unique.
+            if !direct.is_empty() {
+                let mut di = Inliner {
+                    allocator,
+                    candidates: direct,
+                    count: 0,
+                    next_id: direct_id,
+                    hoists: Vec::new(),
+                    trigger: None,
+                    local_names: local_names.clone(),
+                };
+                di.visit_function_body(body);
+                count += di.count;
+            }
         }
     }
     count
@@ -430,6 +456,8 @@ pub(crate) fn inline_with<'a>(
             allocator,
             candidates: direct,
             count: 0,
+            next_id: 0,
+            hoists: Vec::new(),
             trigger: None,
             local_names: local_names.clone(),
         };
@@ -1578,6 +1606,15 @@ struct Inliner<'a, 'c> {
     allocator: &'a Allocator,
     candidates: &'c HashMap<String, Candidate<'a>>,
     count: u32,
+    /// Fresh-id counter for arg-binding temps (`_inl_arg_<id>`) — monotonic per
+    /// pass so the names are unique within it. The `_inl_arg_` prefix never
+    /// collides with BLOCK temps; any cross-pass collision (only possible with a
+    /// program mixing @optimize/@flatten/call-site @inline) is uniquified by the
+    /// block_flatten renamer, like all other inline-generated bindings.
+    next_id: u32,
+    /// Arg-binding `const _inl_arg_<id> = <arg>;` statements to splice before the
+    /// statement currently being walked (drained in `visit_statements`).
+    hoists: Vec<Statement<'a>>,
     /// When `Some`, inline only calls whose span start is in the set (call-site
     /// `/* @inline */` mode). `None` = inline every candidate call.
     trigger: Option<HashSet<u32>>,
@@ -1586,21 +1623,45 @@ struct Inliner<'a, 'c> {
 }
 
 impl<'a> VisitMut<'a> for Inliner<'a, '_> {
-    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
-        walk_mut::walk_expression(self, expr);
-
-        let replacement = if let Expression::CallExpression(call) = &*expr {
-            if triggered(&self.trigger, call) {
-                call_key(call)
-                    .and_then(|k| self.candidates.get(k.as_str()))
-                    .and_then(|cand| self.build_inlined(cand, call))
-            } else {
-                None
+    /// Walk each statement, then splice in any arg-binding hoists its calls
+    /// produced (in front of it, in evaluation order). `take`/`replace` around the
+    /// walk scopes the buffer so a nested block's hoists go into the nested block,
+    /// not this list.
+    fn visit_statements(&mut self, stmts: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        let ast = AstBuilder::new(self.allocator);
+        let taken = std::mem::replace(stmts, ast.vec());
+        let mut out = ast.vec_with_capacity(taken.len());
+        for mut stmt in taken {
+            let saved = std::mem::take(&mut self.hoists);
+            walk_mut::walk_statement(self, &mut stmt);
+            let mine = std::mem::replace(&mut self.hoists, saved);
+            for h in mine {
+                out.push(h);
             }
-        } else {
-            None
-        };
+            out.push(stmt);
+        }
+        *stmts = out;
+    }
 
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expr); // inner calls inline first (eval order)
+
+        let Expression::CallExpression(call) = &*expr else { return };
+        if !triggered(&self.trigger, call) {
+            return;
+        }
+        let Some(key) = call_key(call) else { return };
+        let Some(cand) = self.candidates.get(key.as_str()) else { return };
+        // Disjoint field borrows: `cand` ← self.candidates, `&mut self.next_id`,
+        // `&mut self.hoists`, `&self.local_names`, `self.allocator`.
+        let replacement = build_inlined(
+            self.allocator,
+            cand,
+            call,
+            &self.local_names,
+            &mut self.next_id,
+            &mut self.hoists,
+        );
         if let Some(v) = replacement {
             *expr = v;
             self.count += 1;
@@ -1613,81 +1674,77 @@ fn triggered(trigger: &Option<HashSet<u32>>, call: &CallExpression) -> bool {
     trigger.as_ref().is_none_or(|t| t.contains(&call.span.start))
 }
 
-impl<'a> Inliner<'a, '_> {
-    fn build_inlined(
-        &self,
-        cand: &Candidate<'a>,
-        call: &CallExpression<'a>,
-    ) -> Option<Expression<'a>> {
-        if call.arguments.iter().any(Argument::is_spread) {
-            return None;
-        }
-        if call.arguments.len() > cand.params.len() {
-            return None; // ignore extras for v1
-        }
-        // Capture guard (see `build_block_plan`): a donor free var colliding with
-        // a consumer-local binding would be captured after splicing.
-        if !cand.free.is_disjoint(&self.local_names) {
-            return None;
-        }
-
-        // Map param name → arg expression (None → undefined).
-        let mut subs: HashMap<&str, Option<&Expression<'a>>> = HashMap::new();
-        for (i, p) in cand.params.iter().enumerate() {
-            subs.insert(p.as_str(), call.arguments.get(i).map(Argument::to_expression));
-        }
-
-        // An arg used more than once is substituted into each site, so it's
-        // re-evaluated N times instead of once. That's only sound when eval-N ≡
-        // eval-once:
-        //   - a pure arg (identifier / literal / pure expr): always.
-        //   - a member-read arg (`shape.halfExtents`) when the body is
-        //     side-effect-free: nothing between the reads can change the value
-        //     or be re-triggered, so re-reading is equivalent (the getter-free
-        //     assumption — getters assumed side-effect-free). This keeps the
-        //     DIRECT path — `f(shape.halfExtents)` inlines to `…halfExtents[0]…
-        //     halfExtents[1]…` with no result temp — instead of falling to BLOCK.
-        // Otherwise (a call/`new`/array/object arg, or a side-effecting body),
-        // bail to BLOCK, whose temp prologue evaluates the arg exactly once.
-        let uses = count_uses(&cand.value, &cand.params);
-        let body_side_effect_free = is_side_effect_free(&cand.value);
-        for (i, p) in cand.params.iter().enumerate() {
-            if let Some(arg) = call.arguments.get(i).map(Argument::to_expression) {
-                let multi_use = uses.get(p.as_str()).copied().unwrap_or(0) > 1;
-                let dup_safe =
-                    is_pure(arg) || (body_side_effect_free && is_pure_with_member_reads(arg));
-                if multi_use && !dup_safe {
-                    return None;
-                }
-            }
-        }
-
-        let mut value = cand.value.clone_in(self.allocator);
-        let mut subst = Substitutor { allocator: self.allocator, subs: &subs };
-        subst.visit_expression(&mut value);
-        Some(value)
-    }
-}
-
-struct Substitutor<'a, 's> {
+/// Inline a DIRECT (single-`return E`) candidate at `call`, AS AN EXPRESSION.
+/// Simple args substitute straight into `E`; an arg that's used more than once
+/// and isn't safe to duplicate is bound to an init-position `const _inl_arg_N =
+/// arg;` (pushed to `hoists`) and substituted by that identifier — evaluated
+/// once, AND kept SROA-visible (the old behavior bailed to the BLOCK path's
+/// `let _r; _r = …` result temp, which SROA can't reach). Returns the
+/// substituted return expression to replace the call with.
+fn build_inlined<'a>(
     allocator: &'a Allocator,
-    subs: &'s HashMap<&'s str, Option<&'s Expression<'a>>>,
-}
-
-impl<'a> VisitMut<'a> for Substitutor<'a, '_> {
-    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
-        if let Expression::Identifier(id) = &*expr {
-            if let Some(arg) = self.subs.get(id.name.as_str()) {
-                *expr = match arg {
-                    Some(e) => e.clone_in(self.allocator),
-                    None => oxc_ast::AstBuilder::new(self.allocator)
-                        .expression_identifier(oxc_span::SPAN, "undefined"),
-                };
-                return; // don't recurse into the substituted arg
-            }
-        }
-        walk_mut::walk_expression(self, expr);
+    cand: &Candidate<'a>,
+    call: &CallExpression<'a>,
+    local_names: &HashSet<String>,
+    next_id: &mut u32,
+    hoists: &mut Vec<Statement<'a>>,
+) -> Option<Expression<'a>> {
+    if call.arguments.iter().any(Argument::is_spread) {
+        return None;
     }
+    if call.arguments.len() > cand.params.len() {
+        return None; // ignore extras for v1
+    }
+    // Capture guard (see `build_block_plan`): a donor free var colliding with a
+    // consumer-local binding would be captured after splicing.
+    if !cand.free.is_disjoint(local_names) {
+        return None;
+    }
+
+    let ast = AstBuilder::new(allocator);
+    // An arg used more than once is substituted into each site → re-evaluated N
+    // times. Sound only when eval-N ≡ eval-once: a pure arg, or a member-read arg
+    // (`shape.halfExtents`) when the body is side-effect-free. Otherwise (a
+    // call/`new`/array/object arg, or a side-effecting body) the arg must be
+    // evaluated once — bind it to an init-position const here (vs the BLOCK
+    // path's `let _r; _r = …` temp) so it stays SROA-visible.
+    let uses = count_uses(&cand.value, &cand.params);
+    let body_side_effect_free = is_side_effect_free(&cand.value);
+    let mut subs: HashMap<String, Expression<'a>> = HashMap::new();
+    for (i, p) in cand.params.iter().enumerate() {
+        let Some(arg) = call.arguments.get(i).map(Argument::to_expression) else {
+            subs.insert(p.clone(), ast.expression_identifier(oxc_span::SPAN, "undefined"));
+            continue;
+        };
+        let multi_use = uses.get(p.as_str()).copied().unwrap_or(0) > 1;
+        let dup_safe = is_pure(arg) || (body_side_effect_free && is_pure_with_member_reads(arg));
+        if multi_use && !dup_safe {
+            let name: &'a str = allocator.alloc_str(&format!("_inl_arg_{}", *next_id));
+            *next_id += 1;
+            let declr = ast.variable_declarator(
+                oxc_span::SPAN,
+                VariableDeclarationKind::Const,
+                ast.binding_pattern_binding_identifier(oxc_span::SPAN, name),
+                oxc_ast::NONE,
+                Some(arg.clone_in(allocator)),
+                false,
+            );
+            hoists.push(Statement::VariableDeclaration(ast.alloc(ast.variable_declaration(
+                oxc_span::SPAN,
+                VariableDeclarationKind::Const,
+                ast.vec1(declr),
+                false,
+            ))));
+            subs.insert(p.clone(), ast.expression_identifier(oxc_span::SPAN, name));
+        } else {
+            subs.insert(p.clone(), arg.clone_in(allocator));
+        }
+    }
+
+    let mut value = cand.value.clone_in(allocator);
+    let mut subst = OwnedSubstitutor { allocator, subs: &subs };
+    subst.visit_expression(&mut value);
+    Some(value)
 }
 
 // ── analysis helpers ────────────────────────────────────────────────────────
@@ -1824,15 +1881,17 @@ mod tests {
     }
 
     #[test]
-    fn direct_falls_back_to_block_for_side_effecting_arg_used_twice() {
-        // `a` used twice + impure arg → DIRECT bails → BLOCK fallback evaluates
-        // the arg once via the temp prologue.
+    fn direct_binds_side_effecting_multi_use_arg_as_const() {
+        // `a` used twice + impure arg → the DIRECT path binds the arg to an
+        // init-position `const _inl_arg_N` (evaluated once, and SROA-visible) and
+        // substitutes it, instead of bailing to the BLOCK result-temp prologue.
         let out = inline(
             "/* @inline */ function twice(a) { return a + a; }\nexport function f() { let v = twice(rand()); return v; }",
         );
-        assert!(!out.contains("twice("), "call inlined via fallback:\n{out}");
+        assert!(!out.contains("twice("), "call inlined:\n{out}");
         assert_eq!(out.matches("rand()").count(), 1, "arg evaluated once:\n{out}");
-        assert!(out.contains("a + a"), "body spliced:\n{out}");
+        assert!(out.contains("_inl_arg"), "arg bound to an init-position const:\n{out}");
+        assert!(!out.contains("__result"), "no BLOCK result temp:\n{out}");
     }
 
     #[test]
