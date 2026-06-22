@@ -460,38 +460,31 @@ function render(ctx: CanvasRenderingContext2D, alpha: number): void {
 
 const CLOTH_SOURCE = `const W = self.innerWidth;
 const H = self.innerHeight;
-const N = 22;            // cloth is N×N points — drag the slider
+const N = 22;
 const SPACING = 16;
 const GRAVITY = 0.45;
 const DAMPING = 0.99;
-const ITER = 3;          // constraint relaxation passes per step
+const ITER = 3;
 
 type Vec2 = { x: number; y: number };
 type Node = { x: number; y: number; px: number; py: number; pinned: boolean };
 type Link = { a: number; b: number; rest: number };
 
-// gl-matrix style: write the result into the \`out\` arg, no allocation. Realistic
-// hot-path vector code keeps scratch buffers and mutates them in place.
-// compilecat inlines every call AND SROAs the scratch vectors away, so the
-// optimized build is flat scalar math — no vector objects, no calls.
-function sub(out: Vec2, a: Vec2, b: Vec2): void {
-  out.x = a.x - b.x;
-  out.y = a.y - b.y;
+function add(a: Vec2, b: Vec2): Vec2 {
+  return { x: a.x + b.x, y: a.y + b.y };
 }
-function add(out: Vec2, a: Vec2, b: Vec2): void {
-  out.x = a.x + b.x;
-  out.y = a.y + b.y;
+function sub(a: Vec2, b: Vec2): Vec2 {
+  return { x: a.x - b.x, y: a.y - b.y };
 }
-function scale(out: Vec2, a: Vec2, s: number): void {
-  out.x = a.x * s;
-  out.y = a.y * s;
-}
-function scaleAndAdd(out: Vec2, a: Vec2, b: Vec2, s: number): void {
-  out.x = a.x + b.x * s;
-  out.y = a.y + b.y * s;
+function scale(a: Vec2, s: number): Vec2 {
+  return { x: a.x * s, y: a.y * s };
 }
 function len(a: Vec2): number {
   return Math.sqrt(a.x * a.x + a.y * a.y);
+}
+function normalize(a: Vec2): Vec2 {
+  const l = len(a) || 1;
+  return { x: a.x / l, y: a.y / l };
 }
 
 const nodes: Node[] = [];
@@ -503,7 +496,6 @@ for (let y = 0; y < N; y++) {
   for (let x = 0; x < N; x++) {
     const nx = originX + x * SPACING;
     const ny = originY + y * SPACING;
-    // pin every 3rd node along the top row → a hanging curtain
     nodes.push({ x: nx, y: ny, px: nx, py: ny, pinned: y === 0 && x % 3 === 0 });
   }
 }
@@ -520,34 +512,44 @@ for (let y = 0; y < N; y++) {
 
 let t = 0;
 
-// Verlet integrate, gl-matrix style: a per-node @optimize fn whose scratch
-// vectors sit at the function top — exactly where SROA can reach them.
 /* @optimize */
 function integrateNode(n: Node, wind: number): void {
-  const vel: Vec2 = { x: n.x - n.px, y: n.y - n.py };
-  const force: Vec2 = { x: wind, y: GRAVITY };
-  scale(vel, vel, DAMPING);
+  const pos: Vec2 = { x: n.x, y: n.y };
+  const prev: Vec2 = { x: n.px, y: n.py };
+  const vel = scale(sub(pos, prev), DAMPING);
+  const gravity: Vec2 = { x: 0, y: GRAVITY };
+  const breeze: Vec2 = { x: wind, y: 0 };
+  const swirl = scale({ x: Math.sin(n.y * 0.05 + t * 0.05), y: Math.cos(n.x * 0.05 + t * 0.05) }, 0.05);
+  const force = add(add(gravity, breeze), swirl);
   n.px = n.x;
   n.py = n.y;
-  add(n, n, vel);   // pos += velocity
-  add(n, n, force); // pos += wind + gravity
+  const next = add(add(pos, vel), force);
+  n.x = next.x;
+  n.y = next.y;
 }
 
 /* @optimize */
 function solveLink(a: Node, b: Node, rest: number): void {
-  const delta: Vec2 = { x: 0, y: 0 }; // scratch — inlined + SROA'd away
-  sub(delta, b, a);
+  const delta = sub(b, a);
   const dist = len(delta);
   if (dist === 0) return;
-  const k = (0.5 * (rest - dist)) / dist;
-  if (!a.pinned) scaleAndAdd(a, a, delta, -k); // a -= delta * k
-  if (!b.pinned) scaleAndAdd(b, b, delta, k); //  b += delta * k
+  const dir = normalize(delta);
+  const corr = scale(dir, (rest - dist) * 0.5);
+  if (!a.pinned) {
+    const na = sub(a, corr);
+    a.x = na.x;
+    a.y = na.y;
+  }
+  if (!b.pinned) {
+    const nb = add(b, corr);
+    b.x = nb.x;
+    b.y = nb.y;
+  }
 }
 
 function step(dt: number): void {
   t += 1;
-  // gentle oscillating wind so the curtain keeps swaying
-  const wind = Math.sin(t * 0.02) * 0.35;
+  const wind = Math.sin(t * 0.05) * 0.12;
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
     if (!n.pinned) integrateNode(n, wind);
