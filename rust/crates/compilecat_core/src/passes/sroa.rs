@@ -140,6 +140,18 @@ impl<'a> Sroa<'a> {
     }
 
     fn process_scope(&mut self, body: &mut oxc_allocator::Vec<'a, Statement<'a>>, annotated: bool) {
+        // Pre-phase: collapse the inliner's single-use result temps into their
+        // alias so the value becomes an init-position aggregate SROA can collect
+        // (`let _r; … _r = {…}; const x = _r;` → `… const x = {…};`). Then merge a
+        // deferred-init aggregate (`let v; … v = {…};` with no read before the
+        // single store) into init position (`… let v = {…};`) so a deferred
+        // aggregate read field-wise more than once — which the collapse can't
+        // reach — also becomes collectible. Both canonicalize to the init-position
+        // form the existing collection/escape/rewrite already handle.
+        if annotated {
+            self.collapse_result_temps(body);
+            self.merge_deferred_init(body);
+        }
         let safe = self.collect_safe(body, annotated);
         if safe.is_empty() {
             return;
@@ -160,6 +172,162 @@ impl<'a> Sroa<'a> {
         let mut by_addr: HashMap<Address, SafeCand<'a>> =
             safe.into_iter().map(|c| (c.decl_addr, c)).collect();
         self.rewrite_decls(body, &mut by_addr);
+    }
+
+    /// Collapse the inliner's single-use result temps: `let v; … v = E; <…v…>`
+    /// where `v` is assigned exactly once, read exactly once (in the statement
+    /// immediately after the assignment), and used nowhere else → substitute `E`
+    /// at the read and drop the `let v;` + `v = E;`. The inliner emits exactly
+    /// this for an expression-position BLOCK inline (the temp aliases the call's
+    /// value at one site); after block_flatten the three sit in one list. The
+    /// resulting `const x = E` is an init-position aggregate the existing
+    /// collection scalarizes — no use-def collection needed for this case.
+    fn collapse_result_temps(&mut self, list: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        // Nested blocks first (a temp inside an `if`/loop body).
+        for stmt in list.iter_mut() {
+            match stmt {
+                Statement::BlockStatement(b) => self.collapse_result_temps(&mut b.body),
+                Statement::IfStatement(s) => {
+                    self.collapse_body(&mut s.consequent);
+                    if let Some(alt) = &mut s.alternate {
+                        self.collapse_body(alt);
+                    }
+                }
+                Statement::ForStatement(s) => self.collapse_body(&mut s.body),
+                Statement::ForInStatement(s) => self.collapse_body(&mut s.body),
+                Statement::ForOfStatement(s) => self.collapse_body(&mut s.body),
+                Statement::WhileStatement(s) => self.collapse_body(&mut s.body),
+                Statement::DoWhileStatement(s) => self.collapse_body(&mut s.body),
+                Statement::LabeledStatement(s) => self.collapse_body(&mut s.body),
+                Statement::SwitchStatement(s) => {
+                    for c in s.cases.iter_mut() {
+                        self.collapse_result_temps(&mut c.consequent);
+                    }
+                }
+                Statement::TryStatement(s) => {
+                    self.collapse_result_temps(&mut s.block.body);
+                    if let Some(h) = &mut s.handler {
+                        self.collapse_result_temps(&mut h.body.body);
+                    }
+                    if let Some(f) = &mut s.finalizer {
+                        self.collapse_result_temps(&mut f.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Then this level, repeatedly (one collapse can't enable another here, but
+        // there may be several independent temps).
+        while let Some((di, ai, name)) = find_collapsible_temp(list) {
+            // Take `E` out of the assignment `v = E;` at `ai`.
+            let e = {
+                let Statement::ExpressionStatement(es) = &mut list[ai] else { break };
+                let Expression::AssignmentExpression(asgn) = &mut es.expression else { break };
+                asgn.right.take_in(self.alloc())
+            };
+            // Substitute it at the single read in the next statement.
+            let mut sub = SingleIdentSub { name: &name, value: Some(e) };
+            sub.visit_statement(&mut list[ai + 1]);
+            // Drop `let v;` (di) and `v = E;` (ai).
+            let taken = list.take_in(self.alloc());
+            let mut out = self.ast.vec_with_capacity(taken.len().saturating_sub(2));
+            for (i, s) in taken.into_iter().enumerate() {
+                if i != di && i != ai {
+                    out.push(s);
+                }
+            }
+            *list = out;
+        }
+    }
+
+    /// Collapse temps inside a single-statement body that's actually a block.
+    fn collapse_body(&mut self, body: &mut Statement<'a>) {
+        if let Statement::BlockStatement(b) = body {
+            self.collapse_result_temps(&mut b.body);
+        }
+    }
+
+    /// Merge a deferred-init aggregate into init position: `let v; … v = {…};`
+    /// (a single store, no read of `v` before it) → drop the `let v;` and turn the
+    /// store into `let v = {…};` in place. The existing collection then scalarizes
+    /// the init-position aggregate, including the multi-field-read case the
+    /// single-use `collapse_result_temps` can't reach. Single store + no prior read
+    /// makes relocating the declaration to the store site unobservable (Stage 1 —
+    /// conditional/multi-store aggregates need CFG; see follow_ups.md).
+    fn merge_deferred_init(&mut self, list: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        for stmt in list.iter_mut() {
+            match stmt {
+                Statement::BlockStatement(b) => self.merge_deferred_init(&mut b.body),
+                Statement::IfStatement(s) => {
+                    self.merge_deferred_body(&mut s.consequent);
+                    if let Some(alt) = &mut s.alternate {
+                        self.merge_deferred_body(alt);
+                    }
+                }
+                Statement::ForStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::ForInStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::ForOfStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::WhileStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::DoWhileStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::LabeledStatement(s) => self.merge_deferred_body(&mut s.body),
+                Statement::SwitchStatement(s) => {
+                    for c in s.cases.iter_mut() {
+                        self.merge_deferred_init(&mut c.consequent);
+                    }
+                }
+                Statement::TryStatement(s) => {
+                    self.merge_deferred_init(&mut s.block.body);
+                    if let Some(h) = &mut s.handler {
+                        self.merge_deferred_init(&mut h.body.body);
+                    }
+                    if let Some(f) = &mut s.finalizer {
+                        self.merge_deferred_init(&mut f.body);
+                    }
+                }
+                _ => {}
+            }
+        }
+        while let Some((di, ai)) = find_deferred_init(list) {
+            // Turn the store `v = {…};` at `ai` into `let v = {…};`.
+            let new_decl = {
+                let Statement::ExpressionStatement(es) = &mut list[ai] else { break };
+                let Expression::AssignmentExpression(asgn) = &mut es.expression else { break };
+                let AssignmentTarget::AssignmentTargetIdentifier(id) = &asgn.left else { break };
+                let name = id.name;
+                let e = asgn.right.take_in(self.alloc());
+                let bid = self.ast.binding_pattern_binding_identifier(SPAN, name);
+                let declr = self.ast.variable_declarator(
+                    SPAN,
+                    VariableDeclarationKind::Let,
+                    bid,
+                    NONE,
+                    Some(e),
+                    false,
+                );
+                Statement::VariableDeclaration(self.ast.alloc(self.ast.variable_declaration(
+                    SPAN,
+                    VariableDeclarationKind::Let,
+                    self.ast.vec1(declr),
+                    false,
+                )))
+            };
+            list[ai] = new_decl;
+            // Drop the now-redundant `let v;` at `di`.
+            let taken = list.take_in(self.alloc());
+            let mut out = self.ast.vec_with_capacity(taken.len().saturating_sub(1));
+            for (i, s) in taken.into_iter().enumerate() {
+                if i != di {
+                    out.push(s);
+                }
+            }
+            *list = out;
+        }
+    }
+
+    fn merge_deferred_body(&mut self, body: &mut Statement<'a>) {
+        if let Statement::BlockStatement(b) = body {
+            self.merge_deferred_init(&mut b.body);
+        }
     }
 
     /// Replace each candidate declarator (located by its arena address) with its
@@ -227,8 +395,14 @@ impl<'a> Sroa<'a> {
             ));
         };
         for (d, cand) in declarations.into_iter().zip(cands.into_iter()) {
-            if let Some(cand) = cand {
+            if let Some(mut cand) = cand {
                 flush(self, &mut kept, out);
+                // Rebuild the scalar initializers from the LIVE declarator — the
+                // access-rewrite phase has already updated it in place — rather
+                // than the copy captured at collect time (pre-rewrite). See
+                // `reinit_from_live`.
+                let was_literal = matches!(cand.init, SroaInit::Literal(_));
+                cand.init = self.reinit_from_live(&d, was_literal);
                 out.push(self.scalar_decl(cand));
                 self.count += 1;
             } else {
@@ -283,6 +457,40 @@ impl<'a> Sroa<'a> {
         match stmt {
             Statement::BlockStatement(b) => self.rewrite_decls(&mut b.body, by_addr),
             other => self.rewrite_decls_in_children(other, by_addr),
+        }
+    }
+
+    /// Re-derive a candidate's scalar initializers from the LIVE declarator,
+    /// which the access-rewrite phase has already updated in place — rather than
+    /// the copy captured back in `collect_safe`, which predates that rewrite.
+    ///
+    /// This matters when a candidate's initializer reads ANOTHER candidate's
+    /// field, e.g. `const na = { x: a.x - corr.x }`: the access-rewrite turns the
+    /// live `corr.x` into the scalar `corr_x`, but the pre-rewrite copy still
+    /// says `corr.x`. Emitting the scalar form from the stale copy would re-emit
+    /// `corr.x` after `corr` was itself scalarized away — a reference to a removed
+    /// binding. Keeping the live AST as the single source of truth (as LLVM's
+    /// SROA does — it rewrites the IR in place, never a shadow copy) avoids the
+    /// whole class of drift.
+    fn reinit_from_live(&self, d: &VariableDeclarator<'a>, was_literal: bool) -> SroaInit<'a> {
+        let Some(init) = &d.init else { return SroaInit::Literal(Vec::new()) };
+        if was_literal {
+            // collect_safe only accepts array/object literals here (no spreads or
+            // elisions), so every element is a plain expression.
+            let inits = match init {
+                Expression::ArrayExpression(arr) => arr
+                    .elements
+                    .iter()
+                    .map(|el| el.to_expression().clone_in(self.alloc()))
+                    .collect(),
+                Expression::ObjectExpression(obj) => {
+                    object_literal_fields(obj, self.alloc()).map_or_else(Vec::new, |(_, inits)| inits)
+                }
+                _ => Vec::new(),
+            };
+            SroaInit::Literal(inits)
+        } else {
+            SroaInit::Destructure(init.clone_in(self.alloc()))
         }
     }
 
@@ -718,6 +926,186 @@ fn declarator_addr(d: &VariableDeclarator) -> Address {
     unsafe { Address::from_ptr(d) }
 }
 
+/// Locate the first collapsible result temp in `list`: a `let v;` (no init)
+/// assigned exactly once (`v = E;`) and read exactly once, with the read in the
+/// statement immediately after the assignment. Returns (decl index, assign
+/// index, name). See `collapse_result_temps`.
+fn find_collapsible_temp(list: &[Statement]) -> Option<(usize, usize, String)> {
+    for (di, s) in list.iter().enumerate() {
+        let Statement::VariableDeclaration(vd) = s else { continue };
+        if vd.kind != VariableDeclarationKind::Let || vd.declarations.len() != 1 {
+            continue;
+        }
+        let d = &vd.declarations[0];
+        if d.init.is_some() {
+            continue;
+        }
+        let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
+        let name = id.name.as_str();
+        let (reads, writes) = count_name_uses(name, list);
+        if reads != 1 || writes != 1 {
+            continue;
+        }
+        let Some(ai) = list.iter().position(|st| is_assign_to(st, name)) else { continue };
+        if ai <= di || ai + 1 >= list.len() {
+            continue;
+        }
+        // The single read must be (solely) in the statement right after the assign.
+        if count_name_uses(name, std::slice::from_ref(&list[ai + 1])).0 != 1 {
+            continue;
+        }
+        return Some((di, ai, name.to_string()));
+    }
+    None
+}
+
+/// `true` if `stmt` is a top-level `name = <expr>;` (simple `=` assignment).
+fn is_assign_to(stmt: &Statement, name: &str) -> bool {
+    let Statement::ExpressionStatement(es) = stmt else { return false };
+    let Expression::AssignmentExpression(a) = &es.expression else { return false };
+    a.operator == AssignmentOperator::Assign
+        && matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(id) if id.name == name)
+}
+
+/// `true` if `stmt` is `name = <object|array literal>;` (the deferred aggregate
+/// store the existing collection can scalarize once it's at init position).
+fn is_literal_assign_to(stmt: &Statement, name: &str) -> bool {
+    let Statement::ExpressionStatement(es) = stmt else { return false };
+    let Expression::AssignmentExpression(a) = &es.expression else { return false };
+    a.operator == AssignmentOperator::Assign
+        && matches!(&a.left, AssignmentTarget::AssignmentTargetIdentifier(id) if id.name == name)
+        && matches!(&a.right, Expression::ObjectExpression(_) | Expression::ArrayExpression(_))
+}
+
+/// Locate the first deferred-init aggregate in `list`: a `let v;` (no init,
+/// single declarator) assigned exactly once — a `v = <literal>;` store at a later
+/// index — with no read of `v` before (or at) that store. Returns (decl index,
+/// store index). See `merge_deferred_init`.
+fn find_deferred_init(list: &[Statement]) -> Option<(usize, usize)> {
+    for (di, s) in list.iter().enumerate() {
+        let Statement::VariableDeclaration(vd) = s else { continue };
+        if vd.kind != VariableDeclarationKind::Let || vd.declarations.len() != 1 {
+            continue;
+        }
+        let d = &vd.declarations[0];
+        if d.init.is_some() {
+            continue;
+        }
+        let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
+        let name = id.name.as_str();
+        let (_reads, writes) = count_name_uses(name, list);
+        if writes != 1 {
+            continue; // a single store is what makes the relocation safe (Stage 1)
+        }
+        // A closure capturing `v` could observe it before the relocated store, and
+        // a store hidden inside a closure wouldn't be in the visible `writes`
+        // count — bail if `v` appears in any nested function at all.
+        if name_in_nested_fn(name, list) {
+            continue;
+        }
+        let Some(ai) = list.iter().position(|st| is_literal_assign_to(st, name)) else { continue };
+        if ai <= di {
+            continue;
+        }
+        // No read of `v` between the decl and the store (inclusive of the store,
+        // whose RHS literal can't read `v`) → relocating the decl is unobservable.
+        if count_name_uses(name, &list[di + 1..=ai]).0 != 0 {
+            continue;
+        }
+        return Some((di, ai));
+    }
+    None
+}
+
+/// Reads + writes of `name` across `stmts` (+ nested blocks), excluding nested
+/// functions (their own scope).
+fn count_name_uses(name: &str, stmts: &[Statement]) -> (usize, usize) {
+    struct C<'n> {
+        name: &'n str,
+        reads: usize,
+        writes: usize,
+    }
+    impl<'a> Visit<'a> for C<'_> {
+        fn visit_assignment_expression(&mut self, a: &AssignmentExpression<'a>) {
+            if let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left {
+                if id.name == self.name {
+                    self.writes += 1;
+                    if a.operator != AssignmentOperator::Assign {
+                        self.reads += 1; // compound assignment reads too
+                    }
+                }
+            } else {
+                self.visit_assignment_target(&a.left);
+            }
+            self.visit_expression(&a.right);
+        }
+        fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+            if id.name == self.name {
+                self.reads += 1;
+            }
+        }
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    }
+    let mut c = C { name, reads: 0, writes: 0 };
+    for s in stmts {
+        c.visit_statement(s);
+    }
+    (c.reads, c.writes)
+}
+
+/// `true` if `name` is referenced inside any nested function/arrow in `stmts`
+/// (a closure capture). Used to bail merges that relocate `name`'s declaration —
+/// a closure could observe it before the relocated store.
+fn name_in_nested_fn(name: &str, stmts: &[Statement]) -> bool {
+    struct C<'n> {
+        name: &'n str,
+        depth: u32,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for C<'_> {
+        fn visit_function(&mut self, f: &Function<'a>, flags: ScopeFlags) {
+            self.depth += 1;
+            walk::walk_function(self, f, flags);
+            self.depth -= 1;
+        }
+        fn visit_arrow_function_expression(&mut self, f: &ArrowFunctionExpression<'a>) {
+            self.depth += 1;
+            walk::walk_arrow_function_expression(self, f);
+            self.depth -= 1;
+        }
+        fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+            if self.depth > 0 && id.name == self.name {
+                self.found = true;
+            }
+        }
+    }
+    let mut c = C { name, depth: 0, found: false };
+    for s in stmts {
+        c.visit_statement(s);
+    }
+    c.found
+}
+
+/// Replace the first `IdentifierReference` named `name` with `value` (taken once).
+struct SingleIdentSub<'a, 'n> {
+    name: &'n str,
+    value: Option<Expression<'a>>,
+}
+impl<'a> VisitMut<'a> for SingleIdentSub<'a, '_> {
+    fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        if self.value.is_some() {
+            if let Expression::Identifier(id) = &*expr {
+                if id.name == self.name {
+                    *expr = self.value.take().unwrap();
+                    return;
+                }
+            }
+        }
+        walk_mut::walk_expression(self, expr);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +1156,27 @@ mod tests {
         // No object literal survives in `run` (both `a` and `b` were scalarized).
         assert!(!run_fn.contains("x: 0"), "object `a` not scalarized:\n{out}");
         assert!(!run_fn.contains("x: 3"), "object `b` not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn candidate_init_reading_another_candidates_field_stays_consistent() {
+        // Regression: `na`'s initializer reads `corr.x` — another candidate's
+        // field. Once both are scalarized, `na` must reference the scalar
+        // `corr_x`, not the now-removed `corr.x`. The bug emitted `na` from the
+        // copy of its init captured BEFORE the access-rewrite, leaving a dangling
+        // `corr.x` after `corr` itself was scalarized away. Fixed by rebuilding
+        // the scalar init from the live (already-rewritten) declarator.
+        let out = inline_then_sroa(
+            "type V = { x: number; y: number };\n\
+             function sub(a: V, b: V): V { return { x: a.x - b.x, y: a.y - b.y }; }\n\
+             function scale(a: V, s: number): V { return { x: a.x * s, y: a.y * s }; }\n\
+             /* @optimize */ function f(a: V, s: number, p: boolean): void {\n\
+               const corr = scale(a, s);\n\
+               if (p) { const na = sub(a, corr); a.x = na.x; a.y = na.y; }\n\
+             }",
+        );
+        assert!(!out.contains("corr."), "`corr` left as a member access (dangling):\n{out}");
+        assert!(out.contains("corr_x"), "`corr` scalarized to `corr_x`:\n{out}");
     }
 
     #[test]
