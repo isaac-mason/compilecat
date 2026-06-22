@@ -54,6 +54,16 @@ const CASES: Case[] = [
         call: 'f(21)',
     },
     {
+        // Regression: an inlined-result object used only INSIDE a conditional
+        // block, as an arg to another inlined helper. The 'corr' binding was
+        // dropped while its corr.x/.y uses survived → ReferenceError.
+        name: 'inline-result-arg-in-conditional',
+        code: `function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }
+function scale(a, s) { return { x: a.x * s, y: a.y * s }; }
+/* @optimize */ function f(a, s, p) { const corr = scale(a, s); if (p) { const na = sub(a, corr); a.x = na.x; a.y = na.y; } return a; }`,
+        call: 'JSON.stringify(f({ x: 10, y: 4 }, 2, true))',
+    },
+    {
         name: 'sroa-tuple',
         code: `/* @sroa */ function f() { const v = [1, 2, 3]; v[0] = v[1] + v[2]; return v[0]; }`,
         call: 'f()',
@@ -240,6 +250,104 @@ const CASES: Case[] = [
         name: 'optimize-block-inline-init-position',
         code: `/* @inline */ function callee(a, b) { let jv; if (a > b) { jv = a - b; } else { jv = b - a; } return jv; }\n/* @optimize */ function consumer(x, y) { const r = callee(x, y); return r; }`,
         call: 'consumer(5, 3)',
+    },
+    {
+        // Harden collapse_result_temps: a multi-statement (BLOCK) callee whose
+        // RETURN value has a side effect, read in non-leading position (right of
+        // `+`). collapse moves E back to the call's slot, so eval order must be
+        // preserved (mk('a') before mk('b')).
+        name: 'collapse-side-effecting-return-eval-order',
+        code: `let log = [];\nfunction mk(n, k) { const z = n; return { v: (log.push(k), z) }; }\n/* @optimize */ function f() { const s = mk(1, 'a').v + mk(2, 'b').v; return s + ':' + log.join(','); }`,
+        call: 'f()',
+    },
+    {
+        // Harden: the cloth shape end-to-end — multiple independent result temps,
+        // a multi-statement callee (`norm`) calling a single-return helper (`len`)
+        // that the 2nd DIRECT pass must inline, then SROA scalarizes everything.
+        name: 'collapse-cloth-nested-multi-temp',
+        code: `function sub(a, b) { return { x: a.x - b.x, y: a.y - b.y }; }\nfunction scale(a, s) { return { x: a.x * s, y: a.y * s }; }\nfunction len(a) { return Math.abs(a.x) + Math.abs(a.y); }\nfunction norm(a) { const l = len(a) || 1; return { x: a.x / l, y: a.y / l }; }\n/* @optimize */ function f(px, py) { const p = { x: px, y: py }; const d = norm(sub(p, { x: 1, y: 1 })); const sc = scale(d, 2); return sc.x + sc.y; }`,
+        call: 'f(7, 3)',
+    },
+    {
+        // Harden: a result temp collapsed inside a nested (if) block, not the
+        // function top level.
+        name: 'collapse-temp-in-nested-block',
+        code: `function mk(n) { const z = n + 1; return { v: z, w: z * 2 }; }\n/* @optimize */ function f(c, n) { let out = 0; if (c) { const r = mk(n); out = r.v + r.w; } return out; }`,
+        call: 'f(true, 5)',
+    },
+    {
+        // Harden: a recursive callee under @optimize — the 2nd DIRECT pass must
+        // stay bounded (inline a level, leave the residual self-call) and remain
+        // correct, never expand forever.
+        name: 'recursive-callee-bounded',
+        code: `function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); }\n/* @optimize */ function f() { return fact(5); }`,
+        call: 'f()',
+    },
+    {
+        // Conservatism: a deferred temp read field-wise more than once is not a
+        // single-use alias → collapse must skip it (this is the documented
+        // use-def-SROA follow-up). Behavior must be preserved regardless.
+        name: 'deferred-temp-multi-read-preserved',
+        code: `/* @optimize */ function f(p, q) { let v; v = { x: p + q, y: p - q }; const a = v.x; const b = v.y; return a * b; }`,
+        call: 'f(5, 2)',
+    },
+    {
+        // Conservatism: the read is not adjacent to the assignment (a statement
+        // sits between) → collapse must skip and preserve behavior.
+        name: 'deferred-temp-nonadjacent-read',
+        code: `/* @optimize */ function f(p) { let v; v = { x: p }; const noop = p + 1; return v.x + noop; }`,
+        call: 'f(9)',
+    },
+    {
+        // SROA Stage 1: a deferred-init aggregate (single store, a statement
+        // between decl and store, read field-wise twice) merges to init position
+        // and scalarizes. Behavior must be identical.
+        name: 'deferred-init-merge-scalarizes',
+        code: `/* @optimize */ function f(p) { let v; const k = p + 1; v = { x: k, y: k * 2 }; return v.x + v.y; }`,
+        call: 'f(5)',
+    },
+    {
+        // Conservatism: a conditionally-stored aggregate has TWO stores → Stage 1
+        // merge must skip it (Stage 3 / CFG territory). Behavior preserved.
+        name: 'deferred-init-conditional-not-merged',
+        code: `/* @optimize */ function f(c, n) { let v; if (c) { v = { x: n, y: 1 }; } else { v = { x: -n, y: 2 }; } return v.x + v.y; }`,
+        call: 'f(true, 7)',
+    },
+    {
+        // Conservatism: a deferred aggregate captured by a closure — relocating the
+        // declaration could change when the closure can observe it, so the merge
+        // must bail. Behavior preserved.
+        name: 'deferred-init-closure-capture-not-merged',
+        code: `/* @optimize */ function f(p) { let v; const get = () => v.x + v.y; v = { x: p, y: p + 1 }; return get(); }`,
+        call: 'f(4)',
+    },
+    {
+        // Two independent deferred aggregates in one scope — the merge loop must
+        // handle both.
+        name: 'deferred-init-multiple-aggregates',
+        code: `/* @optimize */ function f(p, q) { let a; let b; a = { x: p, y: p + 1 }; b = { x: q, y: q - 1 }; return a.x * b.y + a.y * b.x; }`,
+        call: 'f(3, 5)',
+    },
+    {
+        // A field-write after the store — SROA must still scalarize across the
+        // merged init + the in-place field assignment.
+        name: 'deferred-init-then-field-write',
+        code: `/* @optimize */ function f(n) { let v; v = { x: n, y: n * 2 }; v.x = v.x + 10; return v.x + v.y; }`,
+        call: 'f(4)',
+    },
+    {
+        // Conservatism: `var` (function-scoped/hoisted) is not relocated by the
+        // merge (only `let`) — behavior preserved.
+        name: 'deferred-init-var-not-merged',
+        code: `/* @optimize */ function f(n) { var v; v = { x: n, y: n + 1 }; return v.x + v.y; }`,
+        call: 'f(6)',
+    },
+    {
+        // Conservatism: a multi-declarator `let a, b;` deferred init isn't merged
+        // (the merge requires a single declarator) — behavior preserved.
+        name: 'deferred-init-multi-declarator-not-merged',
+        code: `/* @optimize */ function f(p, q) { let a, b; a = { x: p, y: 1 }; b = { x: q, y: 2 }; return a.x + b.y; }`,
+        call: 'f(3, 5)',
     },
 ];
 

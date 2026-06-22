@@ -106,3 +106,181 @@ fn perfile_mode_leaves_undirected_code_alone() {
     assert!(out.code.contains("x + 1"), "untouched:\n{}", out.code);
     assert!(!out.stats.changed(), "no-op in PerFile with no directives");
 }
+
+#[test]
+fn inline_result_object_used_in_conditional_keeps_binding() {
+    // Regression: an inlined-result object (`corr`) used only INSIDE a
+    // conditional block, as an arg to another inlined helper, had its `const
+    // corr` definition dropped while the `corr.x`/`corr.y` uses survived — a
+    // reference to an undeclared variable (ReferenceError at runtime).
+    let out = transform(
+        "type V = { x: number; y: number };\n\
+         function sub(a: V, b: V): V { return { x: a.x - b.x, y: a.y - b.y }; }\n\
+         function scale(a: V, s: number): V { return { x: a.x * s, y: a.y * s }; }\n\
+         /* @optimize */ export function f(a: V, s: number, p: boolean): V {\n\
+           const corr = scale(a, s);\n\
+           if (p) { const na = sub(a, corr); a.x = na.x; a.y = na.y; }\n\
+           return a;\n\
+         }",
+        &opts("test.ts"),
+    );
+    // A correct compile either scalarizes `corr` away (no `corr.` member access)
+    // or keeps it declared; the bug leaves `corr.x`/`.y` reads with no binding.
+    let reads_corr_member = out.code.contains("corr.");
+    let declares_corr = out.code.contains("corr =");
+    assert!(
+        !reads_corr_member || declares_corr,
+        "dropped `corr` binding — reads corr.x/.y but never declares corr:\n{}",
+        out.code
+    );
+}
+
+#[test]
+fn pure_expression_callees_inline_without_surviving_aggregates() {
+    // The functional vector style: helpers are single `return {…}` expressions
+    // called with nested-call and object-literal args. The inliner must inline
+    // them AS EXPRESSIONS (binding complex args as init-position `const a$N =
+    // arg`), never the `let _r; _r = {…}` result-temp shape — so every temporary
+    // stays init-position and SROA scalarizes it. End state: zero result temps,
+    // zero surviving value object literals.
+    let out = transform(
+        "type V = { x: number; y: number };\n\
+         function add(a: V, b: V): V { return { x: a.x + b.x, y: a.y + b.y }; }\n\
+         function sub(a: V, b: V): V { return { x: a.x - b.x, y: a.y - b.y }; }\n\
+         function scale(a: V, s: number): V { return { x: a.x * s, y: a.y * s }; }\n\
+         /* @optimize */ export function f(n: { x: number; y: number; px: number; py: number }, wind: number): void {\n\
+           const pos = { x: n.x, y: n.y };\n\
+           const prev = { x: n.px, y: n.py };\n\
+           const vel = scale(sub(pos, prev), 0.99);\n\
+           const force = add({ x: wind, y: 0.45 }, vel);\n\
+           const next = add(pos, force);\n\
+           n.x = next.x;\n\
+           n.y = next.y;\n\
+         }",
+        &opts("test.ts"),
+    );
+    assert!(
+        !out.code.contains("__result"),
+        "inliner emitted a result temp instead of inlining as an expression:\n{}",
+        out.code
+    );
+    let code = norm(&out.code);
+    // `{ x: number` is the only legitimate `{ x:` (the type alias + param type);
+    // any other is a surviving value object allocation.
+    let value_objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert_eq!(value_objs, 0, "expected zero surviving value object literals:\n{}", out.code);
+}
+
+#[test]
+fn deferred_result_temp_from_multistatement_callee_scalarizes() {
+    // `normalize` has a statement before its `return`, so it inlines via the
+    // BLOCK path as a deferred result temp: `let _r; _r = { x: …, y: … };
+    // const dir = _r;`. SROA (use-def, Stage 1) must scalarize that deferred
+    // aggregate — zero surviving object literals, zero result temps.
+    let out = transform(
+        "type V = { x: number; y: number };\n\
+         function len(a: V): number { return Math.sqrt(a.x * a.x + a.y * a.y); }\n\
+         function normalize(a: V): V { const l = len(a) || 1; return { x: a.x / l, y: a.y / l }; }\n\
+         /* @optimize */ export function f(d: V): number { const dir = normalize(d); return dir.x + dir.y; }",
+        &opts("test.ts"),
+    );
+    assert!(!out.code.contains("__result"), "deferred result temp survives:\n{}", out.code);
+    let code = norm(&out.code);
+    let value_objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert_eq!(value_objs, 0, "surviving value object literals:\n{}", out.code);
+}
+
+#[test]
+fn aggregate_through_nested_spliced_helper_scalarizes() {
+    // `delta` is an aggregate passed WHOLE to `normalize`, whose body calls
+    // `len(a)` — so after `normalize` inlines, `len(delta)` (a whole-object use)
+    // would keep `delta` alive unless that spliced single-return helper is also
+    // inlined. The per-host inliner must resolve BLOCK→DIRECT nesting → zero
+    // surviving object literals, no residual `len(` call.
+    let out = transform(
+        "type V = { x: number; y: number };\n\
+         function len(a: V): number { return Math.sqrt(a.x * a.x + a.y * a.y); }\n\
+         function normalize(a: V): V { const l = len(a) || 1; return { x: a.x / l, y: a.y / l }; }\n\
+         /* @optimize */ export function f(p: number, q: number): number {\n\
+           const delta = { x: p - q, y: p + q };\n\
+           const dir = normalize(delta);\n\
+           return dir.x + dir.y + delta.x;\n\
+         }",
+        &opts("test.ts"),
+    );
+    assert!(!out.code.contains("len("), "nested helper left un-inlined:\n{}", out.code);
+    let code = norm(&out.code);
+    let value_objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert_eq!(value_objs, 0, "surviving value object literals:\n{}", out.code);
+}
+
+#[test]
+fn deferred_aggregate_multi_field_read_scalarizes() {
+    // A deferred aggregate read field-wise more than once, with no single-use
+    // alias: `collapse_result_temps` can't touch it (two reads), so use-def SROA
+    // Stage 1 must scalarize the deferred `let v; v = {lit};` directly →
+    // `let v_x = …, v_y = …;`. Zero surviving object literals.
+    let out = transform(
+        "/* @optimize */ export function f(p: { x: number; y: number }): number {\n\
+           let v: { x: number; y: number };\n\
+           v = { x: p.x + 1, y: p.y + 1 };\n\
+           return v.x * v.y;\n\
+         }",
+        &opts("test.ts"),
+    );
+    let code = norm(&out.code);
+    let value_objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert_eq!(value_objs, 0, "deferred aggregate not scalarized:\n{}", out.code);
+}
+
+#[test]
+fn deferred_tuple_init_scalarizes() {
+    // Array (tuple) variant of the deferred merge — the `is_literal_assign_to`
+    // ArrayExpression path, scalarized by the existing tuple collection.
+    let out = transform(
+        "/* @optimize */ export function f(a: number, b: number): number {\n\
+           let v: [number, number];\n\
+           v = [a + 1, b + 1];\n\
+           return v[0] * v[1];\n\
+         }",
+        &opts("test.ts"),
+    );
+    // The array allocation must be gone (scalarized, then the single-use scalars
+    // fold into the return — identical to the init-position `const v = […]` form).
+    assert!(!out.code.contains('['), "array literal survived (not scalarized):\n{}", out.code);
+}
+
+#[test]
+fn deferred_init_in_nested_block_scalarizes() {
+    // The merge recurses into nested blocks: a `let v;` + its single store both
+    // inside an `if` body must scalarize there.
+    let out = transform(
+        "/* @optimize */ export function f(c: boolean, n: number): number {\n\
+           let out = 0;\n\
+           if (c) { let v: { x: number; y: number }; v = { x: n, y: n + 1 }; out = v.x + v.y; }\n\
+           return out;\n\
+         }",
+        &opts("test.ts"),
+    );
+    let code = norm(&out.code);
+    let objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert_eq!(objs, 0, "deferred aggregate in nested block not scalarized:\n{}", out.code);
+}
+
+#[test]
+fn deferred_var_aggregate_not_merged() {
+    // Conservative skip: the merge only relocates `let` declarations (`var` is
+    // function-scoped/hoisted — different relocation semantics), so a `var v;`
+    // deferred aggregate must NOT be merged/scalarized. Pins the kind==Let guard.
+    let out = transform(
+        "/* @optimize */ export function f(n: number): number {\n\
+           var v: { x: number; y: number };\n\
+           v = { x: n, y: n + 1 };\n\
+           return v.x + v.y;\n\
+         }",
+        &opts("test.ts"),
+    );
+    let code = norm(&out.code);
+    let value_objs = code.matches("{ x:").count() - code.matches("{ x: number").count();
+    assert!(value_objs >= 1, "var aggregate unexpectedly scalarized (merge must skip var):\n{}", out.code);
+}
