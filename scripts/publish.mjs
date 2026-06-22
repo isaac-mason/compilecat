@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const NPM = join(ROOT, 'rust/crates/compilecat_napi/npm');
+const WASM_PKG = join(ROOT, 'rust/crates/compilecat_wasm/pkg');
 const { version } = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
 const run = (dir) => execSync('npm publish --access public', { cwd: dir, stdio: 'inherit' });
@@ -28,7 +29,11 @@ for (const triple of readdirSync(NPM)) {
     run(dir);
 }
 
-// 2. the wrapper (compilecat) — optional-deps now resolvable
+// 2. the wasm binary package (@compilecat/wasm) — built + patched by build:wasm.
+console.log('=== @compilecat/wasm ===');
+run(WASM_PKG);
+
+// 3. the wrapper (compilecat) — optional-deps now resolvable
 console.log('=== compilecat ===');
 run(ROOT);
 

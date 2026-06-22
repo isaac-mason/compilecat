@@ -14,7 +14,7 @@
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": false,
     "paths": {
-      "compilecat-wasm": ["../rust/crates/compilecat_wasm/pkg"]
+      "@compilecat/wasm": ["../rust/crates/compilecat_wasm/pkg"]
     }
   },
   "include": ["src"]

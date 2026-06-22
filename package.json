@@ -42,14 +42,14 @@
 		"build": "pnpm build:rust && pnpm build:ts && pnpm build:loader",
 		"clean": "node scripts/clean.mjs",
 		"release:publish": "node scripts/publish.mjs",
-		"release": "pnpm clean && pnpm build:native && pnpm test && pnpm build:all && pnpm build:ts && pnpm build:loader && node -e \"console.log('\\n✓ ready to publish — run:\\n  (cd rust/crates/compilecat_napi && napi prepublish -t npm)   # @compilecat/core-*\\n  npm publish --access public                                # compilecat')\"",
+		"release": "pnpm clean && pnpm build:native && pnpm build:wasm && pnpm test && pnpm build:all && pnpm build:ts && pnpm build:loader && node -e \"console.log('\\n✓ ready to publish — run: pnpm release:publish')\"",
 		"build:ts": "rm -rf ./dist && rollup --config rollup.config.ts",
 		"build:loader": "mkdir -p dist/core && cp rust/crates/compilecat_napi/index.js rust/crates/compilecat_napi/index.d.ts dist/core/ && node -e \"require('fs').writeFileSync('dist/core/package.json', JSON.stringify({ type: 'commonjs' }))\" && (cp rust/crates/compilecat_napi/*.node dist/core/ 2>/dev/null || true)",
 		"build:all": "node scripts/build-all.mjs",
 		"build:rust": "pnpm build:native && pnpm build:wasm",
 		"build:native": "pnpm -C rust/crates/compilecat_napi run build",
 		"build:native:debug": "pnpm -C rust/crates/compilecat_napi run build:debug",
-		"build:wasm": "wasm-pack build rust/crates/compilecat_wasm --target web --release",
+		"build:wasm": "wasm-pack build rust/crates/compilecat_wasm --target web --release && node scripts/patch-wasm-pkg.mjs",
 		"build:wasm:debug": "wasm-pack build rust/crates/compilecat_wasm --target web --dev",
 		"format": "biome format --write src/. tst/.",
 		"lint": "biome lint --write src/. tst/.",
@@ -85,7 +85,8 @@
 		"@compilecat/core-linux-x64-gnu": "0.0.1",
 		"@compilecat/core-linux-arm64-gnu": "0.0.1",
 		"@compilecat/core-win32-x64-msvc": "0.0.1",
-		"@compilecat/core-wasm32-wasi": "0.0.1"
+		"@compilecat/core-wasm32-wasi": "0.0.1",
+		"@compilecat/wasm": "0.0.1"
 	},
 	"packageManager": "pnpm@9.15.3+sha512.1f79bc245a66eb0b07c5d4d83131240774642caaa86ef7d0434ab47c0d16f66b04e21e0c086eb61e62c77efc4d7f7ec071afad3796af64892fae66509173893a"
 }

@@ -11,7 +11,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      'compilecat-wasm': path.resolve(
+      '@compilecat/wasm': path.resolve(
         import.meta.dirname,
         '../rust/crates/compilecat_wasm/pkg/compilecat_wasm.js',
       ),

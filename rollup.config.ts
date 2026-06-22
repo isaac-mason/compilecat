@@ -13,9 +13,10 @@ const external = [
 	'os',
 	'@rollup/pluginutils',
 	'rollup',
-	// wasm core: resolved by the consumer (the website aliases it to the
-	// wasm-pack `pkg/`); never bundled into the package.
-	'compilecat-wasm',
+	// wasm core: the published `@compilecat/wasm` binary package (an optional dep
+	// of `compilecat`); never bundled into the wrapper. In-repo dev resolves it
+	// via the website's vite alias to the local wasm-pack `pkg/`.
+	'@compilecat/wasm',
 ];
 
 const entries = ['index', 'vite', 'rollup', 'rolldown', 'plugin', 'wasm'];

@@ -1,13 +1,13 @@
 // Browser/edge wasm backend for the compilecat core — the in-browser twin of
 // `compiler.ts` (the napi addon). Same `Compiler` surface, but it loads the
-// wasm-bindgen build (`compilecat-wasm`, from `rust/crates/compilecat_wasm`) and
+// wasm-bindgen build (`@compilecat/wasm`, from `rust/crates/compilecat_wasm`) and
 // is **async**: `wasm-pack --target web` needs `init()` before the first call.
 //
 // Consumers (e.g. the website playground, or an edge runtime where the Node
 // addon can't load) import this via `compilecat/wasm` instead of the Node-only
 // `compilecat`.
 
-import initWasm, { Compiler as WasmCompiler, format as wasmFormat } from 'compilecat-wasm';
+import initWasm, { Compiler as WasmCompiler, format as wasmFormat } from '@compilecat/wasm';
 import type { Compiler } from './compiler';
 
 export type {

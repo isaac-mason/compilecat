@@ -1,7 +1,10 @@
 // One-shot version bump across every package that must stay in lockstep:
-//   • compilecat (root)            — version + the @compilecat/core-* optionalDependency pins
+//   • compilecat (root)            — version + the @compilecat/* optionalDependency pins
+//                                    (@compilecat/core-* and @compilecat/wasm)
 //   • compilecat-napi (build pkg)  — version
 //   • @compilecat/core-<triple>    — each platform manifest's version
+//   (@compilecat/wasm's own manifest is set by build:wasm from the root version —
+//    its pkg/ is generated, not committed.)
 //
 //   pnpm version:all 0.2.0
 //
@@ -33,11 +36,12 @@ function patch(relPath, mutate) {
 
 console.log(`bumping → ${version}`);
 
-// root: version + the exact-pinned platform optionalDependencies
+// root: version + the exact-pinned optionalDependencies (@compilecat/core-* +
+// @compilecat/wasm — all lockstep with the root version)
 patch('package.json', (j) => {
     j.version = version;
     for (const k of Object.keys(j.optionalDependencies ?? {})) {
-        if (k.startsWith('@compilecat/core-')) j.optionalDependencies[k] = version;
+        if (k.startsWith('@compilecat/')) j.optionalDependencies[k] = version;
     }
 });
 
