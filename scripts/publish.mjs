@@ -37,4 +37,4 @@ run(WASM_PKG);
 console.log('=== compilecat ===');
 run(ROOT);
 
-console.log(`\n✓ published ${version}. Switch crashcat's dep to "compilecat": "^${version}".`);
+console.log(`\n✓ published ${version}.`);
