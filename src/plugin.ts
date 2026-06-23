@@ -12,8 +12,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { createFilter } from '@rollup/pluginutils';
 import type { StringOrRegExp } from 'rollup';
+
+import { createFilter } from './filter';
 
 import { createCompiler } from './compiler';
 

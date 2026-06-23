@@ -11,7 +11,6 @@ const external = [
 	'tty',
 	'util',
 	'os',
-	'@rollup/pluginutils',
 	'rollup',
 	// wasm core: the published `@compilecat/wasm` binary package (an optional dep
 	// of `compilecat`); never bundled into the wrapper. In-repo dev resolves it
