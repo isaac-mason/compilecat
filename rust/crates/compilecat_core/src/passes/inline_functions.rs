@@ -51,14 +51,19 @@ pub(crate) struct Candidate<'a> {
     free: HashSet<String>,
 }
 
-pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
+/// Returns `(inlines, targets)` where `targets` is the span-starts of functions
+/// that call an `@inline` donor — the (possibly directive-free) consumers whose
+/// inlined residue must be opted into the cleanup gate. The cross-file path
+/// computes the same set itself (`inline_targets`); the same-file caller folds
+/// this into the gate so `@inline` output is flattened like `@optimize`'s.
+pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> (u32, HashSet<u32>) {
     // Spans that carry a leading `@inline` comment (comment attaches to the
     // start of the following token = the declaration's span start).
     let inline_spans = super::directives::annotated_spans_with_exports(program, &["@inline"]);
     // `@flatten`/`@optimize` hosts (the latter a combo directive, per directives.ts).
     let flatten_spans = collect_flatten_spans(program);
     if inline_spans.is_empty() && flatten_spans.is_empty() {
-        return 0;
+        return (0, HashSet::new());
     }
 
     // Discover top-level candidates — DIRECT (single-return) or BLOCK (void
@@ -82,8 +87,15 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
     let callsite = has_callsite_annotation(program, &inline_spans);
     if candidates.is_empty() && block_candidates.is_empty() && flatten_spans.is_empty() && !callsite
     {
-        return 0;
+        return (0, HashSet::new());
     }
+
+    // Functions that call an `@inline` donor — captured BEFORE inlining, while the
+    // calls still exist. These are the consumers whose residue must be cleaned
+    // even when they carry no directive (see this fn's doc).
+    let donor_keys: HashSet<String> =
+        candidates.keys().chain(block_candidates.keys()).cloned().collect();
+    let targets = functions_calling(program, &donor_keys);
 
     let mut count = inline_with(allocator, program, &candidates, &block_candidates);
 
@@ -173,7 +185,7 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
         }
     }
 
-    count
+    (count, targets)
 }
 
 /// `@flatten`/`@optimize` host spans (each comment's `attached_to`), with

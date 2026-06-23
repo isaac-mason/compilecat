@@ -62,18 +62,26 @@ pub fn run_all_gated<'a>(
 ) {
     normalize::run(allocator, program);
     let _ = mode; // inline cross-file (PerFile) path not yet ported
-                  // Per-function/scope opt-in gate (worklist #4): only constructs carrying a
-                  // directive (and their subtrees) are optimized/cleaned; everything else is
-                  // left byte-identical. Computed before producing passes so the directive
-                  // comments are still present. `gate()` mints a fresh gate per pass.
+
+    // Inline first (self-gated on directives); it returns the directive-free
+    // consumers it inlined into so their residue can join the cleanup gate.
+    let (inlined, inline_targets) = inline_functions::run(allocator, program);
+    stats.inlined += inlined;
+
+    // Per-function/scope opt-in gate (worklist #4): only constructs carrying a
+    // directive (and their subtrees), PLUS the `@inline` consumers above, are
+    // optimized/cleaned; everything else is left byte-identical. Built after
+    // inlining so those consumer spans are known (the surviving directive
+    // comments are still present — inline only strips fully-inlined donors).
+    // `gate()` mints a fresh gate per pass.
     let mut touched_set = directives::touched_spans(program);
     touched_set.extend(extra_touched.iter().copied());
+    touched_set.extend(inline_targets);
     let touched = std::rc::Rc::new(touched_set);
     let gate = || gate::Gate::gated(touched.clone());
 
-    stats.inlined += inline_functions::run(allocator, program); // producing: self-gated on directives
-                                                                // Flatten the scaffolding blocks inlining emits, before downstream passes so
-                                                                // they see straight-line code.
+    // Flatten the scaffolding blocks inlining emits, before downstream passes so
+    // they see straight-line code.
     stats.folded += block_flatten::run_with(allocator, program, gate());
     stats.unrolled += unroll::run(allocator, program);
     stats.sroa += sroa::run(allocator, program, sroa_external_shapes);
@@ -166,7 +174,7 @@ pub fn run_one<'a>(
             true
         }
         "inline-functions" => {
-            stats.inlined += inline_functions::run(allocator, program);
+            stats.inlined += inline_functions::run(allocator, program).0;
             true
         }
         "inline-variables" => {
