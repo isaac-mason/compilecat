@@ -1,6 +1,6 @@
 {
   "name": "compilecat-napi",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "Rust/oxc core for compilecat, exposed as a napi addon. Build tool only — not published; its loader is folded into `compilecat` and its binaries ship as @compilecat/core-<triple> platform packages.",
   "license": "MIT",
