@@ -8,7 +8,7 @@
 // already resolve on the registry when consumers install it.
 
 import { execSync } from 'node:child_process';
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -50,17 +50,8 @@ for (const triple of readdirSync(NPM)) {
     run(dir);
 }
 
-// 2. the wasm binary package (@compilecat/wasm). `build:wasm` sets its version
-// from root, but re-sync here so a publish always ships it at the wrapper's
-// version even if build:wasm last ran against an older root (the binary itself is
-// version-agnostic). This is what `version:all` can't reach — pkg/ is generated.
-const wasmPkgPath = join(WASM_PKG, 'package.json');
-const wasmPkg = JSON.parse(readFileSync(wasmPkgPath, 'utf8'));
-if (wasmPkg.version !== version) {
-    wasmPkg.version = version;
-    writeFileSync(wasmPkgPath, `${JSON.stringify(wasmPkg, null, 2)}\n`);
-    console.log(`synced @compilecat/wasm → ${version}`);
-}
+// 2. the wasm binary package (@compilecat/wasm); its version is set from root by
+// version:all (and build:wasm's patch-wasm-pkg) — not here.
 console.log('=== @compilecat/wasm ===');
 run(WASM_PKG);
 

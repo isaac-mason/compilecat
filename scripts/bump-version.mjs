@@ -3,14 +3,15 @@
 //                                    (@compilecat/core-* and @compilecat/wasm)
 //   • compilecat-napi (build pkg)  — version
 //   • @compilecat/core-<triple>    — each platform manifest's version
-//   (@compilecat/wasm's own manifest is set by build:wasm from the root version —
-//    its pkg/ is generated, not committed.)
+//   • @compilecat/wasm             — its generated pkg/ manifest, when present
+//                                    (pkg/ isn't committed; build:wasm's
+//                                     patch-wasm-pkg also sets it from root)
 //
 //   pnpm version:all 0.2.0
 //
 // Then commit, `git tag v0.2.0`, push → the release workflow publishes.
 
-import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -54,6 +55,17 @@ patch('rust/crates/compilecat_napi/package.json', (j) => {
 const npmDir = 'rust/crates/compilecat_napi/npm';
 for (const triple of readdirSync(join(ROOT, npmDir))) {
     patch(join(npmDir, triple, 'package.json'), (j) => {
+        j.version = version;
+    });
+}
+
+// the generated wasm pkg, when it's already been built. Its pkg/ isn't committed
+// (build:wasm regenerates it and patch-wasm-pkg sets the version from root), but
+// syncing it here means a bump-then-publish *without* a rebuild still ships
+// @compilecat/wasm at this version — no dependence on build order.
+const wasmManifest = 'rust/crates/compilecat_wasm/pkg/package.json';
+if (existsSync(join(ROOT, wasmManifest))) {
+    patch(wasmManifest, (j) => {
         j.version = version;
     });
 }
