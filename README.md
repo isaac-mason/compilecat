@@ -5,9 +5,11 @@
 [![Downloads](https://img.shields.io/npm/dt/compilecat.svg?style=for-the-badge)](https://www.npmjs.com/package/compilecat)
 
 ```bash
-> npm install github:isaac-mason/compilecat
-# (npm coming soon!)
+npm install compilecat
 ```
+
+Ships a prebuilt native (napi) binary per platform plus a wasm fallback, resolved
+automatically — no build step or toolchain required.
 
 # compilecat
 
@@ -174,44 +176,40 @@ parse
   → regenerate
 ```
 
-Optimization passes under `src/compiler/` are functional ports of the
-corresponding `jscomp/*.java` files from Google Closure Compiler. See
-[`NOTICE`](./NOTICE).
+Some of the optimization passes (Rust, under
+`rust/crates/compilecat_core/src/passes/`) are functional ports of corresponding
+`jscomp/*.java` files from Google Closure Compiler; others — notably `@unroll` and
+`@sroa` — diverge. See [`NOTICE`](./NOTICE).
 
 ## Plugin options
 
+The same options apply to every adapter (`compilecat/rollup`, `compilecat/vite`,
+`compilecat/rolldown`):
+
 ```ts
 compilecat({
-    debug?: boolean,          // log each transformed chunk/file. default false
-})
-```
-
-The Vite adapter additionally accepts:
-
-```ts
-compilecatVite({
     include: string | RegExp | (string | RegExp)[],   // REQUIRED. picomatch
-                                                      //  globs or RegExps
+                                                       //  globs and/or RegExps
     exclude?: string | RegExp | (string | RegExp)[],  // additional skips
-    debug?: boolean,
-    allowLibraryInline?: boolean, // permit per-file mode to follow imports
-                                  //  into node_modules when the call site
-                                  //  opts in via /* @inline */. default false
+    sourcemap?: boolean,  // emit source maps. default true
+    debug?: boolean,      // per-build timing + counter breakdown. default false
 })
 ```
 
-`include` is required and there is no implicit default, so you scope
-compilecat to your engine/hot-path code explicitly. `include` / `exclude`
-only affect Vite dev (per-file transform mode); they are plumbed through
-Rollup 4's hook-filter API, so under rolldown the test runs in Rust and
-non-matching files never enter the JS plugin handler at all. Combined
-with the built-in `code: /@(?:inline|flatten|sroa|unroll|optimize)\b/`
-filter, compilecat is effectively free on files it has no work to do for.
+`include` is required and has no implicit default, so you scope compilecat to your
+engine/hot-path code explicitly — it bounds both the files that get transformed
+*and* the donor modules that may be read and inlined, so `node_modules` is never
+trawled unless a package is listed explicitly (e.g.
+`['**/src/**', '**/node_modules/mathcat/**']`). It is plumbed through Rollup 4's
+hook-filter API, so under rolldown the scope test runs in Rust and out-of-scope
+files never enter the JS plugin handler at all. An in-scope file that calls an
+in-scope `@inline` function is always processed, even when it carries no directive
+of its own.
 
 ```ts
 // e.g. only transform engine code; everything else (app code,
 // node_modules, etc.) is invisible to compilecat.
-compilecatVite({
+compilecat({
     include: ['src/engine/**'],
 })
 ```
@@ -222,7 +220,7 @@ Heavily inspired by [unplugin-inline-functions](https://github.com/krispya/unplu
 
 ## Attribution
 
-The optimization passes under `src/compiler/` are ports of corresponding files
-from the [Google Closure Compiler](https://github.com/google/closure-compiler),
+Some of the optimization passes under `rust/crates/compilecat_core/src/passes/`
+are ports of corresponding files from the [Google Closure Compiler](https://github.com/google/closure-compiler),
 licensed under the Apache License, Version 2.0. See [`NOTICE`](./NOTICE) for
 required attribution. Compilecat itself is MIT-licensed (see [`LICENSE`](./LICENSE)).
