@@ -619,7 +619,7 @@ fn param_names(params: &FormalParameters) -> HashSet<String> {
 /// stacks suffixes (`part`→`part$2`→`part$2$1`→`part$2$1$1`…) until two collide
 /// into an invalid duplicate `let`. With it, a binding that's already unique
 /// won't collide and so won't be touched again — the pass converges.
-fn pick_fresh(base: &str, taken: &HashSet<String>) -> String {
+pub(crate) fn pick_fresh(base: &str, taken: &HashSet<String>) -> String {
     let root = strip_flatten_suffix(base);
     let mut n = 1;
     loop {

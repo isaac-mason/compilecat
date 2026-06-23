@@ -37,6 +37,7 @@ use oxc_ast::AstBuilder;
 use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_span::GetSpan;
 
+use super::block_flatten::pick_fresh;
 use super::block_mutate::{mutate_for_block_inline, BlockMutateInput};
 use super::util::is_pure;
 
@@ -747,7 +748,7 @@ impl<'a> BlockInliner<'a, '_> {
         // Allocate the id up front so α-renamed params share the inline's suffix;
         // only consume it (bump) when we actually inline.
         let id = self.next_id;
-        let Some(plan) = self.plan_for(&stmt, id) else { return Err(stmt) };
+        let Some(plan) = self.plan_for(&stmt) else { return Err(stmt) };
         self.next_id += 1;
         let needs_result = plan.result_name.is_some();
         let out = mutate_for_block_inline(
@@ -788,12 +789,12 @@ impl<'a> BlockInliner<'a, '_> {
 
     /// Recognize the call-site shape and build an owned plan (no borrow of the
     /// statement survives) — `f();` (discard), `x = f();`, `let x = f();`.
-    fn plan_for(&self, stmt: &Statement<'a>, id: u32) -> Option<BlockPlan<'a>> {
+    fn plan_for(&self, stmt: &Statement<'a>) -> Option<BlockPlan<'a>> {
         match stmt {
             Statement::ExpressionStatement(es) => match &es.expression {
                 Expression::CallExpression(call) => {
                     let cand = self.candidates.get(call_key(call)?.as_str())?;
-                    self.make_plan(call, cand, None, None, id)
+                    self.make_plan(call, cand, None, None)
                 }
                 Expression::AssignmentExpression(asn)
                     if asn.operator == AssignmentOperator::Assign =>
@@ -803,7 +804,7 @@ impl<'a> BlockInliner<'a, '_> {
                     };
                     let Expression::CallExpression(call) = &asn.right else { return None };
                     let cand = self.candidates.get(call_key(call)?.as_str())?;
-                    self.make_plan(call, cand, Some(target.name.to_string()), None, id)
+                    self.make_plan(call, cand, Some(target.name.to_string()), None)
                 }
                 _ => None,
             },
@@ -819,7 +820,7 @@ impl<'a> BlockInliner<'a, '_> {
                 let Some(Expression::CallExpression(call)) = &d.init else { return None };
                 let cand = self.candidates.get(call_key(call)?.as_str())?;
                 let name = bid.name.to_string();
-                self.make_plan(call, cand, Some(name.clone()), Some(name), id)
+                self.make_plan(call, cand, Some(name.clone()), Some(name))
             }
             _ => None,
         }
@@ -831,12 +832,11 @@ impl<'a> BlockInliner<'a, '_> {
         cand: &BlockCandidate<'a>,
         result_name: Option<String>,
         emit_let: Option<String>,
-        id: u32,
     ) -> Option<BlockPlan<'a>> {
         if !triggered(&self.trigger, call) {
             return None;
         }
-        build_block_plan(self.allocator, call, cand, result_name, emit_let, id, &self.local_names)
+        build_block_plan(self.allocator, call, cand, result_name, emit_let, &self.local_names)
     }
 
     /// Inline BLOCK candidate calls nested in `stmt`'s expressions, returning the
@@ -935,7 +935,6 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
                         cand,
                         Some(result.clone()),
                         None,
-                        id,
                         &self.local_names,
                     )
                 })
@@ -989,7 +988,6 @@ fn build_block_plan<'a>(
     cand: &BlockCandidate<'a>,
     result_name: Option<String>,
     emit_let: Option<String>,
-    id: u32,
     local_names: &HashSet<String>,
 ) -> Option<BlockPlan<'a>> {
     if call.arguments.iter().any(Argument::is_spread) {
@@ -1005,17 +1003,24 @@ fn build_block_plan<'a>(
         return None;
     }
     // α-rename: when an arg references a param name, the `let p = arg` prologue
-    // would TDZ-capture itself (`let p = …p…`). Rename the param to `p__<id>` in
-    // the body + prologue instead of bailing.
+    // would TDZ-capture itself (`let p = …p…`). Rename the param to a fresh
+    // `p$<n>` (block_flatten's `pick_fresh` scheme — small + idiomatic, and
+    // block_flatten finalizes uniqueness across inlines) instead of bailing.
     let mut arg_names = HashSet::new();
     for a in &call.arguments {
         collect_names(a.to_expression(), &mut arg_names);
     }
     let mut params = cand.params.clone();
+    // Names the fresh binding must dodge: the consumer's locals, anything the args
+    // reference, and the other params (so two renamed params stay distinct).
+    let mut taken: HashSet<String> = local_names.iter().cloned().collect();
+    taken.extend(arg_names.iter().cloned());
+    taken.extend(params.iter().cloned());
     let mut renames: HashMap<String, String> = HashMap::new();
     for p in params.iter_mut() {
         if arg_names.contains(p.as_str()) {
-            let fresh = format!("{p}__{id}");
+            let fresh = pick_fresh(p, &taken);
+            taken.insert(fresh.clone());
             renames.insert(p.clone(), fresh.clone());
             *p = fresh;
         }
@@ -1907,12 +1912,13 @@ mod tests {
     fn alpha_renames_param_when_arg_references_it() {
         // BLOCK body, args reference the param names (`v`, `k`). `v` is
         // *reassigned* so it can't be substituted — it gets a temp, which must be
-        // α-renamed to `v__N` to avoid the `let v = v` TDZ self-capture.
+        // α-renamed to a fresh `v$N` to avoid the `let v = v` TDZ self-capture.
         let out = inline(
             "/* @inline */ function scale(v, k) { v = v * k; return v; }\nexport function f(v, k) { let r = scale(v, k); return r; }",
         );
         assert!(!out.contains("scale("), "inlined via α-rename instead of bailing:\n{out}");
-        assert!(out.contains("v__"), "reassigned param renamed:\n{out}");
+        assert!(out.contains("v$"), "reassigned param renamed with the $N scheme:\n{out}");
+        assert!(!out.contains("v__"), "no long __id suffix:\n{out}");
     }
 
     #[test]
