@@ -48,8 +48,17 @@ function evalProgram(code: string, call: string): { ok: true; value: unknown } |
         .replace(/\bexport\s+/g, '')
         .replace(/ as number/g, '');
     try {
+        // SIDE-EFFECT / CALL-ORDER ORACLE: the program calls an EXTERNAL `eff(x)`
+        // (an opaque effectful identity the compiler must preserve in count and
+        // order) which records to `__t`. We return BOTH the entry value AND the
+        // trace, so a dropped / reordered / CSE'd / wrongly-hoisted effect is a
+        // detectable divergence even when the returned number is unchanged. NOT
+        // `"use strict"` — cross-file evals depend on sloppy fn redeclaration.
         // biome-ignore lint/security/noGlobalEval: intentionally evaluating generated/compiled code
-        return { ok: true, value: new Function(`${js}\nreturn (${call});`)() };
+        const value = new Function(
+            `const __t = [];\nconst eff = (x) => { __t.push(x); return x; };\n${js}\nreturn [(${call}), __t];`,
+        )();
+        return { ok: true, value };
     } catch {
         return { ok: false };
     }
@@ -171,6 +180,11 @@ class Gen {
             // non-null wrapper isn't fuzzed — harder to strip cleanly — but is
             // covered by a regression test.)
             () => `((${this.numExpr(s, depth - 1)}) as number)`,
+            // EFFECT: an external `eff(x)` records to the trace and returns x. The
+            // compiler must preserve every eff call's count + order (it's opaque
+            // and impure). Wrapping a sub-expr puts an observable effect mid-stream
+            // so reorder/drop/CSE/wrongful-hoist is caught even at equal value.
+            () => `eff(${this.numExpr(s, depth - 1)})`,
         ];
         if (numHelpers.length)
             forms.push(() => {
@@ -250,7 +264,7 @@ class Gen {
         const stmts: string[] = [];
         const k = int(this.r, 2, 6);
         for (let i = 0; i < k; i++) {
-            const form = int(this.r, 0, 12);
+            const form = int(this.r, 0, 14);
             if (form === 0) {
                 // const num = numExpr | helper-num-call (BLOCK in init position)
                 const v = this.fresh('v');
@@ -354,6 +368,16 @@ class Gen {
                     `let ${acc} = 0; ${lbl}: for (let i = 0; i < ${li}; i++) { for (let j = 0; j < ${lj}; j++) { if (${this.cond(s)}) break ${lbl}; ${acc} = ${acc} + ${this.numExpr(s, 1)}; } }`,
                 );
                 s.nums.push(acc);
+            } else if (form === 12) {
+                // bare EFFECT statement (result discarded) — must NOT be dropped.
+                stmts.push(`eff(${this.numExpr(s, 1)});`);
+            } else if (form === 13) {
+                // EFFECT bound to a possibly-DEAD local: dropping the dead binding
+                // must keep the effect (the cleanup_residue dropped-impure-RHS
+                // class). Sometimes read (kept), sometimes not (store is dead).
+                const v = this.fresh('e');
+                stmts.push(`const ${v} = eff(${this.numExpr(s, 1)});`);
+                if (chance(this.r, 0.5)) s.nums.push(v); // sometimes used later
             } else {
                 // if-branch with a nested const + field/array op
                 const v = this.fresh('c');
@@ -489,5 +513,57 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
             }
         }
         expect(true).toBe(true);
+    });
+});
+
+// Pinned minimal repros the effect oracle (value + side-effect trace) found while
+// making the optimizer Closure-aligned on side effects: an effectful expression
+// must never be dropped, reordered, duplicated, or have its count changed. `eff`
+// is the external effect recorder evalProgram injects.
+describe('effect-preservation regressions (Closure-aligned)', () => {
+    const chk = (name: string, src: string, call = 'entry(7, 3)') => {
+        it(name, () => {
+            const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
+            const want = evalProgram(src, call);
+            const got = evalProgram(out, call);
+            expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(JSON.stringify(want.value));
+        });
+    };
+
+    // Inlining a fn whose param is UNUSED dropped the arg's effect. Now an impure
+    // arg is eval-once-hoisted (eager) instead of substituted/dropped.
+    chk(
+        'unused-param impure arg effect preserved',
+        `/* @inline */ function h(a, b) { return b; }\n/* @optimize */ function entry(p, q) { return h(eff(p), q); }`,
+    );
+    // dead_assignments hoisted a dead declarator's impure init AFTER later inits,
+    // reordering effects. Now it splits the decl in evaluation order.
+    chk(
+        'dead-field init keeps order (dead_assignments)',
+        `/* @optimize */ function entry(p, q) { const o = /* @sroa */ { x: eff(1), y: eff(2) }; return o.y; }`,
+    );
+    // Inliner/ExprHoister hoisted an arg-temp before the statement, jumping it past
+    // an effect to its LEFT. Now hoist-needing inlines bail when not the first effect.
+    chk(
+        'DIRECT inline hoist past left effect',
+        `/* @inline */ function h0(a, b) { return eff(a); }\n/* @optimize */ function entry(p, q) { return eff(1) + h0(eff(2), eff(3)); }`,
+    );
+    chk(
+        'BLOCK inline hoist past left effect',
+        `/* @inline */ function dbl(a) { return a + a; }\n/* @optimize */ function entry(p, q) { return eff(1) + dbl(eff(2)); }`,
+    );
+    // vec.x (member read) is still assumed pure → optimization NOT killed.
+    chk(
+        'member-read arg still drops (getters assumed pure)',
+        `/* @inline */ function h(a, b) { return b; }\n/* @optimize */ function entry(p, q) { const v = { x: 5 }; return h(v.x, q); }`,
+    );
+
+    // Cross-file: inlining a donor whose param sits in a conditional branch
+    // substituted the impure arg into that branch, dropping its effect when the
+    // branch wasn't taken. Now the impure arg is hoisted eager.
+    it('cross-file conditional-param drop preserved', () => {
+        const donor = `export function d0(a, b) { return (eff(2) > a ? (b - 9) : 5); }`;
+        const consumer = `import { d0 } from "./donor";\n/* @optimize */ function entry(p, q) { return q - d0(Math.abs(99), eff(0)); }`;
+        expect(crossDiff(donor, consumer, './donor')).toBe(null);
     });
 });

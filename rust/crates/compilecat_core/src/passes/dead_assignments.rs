@@ -346,25 +346,54 @@ impl<'a> VisitMut<'a> for Applier<'a> {
                     self.count += 1;
                 }
             }
-            // Null dead var inits; hoist impure ones.
+            // Null dead var inits; hoist impure ones — PRESERVING EVALUATION ORDER.
+            // Declarators run left-to-right, so a dead declarator's hoisted impure
+            // init must be emitted IN POSITION (before any later declarator's init),
+            // not appended after the whole declaration. Accumulate kept declarators
+            // into a `let`/`var` and flush them out whenever a dead-impure init has
+            // to be spliced between. The binding itself is retained (it may be
+            // reassigned and read later) — only its dead init moves/drops.
             if let Statement::VariableDeclaration(vd) = &mut stmt {
-                let mut hoist: Vec<Expression<'a>> = Vec::new();
-                for d in vd.declarations.iter_mut() {
+                let any = vd
+                    .declarations
+                    .iter()
+                    .any(|d| self.rw.var_init.contains_key(&d.node_id.get()));
+                if !any {
+                    out.push(stmt);
+                    continue;
+                }
+                let ast = self.ast;
+                let kind = vd.kind;
+                let decls = vd.declarations.take_in(ast.allocator);
+                let mut pending = ast.vec::<VariableDeclarator<'a>>();
+                let flush =
+                    |pending: &mut oxc_allocator::Vec<'a, VariableDeclarator<'a>>,
+                     out: &mut oxc_allocator::Vec<'a, Statement<'a>>| {
+                        if !pending.is_empty() {
+                            let taken = std::mem::replace(pending, ast.vec());
+                            out.push(Statement::VariableDeclaration(ast.alloc(
+                                ast.variable_declaration(SPAN, kind, taken, false),
+                            )));
+                        }
+                    };
+                for mut d in decls {
                     if let Some(&impure) = self.rw.var_init.get(&d.node_id.get()) {
                         if let Some(init) = d.init.take() {
-                            if impure {
-                                hoist.push(init);
-                            }
                             self.count += 1;
+                            if impure {
+                                // Emit prior declarators first (their inits run
+                                // before this effect), then the effect in position.
+                                flush(&mut pending, &mut out);
+                                out.push(Statement::ExpressionStatement(
+                                    ast.alloc(ast.expression_statement(SPAN, init)),
+                                ));
+                            }
+                            // (pure init simply dropped; binding kept below)
                         }
                     }
+                    pending.push(d);
                 }
-                out.push(stmt);
-                for init in hoist {
-                    out.push(Statement::ExpressionStatement(
-                        self.ast.alloc(self.ast.expression_statement(SPAN, init)),
-                    ));
-                }
+                flush(&mut pending, &mut out);
                 continue;
             }
             out.push(stmt);
@@ -425,6 +454,18 @@ mod tests {
         assert!(out.contains("var t;"), "dead init nulled: {out}");
         assert!(out.contains("compute(i);"), "impure rhs hoisted/retained: {out}");
         assert!(!out.contains("var t = compute"), "dead store removed: {out}");
+    }
+
+    #[test]
+    fn dead_init_hoist_preserves_eval_order() {
+        // `let a = sink(1), b = sink(2)` with `a` dead, `b` live: nulling a's dead
+        // init must keep the impure `sink(1)` BEFORE `sink(2)` (eval order) — not
+        // append it after the whole declaration, which would reorder the effects.
+        let out = dae("/* @optimize */ function f() { let a = sink(1), b = sink(2); return b; }");
+        assert!(out.contains("sink(1)"), "dead impure init retained: {out}");
+        let i1 = out.find("sink(1)").unwrap();
+        let i2 = out.find("sink(2)").unwrap();
+        assert!(i1 < i2, "eval order preserved (sink(1) before sink(2)): {out}");
     }
 
     #[test]

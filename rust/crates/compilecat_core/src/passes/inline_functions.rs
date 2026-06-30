@@ -155,6 +155,7 @@ pub fn run<'a>(
                 trigger: Some(inline_spans.clone()),
                 local_names: local_names.clone(),
                 no_hoist: false,
+                passed_effect: false,
             };
             di.visit_program(program);
             count += di.count;
@@ -320,6 +321,7 @@ pub(crate) fn flatten_into_hosts<'a>(
                 trigger: None,
                 local_names: local_names.clone(),
                 no_hoist: false,
+                passed_effect: false,
             };
             di.visit_function_body(body);
             count += di.count;
@@ -354,6 +356,7 @@ pub(crate) fn flatten_into_hosts<'a>(
                     trigger: None,
                     local_names: local_names.clone(),
                     no_hoist: false,
+                    passed_effect: false,
                 };
                 di.visit_function_body(body);
                 count += di.count;
@@ -497,6 +500,7 @@ pub(crate) fn inline_with<'a>(
             trigger: None,
             local_names: local_names.clone(),
             no_hoist: false,
+            passed_effect: false,
         };
         inliner.visit_program(program);
         count += inliner.count;
@@ -890,6 +894,7 @@ impl<'a> BlockInliner<'a, '_> {
             local_names: self.local_names.clone(),
             hoists: Vec::new(),
             no_hoist: false,
+            passed_effect: false,
         };
         // Only this statement's own once-evaluated expressions — NOT nested
         // statement bodies. A nested body (block / loop body / if branch / case)
@@ -920,6 +925,11 @@ struct ExprHoister<'a, 'c> {
     /// behavior (runs side effects that shouldn't fire; diverges for a recursive
     /// helper the branch never reaches). While set, leave such calls un-inlined.
     no_hoist: bool,
+    /// Set once an effectful expression has been evaluated EARLIER in the
+    /// statement (snapshot before each call's own subtree). Hoisting a call that
+    /// isn't the statement's first effect would run its block before those earlier
+    /// effects — a reorder. While set, leave the call un-inlined.
+    passed_effect: bool,
 }
 
 impl<'a> ExprHoister<'a, '_> {
@@ -1005,11 +1015,20 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
     }
 
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        // Effects to the LEFT in the statement (snapshot before this subtree), and
+        // whether this expr itself is an effect (for later siblings).
+        let effect_before = self.passed_effect;
+        let effectful = !is_side_effect_free(expr);
         walk_mut::walk_expression(self, expr); // inner calls hoist first (eval order)
+        if effectful {
+            self.passed_effect = true;
+        }
 
-        // Inside a conditionally-evaluated position: leave the call un-inlined
-        // (hoisting it would run the block UNconditionally — unsound).
-        if self.no_hoist {
+        // Inside a conditionally-evaluated position (`no_hoist`), or with an effect
+        // already evaluated earlier in the statement (`effect_before`): leave the
+        // call un-inlined. Hoisting the block before the statement would run it
+        // unconditionally / out of order relative to that earlier effect.
+        if self.no_hoist || effect_before {
             return;
         }
 
@@ -1782,6 +1801,12 @@ struct Inliner<'a, 'c> {
     /// inlines bail (the call is left in place). Substitution-only inlines (no
     /// hoist) stay in place and remain safe.
     no_hoist: bool,
+    /// Set once an effectful (not side-effect-free) expression has been evaluated
+    /// EARLIER in the current statement. An eval-once `const _inl_arg = arg;` hoist
+    /// splices before the whole statement, so hoisting a call that isn't the
+    /// statement's FIRST effect would run its arg before those earlier effects —
+    /// a reorder. While set, hoist-needing inlines bail. Reset per statement.
+    passed_effect: bool,
 }
 
 impl<'a> Inliner<'a, '_> {
@@ -1928,6 +1953,10 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         let mut out = ast.vec_with_capacity(taken.len());
         for mut stmt in taken {
             let saved = std::mem::take(&mut self.hoists);
+            // Hoists splice before THIS statement; effects in prior statements are
+            // already sequenced before it. Only intra-statement left-effects can be
+            // reordered by a hoist → track per statement.
+            self.passed_effect = false;
             walk_mut::walk_statement(self, &mut stmt);
             let mine = std::mem::replace(&mut self.hoists, saved);
             for h in mine {
@@ -1939,7 +1968,15 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
     }
 
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
+        // Effects to the LEFT of this expression in the statement (snapshot BEFORE
+        // walking this subtree — so the expr's OWN args don't count as "before").
+        let effect_before = self.passed_effect;
+        // Whether this expression itself carries an effect (for later siblings).
+        let effectful = !is_side_effect_free(expr);
         walk_mut::walk_expression(self, expr); // inner calls inline first (eval order)
+        if effectful {
+            self.passed_effect = true;
+        }
 
         let Expression::CallExpression(call) = &*expr else { return };
         if !triggered(&self.trigger, call) {
@@ -1949,6 +1986,9 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         let Some(cand) = self.candidates.get(key.as_str()) else { return };
         // Disjoint field borrows: `cand` ← self.candidates, `&mut self.next_id`,
         // `&mut self.hoists`, `&self.local_names`, `self.allocator`.
+        // Bail an eval-once hoist if we're in a conditional position (`no_hoist`)
+        // OR there's an effect to our left (`effect_before`) — hoisting before the
+        // statement would reorder this call's arg past that earlier effect.
         let replacement = build_inlined(
             self.allocator,
             cand,
@@ -1956,7 +1996,7 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
             &self.local_names,
             &mut self.next_id,
             &mut self.hoists,
-            self.no_hoist,
+            self.no_hoist || effect_before,
         );
         if let Some(v) = replacement {
             *expr = v;
@@ -2022,9 +2062,24 @@ fn build_inlined<'a>(
             subs.insert(p.clone(), ast.expression_identifier(oxc_span::SPAN, "undefined"));
             continue;
         };
-        let multi_use = uses.get(p.as_str()).copied().unwrap_or(0) > 1;
+        let n_uses = uses.get(p.as_str()).copied().unwrap_or(0);
+        let multi_use = n_uses > 1;
         let dup_safe = is_pure(arg) || (body_side_effect_free && is_pure_with_member_reads(arg));
-        if multi_use && !dup_safe {
+        // Bind the arg to an eval-once `const _inl_arg_N` when it can't simply be
+        // substituted into the body:
+        //  - NOT side-effect-free: an impure arg must run EXACTLY ONCE, EAGERLY (in
+        //    argument-position order). Substituting it into the body would change
+        //    its count (unused → 0, multi-use → N) OR move it into a position the
+        //    body evaluates conditionally (a `?:`/`&&` branch the param sits in) or
+        //    out of order (after another of the body's effects). Hoisting evaluates
+        //    it once up front; the hoist itself bails in conditional / effect-to-
+        //    the-left positions (`no_hoist`/`passed_effect`), leaving the call.
+        //    (`is_side_effect_free` assumes a MEMBER READ `vec.x` has no effectful
+        //    getter — per the annotated-region contract — so `vec.x` still subs.)
+        //  - multi-use + not-dup-safe: a pure-but-costly arg, hoisted to avoid N
+        //    re-evaluations (perf, not correctness).
+        let needs_eval_once = !is_side_effect_free(arg) || (multi_use && !dup_safe);
+        if needs_eval_once {
             // This arg needs an eval-once `const _inl_arg_N` hoist. In a
             // conditionally-evaluated position that hoist would run
             // unconditionally (before the enclosing statement) — bail the inline.
