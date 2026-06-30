@@ -485,4 +485,37 @@ describe('adversarial-review regressions', () => {
             'entry()',
         );
     });
+
+    // A BLOCK @inline call in a CONDITIONALLY-evaluated position (a `?:` branch, or
+    // `&&`/`||`/`??` RHS) was hoisted to an UNCONDITIONAL statement before the
+    // enclosing one → the body ran when the source never would (here a recursive
+    // helper in a never-taken branch → infinite recursion). Now the ExprHoister
+    // leaves conditional-position calls un-inlined. Found by the fuzzer.
+    it('inline-call-in-ternary-branch-not-hoisted', () => {
+        check(
+            'rev-cond-hoist.ts',
+            `/* @inline */ function rec(a) { let t; if (a < 0) { t = 0; } else { t = rec(a + 1); } return t; }\n/* @optimize */ function entry(p, q) { return p > 0 ? 5 : rec(0); }`,
+            'entry(7, 3)',
+        );
+    });
+    it('inline-call-in-logical-rhs-not-hoisted', () => {
+        check(
+            'rev-cond-hoist-logical.ts',
+            `/* @inline */ function rec(a) { let t; if (a < 0) { t = 0; } else { t = rec(a + 1); } return t; }\n/* @optimize */ function entry(p, q) { return (p > 0) || (rec(0) > 0); }`,
+            'entry(7, 3)',
+        );
+    });
+
+    // Same conditional-hoist class via the DIRECT inliner's eval-once `_inl_arg`
+    // hoist (not the BLOCK ExprHoister): a DIRECT recursive helper called in a
+    // never-taken ternary branch had its arg-temp hoisted unconditionally →
+    // diverged. Now the DIRECT inliner bails when a hoist would be needed in a
+    // conditional position. Found by the (expanded) fuzzer.
+    it('direct-inline-arg-hoist-in-ternary-branch', () => {
+        check(
+            'rev-direct-cond-hoist.ts',
+            `function h1(a, b) { return h1(Math.max(b, 6), (2 <= h1(4, 5) ? b : b)); }\n/* @optimize */ function entry(p, q) { const arr = /* @sroa */ [27, 4]; return (Math.abs(arr[0]) !== Math.max(27, arr[1]) ? h1(arr[1], 6) : Math.abs(4)); }`,
+            'entry(7, 3)',
+        );
+    });
 });

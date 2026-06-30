@@ -154,6 +154,7 @@ pub fn run<'a>(
                 hoists: Vec::new(),
                 trigger: Some(inline_spans.clone()),
                 local_names: local_names.clone(),
+                no_hoist: false,
             };
             di.visit_program(program);
             count += di.count;
@@ -318,6 +319,7 @@ pub(crate) fn flatten_into_hosts<'a>(
                 hoists: Vec::new(),
                 trigger: None,
                 local_names: local_names.clone(),
+                no_hoist: false,
             };
             di.visit_function_body(body);
             count += di.count;
@@ -351,6 +353,7 @@ pub(crate) fn flatten_into_hosts<'a>(
                     hoists: Vec::new(),
                     trigger: None,
                     local_names: local_names.clone(),
+                    no_hoist: false,
                 };
                 di.visit_function_body(body);
                 count += di.count;
@@ -493,6 +496,7 @@ pub(crate) fn inline_with<'a>(
             hoists: Vec::new(),
             trigger: None,
             local_names: local_names.clone(),
+            no_hoist: false,
         };
         inliner.visit_program(program);
         count += inliner.count;
@@ -885,6 +889,7 @@ impl<'a> BlockInliner<'a, '_> {
             trigger: self.trigger.clone(),
             local_names: self.local_names.clone(),
             hoists: Vec::new(),
+            no_hoist: false,
         };
         // Only this statement's own once-evaluated expressions — NOT nested
         // statement bodies. A nested body (block / loop body / if branch / case)
@@ -908,6 +913,13 @@ struct ExprHoister<'a, 'c> {
     trigger: Option<HashSet<u32>>,
     local_names: Rc<HashSet<String>>,
     hoists: Vec<Statement<'a>>,
+    /// Set inside a conditionally-evaluated sub-expression (a `?:` branch, or the
+    /// short-circuit RHS of `&&`/`||`/`??`). A BLOCK inline hoists the call's body
+    /// to a statement BEFORE the enclosing statement — i.e. UNCONDITIONALLY — so
+    /// hoisting a call that the source only evaluates conditionally changes
+    /// behavior (runs side effects that shouldn't fire; diverges for a recursive
+    /// helper the branch never reaches). While set, leave such calls un-inlined.
+    no_hoist: bool,
 }
 
 impl<'a> ExprHoister<'a, '_> {
@@ -947,8 +959,34 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
     fn visit_function(&mut self, _: &mut Function<'a>, _: oxc_semantic::ScopeFlags) {}
     fn visit_arrow_function_expression(&mut self, _: &mut ArrowFunctionExpression<'a>) {}
 
+    // A `?:` evaluates the test unconditionally, but each branch only when chosen.
+    fn visit_conditional_expression(&mut self, c: &mut ConditionalExpression<'a>) {
+        self.visit_expression(&mut c.test);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut c.consequent);
+        self.visit_expression(&mut c.alternate);
+        self.no_hoist = saved;
+    }
+
+    // `&&`/`||`/`??` evaluate the left unconditionally, the right only on the
+    // non-short-circuit path.
+    fn visit_logical_expression(&mut self, l: &mut LogicalExpression<'a>) {
+        self.visit_expression(&mut l.left);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut l.right);
+        self.no_hoist = saved;
+    }
+
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         walk_mut::walk_expression(self, expr); // inner calls hoist first (eval order)
+
+        // Inside a conditionally-evaluated position: leave the call un-inlined
+        // (hoisting it would run the block UNconditionally — unsound).
+        if self.no_hoist {
+            return;
+        }
 
         let id = self.next_id;
         // Result-temp name: `_<callee>__result_<id>` reads as "the value of
@@ -1711,9 +1749,37 @@ struct Inliner<'a, 'c> {
     trigger: Option<HashSet<u32>>,
     /// Consumer non-module binding names (capture guard); see `BlockInliner`.
     local_names: Rc<HashSet<String>>,
+    /// Set inside a conditionally-evaluated sub-expression (a `?:` branch or the
+    /// short-circuit RHS of `&&`/`||`/`??`). An inline that needs an eval-once
+    /// `const _inl_arg_N = arg;` hoist would splice that BEFORE the enclosing
+    /// statement — i.e. UNCONDITIONALLY — so the arg (its calls / side effects)
+    /// runs even when the source never evaluates the branch. While set, such
+    /// inlines bail (the call is left in place). Substitution-only inlines (no
+    /// hoist) stay in place and remain safe.
+    no_hoist: bool,
 }
 
 impl<'a> VisitMut<'a> for Inliner<'a, '_> {
+    // A `?:` evaluates the test unconditionally; each branch only when chosen.
+    fn visit_conditional_expression(&mut self, c: &mut ConditionalExpression<'a>) {
+        self.visit_expression(&mut c.test);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut c.consequent);
+        self.visit_expression(&mut c.alternate);
+        self.no_hoist = saved;
+    }
+
+    // `&&`/`||`/`??` evaluate the left unconditionally, the right on the
+    // non-short-circuit path only.
+    fn visit_logical_expression(&mut self, l: &mut LogicalExpression<'a>) {
+        self.visit_expression(&mut l.left);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut l.right);
+        self.no_hoist = saved;
+    }
+
     /// Walk each statement, then splice in any arg-binding hoists its calls
     /// produced (in front of it, in evaluation order). `take`/`replace` around the
     /// walk scopes the buffer so a nested block's hoists go into the nested block,
@@ -1752,6 +1818,7 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
             &self.local_names,
             &mut self.next_id,
             &mut self.hoists,
+            self.no_hoist,
         );
         if let Some(v) = replacement {
             *expr = v;
@@ -1779,6 +1846,7 @@ fn build_inlined<'a>(
     local_names: &HashSet<String>,
     next_id: &mut u32,
     hoists: &mut Vec<Statement<'a>>,
+    bail_on_hoist: bool,
 ) -> Option<Expression<'a>> {
     if call.arguments.iter().any(Argument::is_spread) {
         return None;
@@ -1819,6 +1887,12 @@ fn build_inlined<'a>(
         let multi_use = uses.get(p.as_str()).copied().unwrap_or(0) > 1;
         let dup_safe = is_pure(arg) || (body_side_effect_free && is_pure_with_member_reads(arg));
         if multi_use && !dup_safe {
+            // This arg needs an eval-once `const _inl_arg_N` hoist. In a
+            // conditionally-evaluated position that hoist would run
+            // unconditionally (before the enclosing statement) — bail the inline.
+            if bail_on_hoist {
+                return None;
+            }
             let name: &'a str = allocator.alloc_str(&format!("_inl_arg_{}", *next_id));
             *next_id += 1;
             let declr = ast.variable_declarator(

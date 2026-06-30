@@ -38,7 +38,14 @@ function withExports(code: string): string {
 }
 
 function evalProgram(code: string, call: string): { ok: true; value: unknown } | { ok: false } {
-    const js = code.replace(/^\s*export\s*\{[^}]*\}\s*;?/gm, '').replace(/\bexport\s+/g, '');
+    // Strip ESM exports and the (unambiguous) TS `as number` wrapper so the JS
+    // `new Function` eval can parse it. Both source and compiled go through this,
+    // so it's a fair differential — the strip only removes the type annotation,
+    // never the surrounding code a miscompile would have corrupted.
+    const js = code
+        .replace(/^\s*export\s*\{[^}]*\}\s*;?/gm, '')
+        .replace(/\bexport\s+/g, '')
+        .replace(/ as number/g, '');
     try {
         // biome-ignore lint/security/noGlobalEval: intentionally evaluating generated/compiled code
         return { ok: true, value: new Function(`${js}\nreturn (${call});`)() };
@@ -86,6 +93,7 @@ const int = (r: Rng, lo: number, hi: number): number => lo + Math.floor(r() * (h
 interface Scope {
     nums: string[]; // in-scope number vars
     pts: string[]; // in-scope point vars (always have .x and .y)
+    arrs: { name: string; len: number }[]; // in-scope number-arrays (fixed length)
 }
 
 interface Helper {
@@ -110,6 +118,11 @@ class Gen {
         const leaves: (() => string)[] = [() => String(int(this.r, 0, 9))];
         if (s.nums.length) leaves.push(() => pick(this.r, s.nums));
         if (s.pts.length) leaves.push(() => `${pick(this.r, s.pts)}.${pick(this.r, ['x', 'y'])}`);
+        if (s.arrs.length)
+            leaves.push(() => {
+                const a = pick(this.r, s.arrs);
+                return `${a.name}[${int(this.r, 0, a.len - 1)}]`; // always in-bounds → total
+            });
         if (depth <= 0) return pick(this.r, leaves)();
         const numHelpers = this.helpers.filter((h) => h.kind === 'num');
         const forms: (() => string)[] = [
@@ -117,11 +130,22 @@ class Gen {
             () => `(${this.numExpr(s, depth - 1)} ${pick(this.r, ['+', '-', '*'])} ${this.numExpr(s, depth - 1)})`,
             () => `Math.abs(${this.numExpr(s, depth - 1)})`,
             () => `Math.max(${this.numExpr(s, depth - 1)}, ${this.numExpr(s, depth - 1)})`,
+            // ternary
+            () => `(${this.cond(s)} ? ${this.numExpr(s, depth - 1)} : ${this.numExpr(s, depth - 1)})`,
+            // TS `as` wrapper (number, so total) — exercises the reaching /
+            // walk-reads coverage for type-only wrappers. `evalProgram` strips the
+            // unambiguous ` as number` so the JS eval can parse it. (The `!`
+            // non-null wrapper isn't fuzzed — harder to strip cleanly — but is
+            // covered by a regression test.)
+            () => `((${this.numExpr(s, depth - 1)}) as number)`,
         ];
         if (numHelpers.length)
             forms.push(() => {
                 const h = pick(this.r, numHelpers);
-                return `${h.name}(${this.numExpr(s, depth - 1)}, ${this.numExpr(s, depth - 1)})`;
+                // Sometimes force inlining at the call site (exercises the
+                // call-site phase + the global inline-temp counter).
+                const cs = !h.inline && chance(this.r, 0.3) ? '/* @inline */ ' : '';
+                return `${cs}${h.name}(${this.numExpr(s, depth - 1)}, ${this.numExpr(s, depth - 1)})`;
             });
         return pick(this.r, forms)();
     }
@@ -150,7 +174,7 @@ class Gen {
             const h: Helper = { name: `h${i}`, kind, inline: chance(this.r, 0.6) };
             this.helpers.push(h);
             const dir = h.inline ? '/* @inline */ ' : '';
-            const s: Scope = { nums: ['a', 'b'], pts: [] };
+            const s: Scope = { nums: ['a', 'b'], pts: [], arrs: [] };
             if (kind === 'num') {
                 // Mix DIRECT (single return) and BLOCK (branch / temp) bodies.
                 const shape = int(this.r, 0, 2);
@@ -160,10 +184,10 @@ class Gen {
                 else
                     out.push(`${dir}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`);
             } else if (kind === 'pt') {
-                out.push(`${dir}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [] }, 1)} }; }`);
+                out.push(`${dir}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [] }, 1)} }; }`);
             } else {
                 // void: mutate point arg0 (a is a point here, b a number).
-                const ps: Scope = { nums: ['b'], pts: ['a'] };
+                const ps: Scope = { nums: ['b'], pts: ['a'], arrs: [] };
                 out.push(`${dir}function ${h.name}(a, b) { a.x = ${this.numExpr(ps, 1)}; a.y = ${this.numExpr(ps, 1)}; }`);
             }
         }
@@ -171,7 +195,7 @@ class Gen {
     }
 
     private genEntryBody(): string {
-        const s: Scope = { nums: ['p', 'q'], pts: [] };
+        const s: Scope = { nums: ['p', 'q'], pts: [], arrs: [] };
         const stmts: string[] = [];
         const k = int(this.r, 2, 6);
         for (let i = 0; i < k; i++) {
@@ -193,11 +217,23 @@ class Gen {
                 stmts.push(`const ${v} = ${dir}${this.ptExpr(s, 2)};`);
                 s.pts.push(v);
             } else if (form === 3) {
-                // array aggregate (sometimes @sroa) + constant-index reads
+                // array aggregate (sometimes @sroa), added to scope. Variable
+                // length; later stmts may index-read (numExpr leaf), element-write,
+                // or spread it. All accesses are in-bounds → total.
                 const v = this.fresh('arr');
+                const len = int(this.r, 2, 4);
                 const dir = chance(this.r, 0.5) ? '/* @sroa */ ' : '';
-                stmts.push(`const ${v} = ${dir}[${this.numExpr(s, 1)}, ${this.numExpr(s, 1)}];`);
-                stmts.push(`const ${this.fresh('s')} = ${v}[0] + ${v}[1];`);
+                const elems = Array.from({ length: len }, () => this.numExpr(s, 1)).join(', ');
+                stmts.push(`const ${v} = ${dir}[${elems}];`);
+                s.arrs.push({ name: v, len });
+                if (chance(this.r, 0.4))
+                    stmts.push(`${v}[${int(this.r, 0, len - 1)}] = ${this.numExpr(s, 1)};`);
+                if (chance(this.r, 0.4)) {
+                    // spread a number-array into Math.max (exercises spread reads)
+                    const m = this.fresh('m');
+                    stmts.push(`const ${m} = Math.max(...${v});`);
+                    s.nums.push(m);
+                }
             } else if (form === 4 && s.pts.length) {
                 // void-helper mutation of a point + field write
                 const voids = this.helpers.filter((h) => h.kind === 'void');
@@ -234,6 +270,7 @@ class Gen {
 // Line-based delta-debug: drop statement lines while the divergence persists.
 
 function shrink(code: string): string {
+    const orig = evalProgram(code, 'entry(7, 3)');
     let best = code;
     let changed = true;
     while (changed) {
@@ -245,7 +282,17 @@ function shrink(code: string): string {
             if (trimmed === '' || trimmed === '}' || trimmed.startsWith('function') || trimmed.includes('function entry') || trimmed.startsWith('/* @optimize */ function') || trimmed.startsWith('return ')) continue;
             const candidate = lines.slice(0, i).concat(lines.slice(i + 1)).join('\n');
             try {
-                if (diff(candidate)) {
+                // Keep the reduction only if it (a) still diverges AND (b) PRESERVES
+                // the original source value. (b) prevents dropping a needed
+                // declaration — which would turn a real var into an undefined read
+                // (NaN, which still "diverges") and yield a misleading repro.
+                const cv = evalProgram(candidate, 'entry(7, 3)');
+                if (
+                    orig.ok &&
+                    cv.ok &&
+                    JSON.stringify(cv.value) === JSON.stringify(orig.value) &&
+                    diff(candidate)
+                ) {
                     best = candidate;
                     changed = true;
                     break;
@@ -263,10 +310,12 @@ function shrink(code: string): string {
 // BLOCKING GATE (always on): the codebase is fuzz-clean to 80k+ iterations, so a
 // modest deterministic batch runs on every `pnpm test` to catch new regressions.
 // Deterministic (fixed seed) → stable. For a deep campaign, scale it up:
-//   FUZZ_ITERS=80000 pnpm fuzz            (raise vitest's timeout for big runs:)
-//   FUZZ_ITERS=80000 npx vitest run tst/fuzz.test.ts --testTimeout=600000
+//   FUZZ_ITERS=40000 npx vitest run tst/fuzz.test.ts --testTimeout=600000
 // FUZZ_SEED varies the corpus. The default batch is kept small so the gate stays
-// fast; the tail is covered by the on-demand campaign.
+// fast; the tail is covered by on-demand campaigns. Note: a single run beyond
+// ~40k iters (~30s) can trip vitest's worker RPC heartbeat ("Timeout calling
+// onTaskUpdate" — benign, not a miscompile); for deeper coverage run several
+// chunks with different FUZZ_SEED rather than one huge FUZZ_ITERS.
 describe('behavioral fuzzer: compiled output ≡ source', () => {
     const ITERS = Number(process.env.FUZZ_ITERS ?? 500);
     const BASE = Number(process.env.FUZZ_SEED ?? 0x1234abcd);
