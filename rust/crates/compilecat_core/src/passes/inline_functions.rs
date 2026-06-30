@@ -1015,85 +1015,117 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
     }
 
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
-        // Effects to the LEFT in the statement (snapshot before this subtree), and
-        // whether this expr itself is an effect (for later siblings).
+        // Effects to the LEFT in the statement (snapshot before this subtree).
         let effect_before = self.passed_effect;
-        let effectful = !is_side_effect_free(expr);
         walk_mut::walk_expression(self, expr); // inner calls hoist first (eval order)
-        if effectful {
+
+        'hoist: {
+            // Inside a conditionally-evaluated position (`no_hoist`), or with an
+            // effect already evaluated earlier in the statement (`effect_before`):
+            // leave the call un-inlined. Hoisting the block before the statement
+            // would run it unconditionally / out of order relative to that effect.
+            if self.no_hoist || effect_before {
+                break 'hoist;
+            }
+
+            let id = self.next_id;
+            // Result-temp name: `_<callee>__result_<id>` reads as "the value of
+            // <callee>" (anon callee → `_result_<id>`), instead of an opaque
+            // `_compilecat_result_<id>`.
+            let result = match &*expr {
+                Expression::CallExpression(call) => match callee_simple_name(call) {
+                    Some(n) => format!("_{n}__result_{id}"),
+                    None => format!("_result_{id}"),
+                },
+                _ => format!("_result_{id}"),
+            };
+            let plan = match &*expr {
+                Expression::CallExpression(call) if triggered(&self.trigger, call) => {
+                    call_key(call).and_then(|k| self.candidates.get(k.as_str())).and_then(|cand| {
+                        build_block_plan(
+                            self.allocator,
+                            call,
+                            cand,
+                            Some(result.clone()),
+                            None,
+                            &self.local_names,
+                            id,
+                        )
+                    })
+                }
+                _ => None,
+            };
+            let Some(plan) = plan else { break 'hoist };
+            self.next_id += 1;
+
+            let out = mutate_for_block_inline(
+                self.allocator,
+                BlockMutateInput {
+                    body_stmts: plan.body_stmts,
+                    params: plan.params,
+                    args: plan.args,
+                    label: format!("_compilecat_inline_label_{id}"),
+                    result_name: result.clone(),
+                    needs_result: true,
+                },
+            );
+
+            let ast = AstBuilder::new(self.allocator);
+            let rn: &'a str = self.allocator.alloc_str(&result);
+            let bid = ast.binding_pattern_binding_identifier(oxc_span::SPAN, rn);
+            let declr = ast.variable_declarator(
+                oxc_span::SPAN,
+                VariableDeclarationKind::Let,
+                bid,
+                oxc_ast::NONE,
+                None,
+                false,
+            );
+            self.hoists.push(Statement::VariableDeclaration(ast.alloc(ast.variable_declaration(
+                oxc_span::SPAN,
+                VariableDeclarationKind::Let,
+                ast.vec1(declr),
+                false,
+            ))));
+            self.hoists.push(out.block);
+            *expr = ast.expression_identifier(oxc_span::SPAN, rn);
+        }
+
+        // Residual in-statement effect for later siblings — checked AFTER the
+        // hoist, on the FINAL expression. A successfully hoisted call becomes a
+        // pure `_result` identifier (its block is spliced OUT of the statement, so
+        // a later sibling's hoist can't be reordered past it), contributing no
+        // effect — so `blk1(x) + blk2(y)` hoists both. A call left in place (bailed
+        // or non-candidate) is a real left-effect and is recorded.
+        if !is_side_effect_free(expr) {
             self.passed_effect = true;
         }
-
-        // Inside a conditionally-evaluated position (`no_hoist`), or with an effect
-        // already evaluated earlier in the statement (`effect_before`): leave the
-        // call un-inlined. Hoisting the block before the statement would run it
-        // unconditionally / out of order relative to that earlier effect.
-        if self.no_hoist || effect_before {
-            return;
-        }
-
-        let id = self.next_id;
-        // Result-temp name: `_<callee>__result_<id>` reads as "the value of
-        // <callee>" (anon callee → `_result_<id>`), instead of an opaque
-        // `_compilecat_result_<id>`.
-        let result = match &*expr {
-            Expression::CallExpression(call) => match callee_simple_name(call) {
-                Some(n) => format!("_{n}__result_{id}"),
-                None => format!("_result_{id}"),
-            },
-            _ => format!("_result_{id}"),
-        };
-        let plan = match &*expr {
-            Expression::CallExpression(call) if triggered(&self.trigger, call) => {
-                call_key(call).and_then(|k| self.candidates.get(k.as_str())).and_then(|cand| {
-                    build_block_plan(
-                        self.allocator,
-                        call,
-                        cand,
-                        Some(result.clone()),
-                        None,
-                        &self.local_names,
-                        id,
-                    )
-                })
-            }
-            _ => None,
-        };
-        let Some(plan) = plan else { return };
-        self.next_id += 1;
-
-        let out = mutate_for_block_inline(
-            self.allocator,
-            BlockMutateInput {
-                body_stmts: plan.body_stmts,
-                params: plan.params,
-                args: plan.args,
-                label: format!("_compilecat_inline_label_{id}"),
-                result_name: result.clone(),
-                needs_result: true,
-            },
-        );
-
-        let ast = AstBuilder::new(self.allocator);
-        let rn: &'a str = self.allocator.alloc_str(&result);
-        let bid = ast.binding_pattern_binding_identifier(oxc_span::SPAN, rn);
-        let declr = ast.variable_declarator(
-            oxc_span::SPAN,
-            VariableDeclarationKind::Let,
-            bid,
-            oxc_ast::NONE,
-            None,
-            false,
-        );
-        self.hoists.push(Statement::VariableDeclaration(ast.alloc(ast.variable_declaration(
-            oxc_span::SPAN,
-            VariableDeclarationKind::Let,
-            ast.vec1(declr),
-            false,
-        ))));
-        self.hoists.push(out.block);
-        *expr = ast.expression_identifier(oxc_span::SPAN, rn);
     }
+}
+
+/// Generated-temp bindings a prior inline left in a candidate body — names
+/// containing `__` (param α-renames `p__N` and result temps `_x__result_N`),
+/// collected for re-uniquification on clone. Skips nested function/arrow scopes
+/// (their bindings don't lift into the host) and consumer code (which rarely uses
+/// `__`); a false positive only renames a binding consistently, never miscompiles.
+fn collect_generated_bindings(body: &[Statement]) -> HashSet<String> {
+    struct V {
+        names: HashSet<String>,
+    }
+    impl<'a> Visit<'a> for V {
+        fn visit_function(&mut self, _: &Function<'a>, _: oxc_semantic::ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+        fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
+            if id.name.contains("__") {
+                self.names.insert(id.name.to_string());
+            }
+        }
+    }
+    let mut v = V { names: HashSet::new() };
+    for s in body {
+        v.visit_statement(s);
+    }
+    v.names
 }
 
 /// Build the splice plan for a BLOCK candidate call: arg clones (padded with
@@ -1149,6 +1181,17 @@ fn build_block_plan<'a>(
         let fresh = format!("{p}__{id}");
         renames.insert(p.clone(), fresh.clone());
         *p = fresh;
+    }
+    // Re-uniquify generated temps a PRIOR sub-inline baked into this candidate
+    // body (inlining @inline `h0` into `h1` leaves `a__0`/`b__0`/`_h0__result_0`
+    // in h1's body). Cloning the body into N call sites duplicates those fixed-id
+    // names; once minimize-exit unwraps the inline label-blocks into one scope the
+    // duplicates conflate (oxc models same-name same-scope bindings as ONE symbol)
+    // and corrupt symbol-keyed passes — exactly the param case above, one level
+    // deeper. Suffix each with this expansion's unique `id` (`$` matches the
+    // block_flatten suffix convention). Skips the params (already renamed).
+    for name in collect_generated_bindings(&cand.body) {
+        renames.entry(name.clone()).or_insert_with(|| format!("{name}${id}"));
     }
     // Reusing an existing var as the result temp is unsafe if the body has a free
     // read of that name — bail (only relevant for init/assign shapes).
@@ -1323,6 +1366,15 @@ struct Renamer<'a, 'r> {
 
 impl<'a> VisitMut<'a> for Renamer<'a, '_> {
     fn visit_identifier_reference(&mut self, id: &mut IdentifierReference<'a>) {
+        if let Some(fresh) = self.map.get(id.name.as_str()) {
+            let nm: &'a str = self.allocator.alloc_str(fresh);
+            id.name = nm.into();
+        }
+    }
+    // Also rename the `let`/`const` BINDING site (not just reads) — params have no
+    // body binding, but a re-uniquified nested generated temp (`let b__0`) does, so
+    // its declaration must move with its references.
+    fn visit_binding_identifier(&mut self, id: &mut oxc_ast::ast::BindingIdentifier<'a>) {
         if let Some(fresh) = self.map.get(id.name.as_str()) {
             let nm: &'a str = self.allocator.alloc_str(fresh);
             id.name = nm.into();
@@ -1934,36 +1986,44 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         // Effects to the LEFT of this expression in the statement (snapshot BEFORE
         // walking this subtree — so the expr's OWN args don't count as "before").
         let effect_before = self.passed_effect;
-        // Whether this expression itself carries an effect (for later siblings).
-        let effectful = !is_side_effect_free(expr);
         walk_mut::walk_expression(self, expr); // inner calls inline first (eval order)
-        if effectful {
-            self.passed_effect = true;
+
+        'inline: {
+            let Expression::CallExpression(call) = &*expr else { break 'inline };
+            if !triggered(&self.trigger, call) {
+                break 'inline;
+            }
+            let Some(key) = call_key(call) else { break 'inline };
+            let Some(cand) = self.candidates.get(key.as_str()) else { break 'inline };
+            // Disjoint field borrows: `cand` ← self.candidates, `&mut self.next_id`,
+            // `&mut self.hoists`, `&self.local_names`, `self.allocator`.
+            // Bail an eval-once hoist if we're in a conditional position (`no_hoist`)
+            // OR there's an effect to our left (`effect_before`) — hoisting before
+            // the statement would reorder this call's arg past that earlier effect.
+            let replacement = build_inlined(
+                self.allocator,
+                cand,
+                call,
+                &self.local_names,
+                &mut self.next_id,
+                &mut self.hoists,
+                self.no_hoist || effect_before,
+            );
+            if let Some(v) = replacement {
+                *expr = v;
+                self.count += 1;
+            }
         }
 
-        let Expression::CallExpression(call) = &*expr else { return };
-        if !triggered(&self.trigger, call) {
-            return;
-        }
-        let Some(key) = call_key(call) else { return };
-        let Some(cand) = self.candidates.get(key.as_str()) else { return };
-        // Disjoint field borrows: `cand` ← self.candidates, `&mut self.next_id`,
-        // `&mut self.hoists`, `&self.local_names`, `self.allocator`.
-        // Bail an eval-once hoist if we're in a conditional position (`no_hoist`)
-        // OR there's an effect to our left (`effect_before`) — hoisting before the
-        // statement would reorder this call's arg past that earlier effect.
-        let replacement = build_inlined(
-            self.allocator,
-            cand,
-            call,
-            &self.local_names,
-            &mut self.next_id,
-            &mut self.hoists,
-            self.no_hoist || effect_before,
-        );
-        if let Some(v) = replacement {
-            *expr = v;
-            self.count += 1;
+        // Record a residual in-statement effect for later siblings — checked AFTER
+        // inlining, on the FINAL expression. A helper that inlined to pure code (or
+        // whose eval-once arg/block was hoisted OUT of the statement) carries no
+        // residual effect, so it no longer bails a sibling's hoist: `lenSq(a) +
+        // lenSq(b)` inlines both. A non-inlined call (or a body still holding one)
+        // is a real left-effect and is recorded. (Pre-inline checking over-counted
+        // a soon-to-be-pure helper call as an effect.)
+        if !is_side_effect_free(expr) {
+            self.passed_effect = true;
         }
     }
 }

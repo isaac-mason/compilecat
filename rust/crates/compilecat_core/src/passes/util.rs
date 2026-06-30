@@ -89,6 +89,13 @@ fn call_is_side_effect_free(c: &CallExpression) -> bool {
 /// tagged-template / dynamic-import / `delete` are always effectful. Unlike the
 /// permissive [`is_pure`] (which treats member reads as impure but is otherwise
 /// used for fold/dce shape checks), use THIS for "may I drop/move this?".
+///
+/// Scope: this answers "no observable SIDE EFFECT", not "cannot THROW". A member
+/// read on a null receiver, or `1n + 1`, is side-effect-free yet throws — so
+/// substituting/dropping it can defer or drop that throw. That's an accepted
+/// precondition of optimized regions (well-behaved property access / no type
+/// errors on the hot path), the same assumption that makes member reads pure and
+/// matching Closure's `mayHaveSideEffects` (separate from `mayThrow`).
 pub fn is_side_effect_free(e: &Expression) -> bool {
     match e {
         Expression::NumericLiteral(_)
@@ -99,9 +106,11 @@ pub fn is_side_effect_free(e: &Expression) -> bool {
         | Expression::RegExpLiteral(_)
         | Expression::Identifier(_)
         | Expression::ThisExpression(_)
+        // function/arrow exprs create a closure (no eval of the body) → pure. A
+        // CLASS expression is NOT here: it runs static field initializers, static
+        // blocks, computed key/method-name exprs, and the `extends` expression.
         | Expression::FunctionExpression(_)
-        | Expression::ArrowFunctionExpression(_)
-        | Expression::ClassExpression(_) => true,
+        | Expression::ArrowFunctionExpression(_) => true,
         Expression::ParenthesizedExpression(p) => is_side_effect_free(&p.expression),
         Expression::TSAsExpression(t) => is_side_effect_free(&t.expression),
         Expression::TSSatisfiesExpression(t) => is_side_effect_free(&t.expression),
@@ -112,7 +121,12 @@ pub fn is_side_effect_free(e: &Expression) -> bool {
             u.operator != UnaryOperator::Delete && is_side_effect_free(&u.argument)
         }
         Expression::BinaryExpression(b) => {
-            is_side_effect_free(&b.left) && is_side_effect_free(&b.right)
+            // `x instanceof C` invokes `C[Symbol.hasInstance]`; `k in obj` invokes a
+            // Proxy `has` trap — both observable effects, so exclude them (matching
+            // `is_pure`).
+            !matches!(b.operator, BinaryOperator::In | BinaryOperator::Instanceof)
+                && is_side_effect_free(&b.left)
+                && is_side_effect_free(&b.right)
         }
         Expression::LogicalExpression(l) => {
             is_side_effect_free(&l.left) && is_side_effect_free(&l.right)

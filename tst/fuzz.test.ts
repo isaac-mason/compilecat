@@ -578,6 +578,40 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         'pure-annotated call keeps impure arg effect',
         `function f(x) { return x; }\n/* @optimize */ function entry(p, q) { const v = /*@__PURE__*/ f(eff(7)); return q; }`,
     );
+    // `x instanceof C` invokes C[Symbol.hasInstance]; `k in obj` a Proxy `has`
+    // trap — real effects that must not be dropped/reordered (HOLE 1).
+    chk(
+        'instanceof effect preserved (Symbol.hasInstance)',
+        `class C { static [Symbol.hasInstance](x) { eff(1); return false; } }\n/* @inline */ function ignore(a) { return 42; }\n/* @optimize */ function entry(p, q) { return ignore(p instanceof C) + q; }`,
+    );
+    // A class EXPRESSION runs static field initializers when evaluated (HOLE 2).
+    chk(
+        'class-expression static-init effect preserved',
+        `/* @inline */ function ignore(a) { return 42; }\n/* @optimize */ function entry(p, q) { return ignore(class { static z = eff(9); }) + q; }`,
+    );
+
+    // Nested inline + multi-call temp collision: @inline `h0` (BLOCK) inlined into
+    // `h1` bakes id-0 temps (`a__0`/`_h0__result_0`) into h1's body; inlining h1 at
+    // two sites cloned them, and minimize-exit unwrapping the blocks conflated the
+    // duplicates → one expansion's value used for both (here pt3.x's eff(16) became
+    // pa0.x's eff(1)). build_block_plan now re-uniquifies nested generated temps.
+    chk(
+        'nested-inline cloned-temp collision (eff value)',
+        `/* @inline */ function h0(a, b) { if (b > 99) return 0; return (b > Math.max(b, 4) ? eff(a) : eff(b)); }\nfunction h1(a, b) { return h0(b + a, b * b); }\n/* @inline */ function h2(a, b) { return { x: h1(4, 4), y: (a - b) }; }\n/* @optimize */ function entry(p, q) { const pa0 = /* @sroa */ { x: h1(4, 1), y: 2 }; const pt3 = /* @sroa */ h2(p, q); return pa0.x + pt3.y; }`,
+    );
+
+    // OPTIMIZATION (not just correctness): chained multi-statement @inline helpers
+    // — the textbook `lenSq(a) + lenSq(b)` — must BOTH inline. A regression made
+    // the post-inline effect signal pre-inline, so the left (soon-pure) call bailed
+    // the right. Assert no residual helper call survives.
+    it('chained BLOCK @inline helpers both inline', () => {
+        const out = compiler.compileChunk(
+            'r.ts',
+            `/* @inline */ function lenSq(v) { const dx = v.x; const dy = v.y; return dx * dx + dy * dy; }\nexport function entry(a, b) { return lenSq(a) + lenSq(b); }`,
+            {},
+        ).code;
+        expect(out).not.toMatch(/lenSq\s*\(/); // both calls inlined away
+    });
 
     // Cross-file: inlining a donor whose param sits in a conditional branch
     // substituted the impure arg into that branch, dropping its effect when the
