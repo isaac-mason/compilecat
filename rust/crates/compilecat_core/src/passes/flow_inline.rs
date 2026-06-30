@@ -765,11 +765,7 @@ fn read_idents_in_value<'a>(value: AstKind<'a>, f: &mut impl FnMut(&IdentifierRe
         }
         AstKind::CallExpression(c) => {
             walk_reads(&c.callee, f);
-            for arg in &c.arguments {
-                if let Some(e) = arg.as_expression() {
-                    walk_reads(e, f);
-                }
-            }
+            walk_arg_reads(&c.arguments, f);
         }
         AstKind::IdentifierReference(id) => f(id),
         AstKind::StaticMemberExpression(m) => walk_reads(&m.object, f),
@@ -810,28 +806,16 @@ fn walk_reads<'a>(e: &Expression<'a>, f: &mut impl FnMut(&IdentifierReference<'a
         Expression::ParenthesizedExpression(p) => walk_reads(&p.expression, f),
         Expression::CallExpression(c) => {
             walk_reads(&c.callee, f);
-            for arg in &c.arguments {
-                if let Some(e) = arg.as_expression() {
-                    walk_reads(e, f);
-                }
-            }
+            walk_arg_reads(&c.arguments, f);
         }
         Expression::NewExpression(c) => {
             walk_reads(&c.callee, f);
-            for arg in &c.arguments {
-                if let Some(e) = arg.as_expression() {
-                    walk_reads(e, f);
-                }
-            }
+            walk_arg_reads(&c.arguments, f);
         }
         Expression::ChainExpression(c) => match &c.expression {
             ChainElement::CallExpression(inner) => {
                 walk_reads(&inner.callee, f);
-                for arg in &inner.arguments {
-                    if let Some(e) = arg.as_expression() {
-                        walk_reads(e, f);
-                    }
-                }
+                walk_arg_reads(&inner.arguments, f);
             }
             ChainElement::StaticMemberExpression(m) => walk_reads(&m.object, f),
             ChainElement::ComputedMemberExpression(m) => {
@@ -892,8 +876,41 @@ fn walk_reads<'a>(e: &Expression<'a>, f: &mut impl FnMut(&IdentifierReference<'a
                 }
             }
         }
-        // literals, functions, classes, this, super, await/yield (cfg bails) → no reads.
+        // TS type-only wrappers carry the inner expression's reads and persist in
+        // TS→TS output — recurse into the wrapped expression.
+        Expression::TSAsExpression(e) => walk_reads(&e.expression, f),
+        Expression::TSSatisfiesExpression(e) => walk_reads(&e.expression, f),
+        Expression::TSNonNullExpression(e) => walk_reads(&e.expression, f),
+        Expression::TSTypeAssertion(e) => walk_reads(&e.expression, f),
+        Expression::TSInstantiationExpression(e) => walk_reads(&e.expression, f),
+        Expression::ImportExpression(e) => {
+            walk_reads(&e.source, f);
+            if let Some(o) = &e.options {
+                walk_reads(o, f);
+            }
+        }
+        // literals, functions, classes/JSX (cfg bails), this, super,
+        // await/yield (cfg bails) → no reads.
         _ => {}
+    }
+}
+
+/// Reads in call/new arguments, including spread args (`f(...x)`) — `Argument`'s
+/// `as_expression()` returns `None` for a `SpreadElement`, so a plain
+/// `as_expression()` loop silently drops spread reads.
+fn walk_arg_reads<'a>(
+    args: &oxc_allocator::Vec<'a, Argument<'a>>,
+    f: &mut impl FnMut(&IdentifierReference<'a>),
+) {
+    for arg in args {
+        match arg {
+            Argument::SpreadElement(s) => walk_reads(&s.argument, f),
+            _ => {
+                if let Some(e) = arg.as_expression() {
+                    walk_reads(e, f);
+                }
+            }
+        }
     }
 }
 

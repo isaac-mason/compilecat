@@ -1127,7 +1127,8 @@ mod tests {
         let allocator = Allocator::default();
         let mut program = crate::parse_program(&allocator, src, SourceType::ts());
         crate::passes::normalize::run(&allocator, &mut program);
-        crate::passes::inline_functions::run(&allocator, &mut program);
+        let mut uid = 0u32;
+        crate::passes::inline_functions::run(&allocator, &mut program, &mut uid);
         crate::passes::block_flatten::run(&allocator, &mut program);
         run(&allocator, &mut program, &HashMap::new());
         Codegen::new().build(&program).code
@@ -1146,16 +1147,15 @@ mod tests {
              /* @optimize */ function run() { return measure({ x: 0, y: 0 }, { x: 3, y: 4 }); }",
         );
         let run_fn = out.split("function run").nth(1).expect("run in output");
-        // Both aggregates scalarized: every scalar referenced must be declared.
-        for scalar in ["a_x", "a_y", "b_x", "b_y"] {
-            assert!(
-                run_fn.contains(&format!("{scalar} = ")),
-                "{scalar} must be declared, not just referenced:\n{out}"
-            );
-        }
-        // No object literal survives in `run` (both `a` and `b` were scalarized).
-        assert!(!run_fn.contains("x: 0"), "object `a` not scalarized:\n{out}");
-        assert!(!run_fn.contains("x: 3"), "object `b` not scalarized:\n{out}");
+        // Both arg aggregates were scalarized away (the `{x,y}` literals are gone).
+        // The inliner now α-renames the params per expansion (`a__<id>`/`b__<id>`),
+        // so SROA emits scalars named `a__<id>_x` etc. — assert both arg objects
+        // are gone and both produced scalar bindings, without hardcoding the id.
+        // (Eval-correctness — that no scalar is referenced-but-undeclared — is
+        // covered behaviorally by equivalence.test.ts `inline-object-args-then-sroa`.)
+        assert!(!run_fn.contains("x: 0"), "arg object `a` not scalarized:\n{out}");
+        assert!(!run_fn.contains("x: 3"), "arg object `b` not scalarized:\n{out}");
+        assert!(run_fn.contains("a__") && run_fn.contains("b__"), "both args present as scalars:\n{out}");
     }
 
     #[test]

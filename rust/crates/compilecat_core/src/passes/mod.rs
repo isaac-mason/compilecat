@@ -45,13 +45,15 @@ pub fn run_all<'a>(
     stats: &mut Stats,
     sroa_external_shapes: &HashMap<String, crate::analysis::type_shape::Shape>,
 ) {
-    run_all_gated(allocator, program, mode, stats, sroa_external_shapes, &HashSet::new());
+    run_all_gated(allocator, program, mode, stats, sroa_external_shapes, &HashSet::new(), 0);
 }
 
 /// As [`run_all`], but with `extra_touched` function span-starts opted into the
 /// cleanup gate — used by the cross-file path to mark `@inline` *target*
 /// functions (which carry no directive of their own) so their inlined residue
-/// gets cleaned.
+/// gets cleaned. `uid_base` continues the cross-file driver's inline-temp counter
+/// so generated names stay unique across the donor-inline → local-pipeline
+/// boundary (single-file callers pass 0).
 pub fn run_all_gated<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
@@ -59,13 +61,15 @@ pub fn run_all_gated<'a>(
     stats: &mut Stats,
     sroa_external_shapes: &HashMap<String, crate::analysis::type_shape::Shape>,
     extra_touched: &std::collections::HashSet<u32>,
+    uid_base: u32,
 ) {
     normalize::run(allocator, program);
     let _ = mode; // inline cross-file (PerFile) path not yet ported
 
     // Inline first (self-gated on directives); it returns the directive-free
     // consumers it inlined into so their residue can join the cleanup gate.
-    let (inlined, inline_targets) = inline_functions::run(allocator, program);
+    let mut uid = uid_base;
+    let (inlined, inline_targets) = inline_functions::run(allocator, program, &mut uid);
     stats.inlined += inlined;
 
     // Per-function/scope opt-in gate (worklist #4): only constructs carrying a
@@ -174,7 +178,8 @@ pub fn run_one<'a>(
             true
         }
         "inline-functions" => {
-            stats.inlined += inline_functions::run(allocator, program).0;
+            let mut uid = 0u32;
+            stats.inlined += inline_functions::run(allocator, program, &mut uid).0;
             true
         }
         "inline-variables" => {

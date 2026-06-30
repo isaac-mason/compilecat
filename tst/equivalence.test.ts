@@ -362,3 +362,127 @@ describe('behavioral equivalence: compiler output ≡ source', () => {
         });
     }
 });
+
+// Regression (was a KNOWN BUG, fixed): two calls to the same @inline helper share
+// `a` but pass DIFFERENT members of a SROA-scalarized object as `b` (`pt.x` vs
+// `pt.y`). The BLOCK inliner bound both expansions' param to the raw name `let b`;
+// once minimize-exit-points unwrapped the inline label-blocks into the function
+// scope, the two `let b`s became a duplicate same-scope binding that semantic
+// conflated → inline-variables substituted one call's value into both. Fixed by
+// α-renaming BLOCK-inline params to a per-expansion-unique `b__<id>`. Found by the
+// fuzzer (tst/fuzz.test.ts).
+describe('fuzzer regressions', () => {
+    it('repeated-inline-with-distinct-sroa-member-args', () => {
+        const code = `/* @inline */ function h0(a, b) { if (a >= 8) return 1; return b; }
+/* @optimize */ function entry(p, q) { const pt = { x: q, y: 0 }; let c = h0(q, pt.x); return c + h0(q, pt.y); }`;
+        const call = 'entry(7, 3)';
+        const expected = run(code, call);
+        const compiled = compiler.compileChunk('fuzz-inline-member-args.ts', withExports(code), {}).code;
+        expect(run(compiled, call)).toEqual(expected);
+    });
+
+    // A nested EXPRESSION-position inline whose result-temp declaration was wrongly
+    // dropped: a helper `h1` (itself inlined) whose body is `h0(9,a) + h0(b,0)` (two
+    // expr-position @inline calls) — so both `h1` and `entry` get a `_h0__result_0`
+    // result-temp (the per-context inline id counters repeat across functions).
+    // cleanup_residue removed the (dead) `_h0__result_0` in `h1` BY NAME, which also
+    // killed the LIVE `_h0__result_0` decl+assign in `entry` → `_h0__result_0 + …`
+    // referenced but never declared (ReferenceError). Fixed by keying
+    // cleanup_residue's dead-def removal by NodeId, not name.
+    it('nested-expr-inline-result-temp-dropped', () => {
+        const code = `/* @inline */ function h0(a, b) { let t; if (Math.max(a, b) >= Math.max(a, a)) { t = Math.abs(Math.max(b, 3)); } else { t = Math.abs(3 - b); } return t; }
+function h1(a, b) { if (b + 1 < b) return h1(Math.abs(a), h1(9, b)); return h0(9, a) + h0(b, 0); }
+/* @optimize */ function entry(p, q) {
+  const pt0 = /* @sroa */ { x: h0(q, 5), y: h0(5, q) };
+  const pt2 = /* @sroa */ { x: q, y: h1(1, 2) };
+  let c4 = 0; if (h1(pt2.y, pt2.y) < 7 * pt0.x) { c4 = pt0.x; } else { c4 = 0; }
+  return Math.abs(2);
+}`;
+        const call = 'entry(7, 3)';
+        const expected = run(code, call);
+        const compiled = compiler.compileChunk('fuzz-nested-expr-temp.ts', withExports(code), {}).code;
+        expect(run(compiled, call)).toEqual(expected);
+    });
+
+    // Regression (was a KNOWN BUG, fixed): an inlined `const v = h1(…)` used in
+    // BOTH a foldable condition (`if (v < 3)`) AND an `@sroa` object field
+    // (`{ x: v }`). flow-inline's maybe-reaching-USE analysis (reaching.rs) had no
+    // case for `ObjectExpression`/`ArrayExpression` (etc.), so the `v` use inside
+    // the object literal was invisible → `v` looked single-use → flow-inline
+    // inlined it into the condition and dropped its def, dangling `x: v` →
+    // `v is not defined`. Fixed by making both reaching walkers recurse into
+    // container expressions. Found by the fuzzer (tst/fuzz.test.ts).
+    it('const-inline-folded-cond-use-vs-sroa-field', () => {
+        const code = `/* @inline */ function h1(a, b) { let t; if (b <= 0) { t = 0; } else { t = 1; } return t; }
+function entry(p, q) {
+  const v = h1(q, 5);
+  let c = 0; if (v < 3) { c = 1; } else { c = 2; }
+  const pt = /* @sroa */ { x: v, y: c };
+  return pt.x + pt.y;
+}`;
+        const call = 'entry(7, 3)';
+        const expected = run(code, call);
+        const compiled = compiler.compileChunk('known-bug-const-inline-sroa-field.ts', withExports(code), {}).code;
+        expect(run(compiled, call)).toEqual(expected);
+    });
+});
+
+// Regressions from the adversarial self-review of the fuzzer fixes — each fix was
+// sound but the surrounding pass had a latent miscompile (verified before fixing).
+describe('adversarial-review regressions', () => {
+    const check = (file: string, code: string, call: string) => {
+        const expected = run(code, call);
+        const compiled = compiler.compileChunk(file, withExports(code), {}).code;
+        expect(run(compiled, call)).toEqual(expected);
+    };
+
+    // bug #1 fix introduced a shadow regression: renaming a param whose name is
+    // re-declared in a nested block corrupted the inner binding. Now bails.
+    it('inline-param-shadowed-in-nested-block', () => {
+        check(
+            'rev-shadow.ts',
+            `/* @inline */ function helper(b) { let r; { let b = 5; r = b; } return r + b; }\nfunction entry(x) { return helper(x + 1); }`,
+            'entry(6)',
+        );
+    });
+
+    // flow-inline reaching analysis missed uses inside TS type-wrappers (`x as T`,
+    // `x!`) and call/new spread (`f(...x)`) → dropped a still-used def.
+    it('flow-inline-use-in-call-spread', () => {
+        check(
+            'rev-spread.ts',
+            `/* @optimize */ function entry(p, q) { const x = [p, q]; const y = Math.max(...x); return x[0] + y; }`,
+            'entry(7, 3)',
+        );
+    });
+
+    // cleanup_residue dropped an impure init / a write nested in a call → lost an
+    // effect or dangled the binding. Now removal is symmetric + purity-checked.
+    it('cleanup-residue-keeps-effectful-and-nested-writes', () => {
+        check(
+            'rev-cleanup.ts',
+            `function sink(x) { globalThis.__n = (globalThis.__n || 0) + 1; return x; }\n/* @optimize */ function entry(p, q) { const v = /* @sroa */ [1, 2]; sink(v[0] = 9); return v[1]; }`,
+            'entry(7, 3)',
+        );
+    });
+
+    // cleanup_residue phase-1 propagation kept a stale value for a generated var
+    // reassigned inside a chained assignment (`v_x = v_y = 9`) → wrong value.
+    it('cleanup-residue-chained-assign-through-sroa', () => {
+        check(
+            'rev-chain.ts',
+            `/* @optimize */ function entry(p, q) { const v = /* @sroa */ { x: 1, y: 2 }; v.x = v.y = 9; return v.y; }`,
+            'entry(7, 3)',
+        );
+    });
+
+    // systemic: phase-1 (@inline decl) + phase-3 (call-site) inline-temp counters
+    // collided → self-referential const (TDZ). Now one program-global counter.
+    it('inline-temp-counter-cross-phase', () => {
+        check(
+            'rev-counter.ts',
+            `/* @inline */ function twice(a) { return log(a) + log(a); }\nfunction quad(b) { return b * b; }\nfunction log(x) { return x; }\nfunction entry() { return /* @inline */ quad(twice(3)); }`,
+            'entry()',
+        );
+    });
+});

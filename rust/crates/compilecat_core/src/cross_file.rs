@@ -141,11 +141,15 @@ pub fn transform_cross_file(
     // consumer functions that call a donor BEFORE inlining (the calls vanish
     // after) so the cleanup gate cleans their inlined residue.
     let mut inline_targets: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // One inline-temp counter for the WHOLE chunk: cross-file donor inlining
+    // (`inline_with`, `flatten_into_hosts`) then the local pipeline (`run_all_gated`
+    // via `uid_base`) — so every generated temp name is unique across all of them.
+    let mut uid = 0u32;
     if !reg.direct.is_empty() || !reg.block.is_empty() {
         let keys: std::collections::HashSet<String> =
             reg.direct.keys().chain(reg.block.keys()).cloned().collect();
         inline_targets = passes::inline_functions::functions_calling(&program, &keys);
-        stats.inlined += inline_with(&allocator, &mut program, &reg.direct, &reg.block);
+        stats.inlined += inline_with(&allocator, &mut program, &reg.direct, &reg.block, &mut uid);
         remove_unused_imports(&allocator, &mut program, &reg.inlined_locals);
         prepend_imports(&allocator, &mut program, reg.forward);
         insert_after_imports(&allocator, &mut program, reg.hoist);
@@ -238,7 +242,7 @@ pub fn transform_cross_file(
                 &flatten_spans,
                 &freg.direct,
                 &freg.block,
-                3_000_000,
+                &mut uid,
             );
             remove_unused_imports(&allocator, &mut program, &freg.inlined_locals);
         }
@@ -261,6 +265,7 @@ pub fn transform_cross_file(
         &mut stats,
         &sroa_external_shapes,
         &inline_targets,
+        uid,
     );
 
     let codegen_options = CodegenOptions {

@@ -280,8 +280,13 @@ impl MustWalk<'_, '_> {
     fn call(&mut self, c: &CallExpression, cond: bool) {
         self.expr(&c.callee, cond);
         for arg in &c.arguments {
-            if let Some(e) = arg.as_expression() {
-                self.expr(e, cond);
+            match arg {
+                Argument::SpreadElement(s) => self.expr(&s.argument, cond),
+                _ => {
+                    if let Some(e) = arg.as_expression() {
+                        self.expr(e, cond);
+                    }
+                }
             }
         }
     }
@@ -309,9 +314,96 @@ impl MustWalk<'_, '_> {
                 self.expr(&b.right, cond);
             }
             Expression::UnaryExpression(u) => self.expr(&u.argument, cond),
+            Expression::StaticMemberExpression(m) => self.expr(&m.object, cond),
+            Expression::ComputedMemberExpression(m) => {
+                self.expr(&m.object, cond);
+                self.expr(&m.expression, cond);
+            }
+            Expression::PrivateFieldExpression(m) => self.expr(&m.object, cond),
+            // TS type-only wrappers — recurse so a nested write/`arguments` inside
+            // `(x = 5) as T` etc. still registers.
+            Expression::TSAsExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSSatisfiesExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSNonNullExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSTypeAssertion(e) => self.expr(&e.expression, cond),
+            Expression::TSInstantiationExpression(e) => self.expr(&e.expression, cond),
+            Expression::ImportExpression(e) => {
+                self.expr(&e.source, cond);
+                if let Some(o) = &e.options {
+                    self.expr(o, cond);
+                }
+            }
             Expression::Identifier(id) if id.name == "arguments" => {
                 self.events.push(MustEvent::InvalidateAll);
             }
+            // Container expressions: recurse so a write/update nested inside a
+            // literal (`const o = { x: (a = 5) }`, `[a++]`) still KILLs its slot —
+            // otherwise must-reaching would treat an overwritten def as still
+            // reaching. (Mirror of the maybe-reaching walker's container coverage.)
+            Expression::NewExpression(c) => {
+                self.expr(&c.callee, cond);
+                for arg in &c.arguments {
+                    if let Some(e) = arg.as_expression() {
+                        self.expr(e, cond);
+                    }
+                }
+            }
+            Expression::ObjectExpression(o) => {
+                for p in &o.properties {
+                    match p {
+                        ObjectPropertyKind::ObjectProperty(prop) => {
+                            if prop.computed {
+                                if let Some(e) = prop.key.as_expression() {
+                                    self.expr(e, cond);
+                                }
+                            }
+                            self.expr(&prop.value, cond);
+                        }
+                        ObjectPropertyKind::SpreadProperty(s) => self.expr(&s.argument, cond),
+                    }
+                }
+            }
+            Expression::ArrayExpression(arr) => {
+                for el in &arr.elements {
+                    match el {
+                        ArrayExpressionElement::SpreadElement(s) => self.expr(&s.argument, cond),
+                        ArrayExpressionElement::Elision(_) => {}
+                        _ => {
+                            if let Some(e) = el.as_expression() {
+                                self.expr(e, cond);
+                            }
+                        }
+                    }
+                }
+            }
+            Expression::TemplateLiteral(t) => {
+                for e in &t.expressions {
+                    self.expr(e, cond);
+                }
+            }
+            Expression::TaggedTemplateExpression(t) => {
+                self.expr(&t.tag, cond);
+                for e in &t.quasi.expressions {
+                    self.expr(e, cond);
+                }
+            }
+            Expression::ChainExpression(c) => match &c.expression {
+                ChainElement::CallExpression(inner) => {
+                    self.expr(&inner.callee, cond);
+                    for arg in &inner.arguments {
+                        if let Some(e) = arg.as_expression() {
+                            self.expr(e, cond);
+                        }
+                    }
+                }
+                ChainElement::StaticMemberExpression(m) => self.expr(&m.object, cond),
+                ChainElement::ComputedMemberExpression(m) => {
+                    self.expr(&m.object, cond);
+                    self.expr(&m.expression, cond);
+                }
+                ChainElement::PrivateFieldExpression(m) => self.expr(&m.object, cond),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -561,8 +653,13 @@ impl MayWalk<'_> {
 
     fn call(&mut self, c: &CallExpression, cond: bool) {
         for arg in c.arguments.iter().rev() {
-            if let Some(e) = arg.as_expression() {
-                self.expr(e, cond);
+            match arg {
+                Argument::SpreadElement(s) => self.expr(&s.argument, cond),
+                _ => {
+                    if let Some(e) = arg.as_expression() {
+                        self.expr(e, cond);
+                    }
+                }
             }
         }
         self.expr(&c.callee, cond);
@@ -599,6 +696,90 @@ impl MayWalk<'_> {
                 self.expr(&m.expression, cond);
                 self.expr(&m.object, cond);
             }
+            Expression::PrivateFieldExpression(m) => self.expr(&m.object, cond),
+            // TS type-only wrappers (`x as T`, `x satisfies T`, `x!`, `<T>x`,
+            // `f<T>`) carry the inner expression's reads and persist in the
+            // TS→TS output — recurse into the wrapped expression.
+            Expression::TSAsExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSSatisfiesExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSNonNullExpression(e) => self.expr(&e.expression, cond),
+            Expression::TSTypeAssertion(e) => self.expr(&e.expression, cond),
+            Expression::TSInstantiationExpression(e) => self.expr(&e.expression, cond),
+            Expression::ImportExpression(e) => {
+                if let Some(o) = &e.options {
+                    self.expr(o, cond);
+                }
+                self.expr(&e.source, cond);
+            }
+            // Container expressions: their sub-expressions are read unconditionally
+            // (when the container evaluates), so they carry uses. Missing these (esp.
+            // ObjectExpression) made a use inside `const pt = { x: v }` invisible to
+            // the reaching-USE analysis → flow-inline wrongly saw `v` as single-use,
+            // inlined it, and dropped its def, dangling the object-literal use.
+            Expression::NewExpression(c) => {
+                for arg in c.arguments.iter().rev() {
+                    if let Some(e) = arg.as_expression() {
+                        self.expr(e, cond);
+                    }
+                }
+                self.expr(&c.callee, cond);
+            }
+            Expression::ObjectExpression(o) => {
+                for p in o.properties.iter().rev() {
+                    match p {
+                        ObjectPropertyKind::ObjectProperty(prop) => {
+                            self.expr(&prop.value, cond);
+                            if prop.computed {
+                                if let Some(e) = prop.key.as_expression() {
+                                    self.expr(e, cond);
+                                }
+                            }
+                        }
+                        ObjectPropertyKind::SpreadProperty(s) => self.expr(&s.argument, cond),
+                    }
+                }
+            }
+            Expression::ArrayExpression(arr) => {
+                for el in arr.elements.iter().rev() {
+                    match el {
+                        ArrayExpressionElement::SpreadElement(s) => self.expr(&s.argument, cond),
+                        ArrayExpressionElement::Elision(_) => {}
+                        _ => {
+                            if let Some(e) = el.as_expression() {
+                                self.expr(e, cond);
+                            }
+                        }
+                    }
+                }
+            }
+            Expression::TemplateLiteral(t) => {
+                for e in t.expressions.iter().rev() {
+                    self.expr(e, cond);
+                }
+            }
+            Expression::TaggedTemplateExpression(t) => {
+                for e in t.quasi.expressions.iter().rev() {
+                    self.expr(e, cond);
+                }
+                self.expr(&t.tag, cond);
+            }
+            Expression::ChainExpression(c) => match &c.expression {
+                ChainElement::CallExpression(inner) => {
+                    for arg in inner.arguments.iter().rev() {
+                        if let Some(e) = arg.as_expression() {
+                            self.expr(e, cond);
+                        }
+                    }
+                    self.expr(&inner.callee, cond);
+                }
+                ChainElement::StaticMemberExpression(m) => self.expr(&m.object, cond),
+                ChainElement::ComputedMemberExpression(m) => {
+                    self.expr(&m.expression, cond);
+                    self.expr(&m.object, cond);
+                }
+                ChainElement::PrivateFieldExpression(m) => self.expr(&m.object, cond),
+                _ => {}
+            },
             _ => {}
         }
     }

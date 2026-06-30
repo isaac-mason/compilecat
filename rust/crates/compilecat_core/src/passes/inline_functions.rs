@@ -37,7 +37,6 @@ use oxc_ast::AstBuilder;
 use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_span::GetSpan;
 
-use super::block_flatten::pick_fresh;
 use super::block_mutate::{mutate_for_block_inline, BlockMutateInput};
 use super::util::is_pure;
 
@@ -56,7 +55,11 @@ pub(crate) struct Candidate<'a> {
 /// inlined residue must be opted into the cleanup gate. The cross-file path
 /// computes the same set itself (`inline_targets`); the same-file caller folds
 /// this into the gate so `@inline` output is flattened like `@optimize`'s.
-pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> (u32, HashSet<u32>) {
+pub fn run<'a>(
+    allocator: &'a Allocator,
+    program: &mut Program<'a>,
+    uid: &mut u32,
+) -> (u32, HashSet<u32>) {
     // Spans that carry a leading `@inline` comment (comment attaches to the
     // start of the following token = the declaration's span start).
     let inline_spans = super::directives::annotated_spans_with_exports(program, &["@inline"]);
@@ -97,7 +100,16 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> (u32, Has
         candidates.keys().chain(block_candidates.keys()).cloned().collect();
     let targets = functions_calling(program, &donor_keys);
 
-    let mut count = inline_with(allocator, program, &candidates, &block_candidates);
+    // ONE program-global counter (`uid`, threaded in by `&mut`) for every
+    // inline-generated name across ALL phases (declaration inlining,
+    // @optimize/@flatten, call-site) — and, via the caller, across the cross-file
+    // donor-inline that precedes this. Each generated `_inl_arg_<n>` /
+    // `_compilecat_inline_label_<n>` / `_…__result_<n>` / `p__<n>` is unique by
+    // construction, preventing the illegal same-scope redeclaration that
+    // `oxc_semantic` conflates (which defeats the block_flatten renamer and yields
+    // self-referential consts or cross-slot substitutions). Replaces the old
+    // per-phase bases (0 / 1M·k / 2M / 3M).
+    let mut count = inline_with(allocator, program, &candidates, &block_candidates, uid);
 
     // @flatten/@optimize: inline calls *inside* each annotated host, using every
     // top-level function as a candidate (scoped to the host subtree). More
@@ -119,13 +131,11 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> (u32, Has
             .filter_map(|s| top_level_function(s).map(|_| s.span().start))
             .filter(|st| flatten_spans.contains(st))
             .collect();
-        let mut next_id = 1_000_000u32;
         for span in host_spans {
             let (all_direct, all_block) = gather_all_callables(allocator, program);
             let single: HashSet<u32> = std::iter::once(span).collect();
             count +=
-                flatten_into_hosts(allocator, program, &single, &all_direct, &all_block, next_id);
-            next_id += 1_000_000;
+                flatten_into_hosts(allocator, program, &single, &all_direct, &all_block, uid);
         }
     }
 
@@ -140,25 +150,27 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> (u32, Has
                 allocator,
                 candidates: &all_direct,
                 count: 0,
-                next_id: 0,
+                next_id: *uid,
                 hoists: Vec::new(),
                 trigger: Some(inline_spans.clone()),
                 local_names: local_names.clone(),
             };
             di.visit_program(program);
             count += di.count;
+            *uid = di.next_id;
         }
         if !all_block.is_empty() {
             let mut bi = BlockInliner {
                 allocator,
                 candidates: &all_block,
                 count: 0,
-                next_id: 2_000_000,
+                next_id: *uid,
                 trigger: Some(inline_spans.clone()),
                 local_names: local_names.clone(),
             };
             bi.visit_program(program);
             count += bi.count;
+            *uid = bi.next_id;
         }
     }
 
@@ -261,13 +273,12 @@ pub(crate) fn flatten_into_hosts<'a>(
     flatten_spans: &HashSet<u32>,
     direct: &HashMap<String, Candidate<'a>>,
     block: &HashMap<String, BlockCandidate<'a>>,
-    next_id_base: u32,
+    uid: &mut u32,
 ) -> u32 {
     if flatten_spans.is_empty() || (direct.is_empty() && block.is_empty()) {
         return 0;
     }
     let mut count = 0;
-    let mut next_id = next_id_base;
     for stmt in program.body.iter_mut() {
         if !flatten_spans.contains(&stmt.span().start) {
             continue;
@@ -290,52 +301,60 @@ pub(crate) fn flatten_into_hosts<'a>(
             _ => None,
         };
         let Some(body) = body else { continue };
-        let mut direct_id = 0u32;
+        // All generated temps (DIRECT `_inl_arg_<n>` and BLOCK label/result/param
+        // temps) draw from ONE program-global counter `uid`, threaded through every
+        // inliner in every phase. This makes every generated name unique BY
+        // CONSTRUCTION across phases/functions, so no two same-named temps can ever
+        // land in one scope — the only thing that would make `oxc_semantic` conflate
+        // them (an illegal redeclaration the block_flatten renamer can't recover,
+        // producing self-referential consts / cross-slot substitutions). The
+        // counters are advanced sequentially: DIRECT, BLOCK, DIRECT.
         if !direct.is_empty() {
             let mut di = Inliner {
                 allocator,
                 candidates: direct,
                 count: 0,
-                next_id: direct_id,
+                next_id: *uid,
                 hoists: Vec::new(),
                 trigger: None,
                 local_names: local_names.clone(),
             };
             di.visit_function_body(body);
             count += di.count;
-            direct_id = di.next_id;
+            *uid = di.next_id;
         }
         if !block.is_empty() {
             let mut bi = BlockInliner {
                 allocator,
                 candidates: block,
                 count: 0,
-                next_id,
+                next_id: *uid,
                 trigger: None,
                 local_names: local_names.clone(),
             };
             bi.visit_function_body(body);
             count += bi.count;
-            next_id = bi.next_id;
+            *uid = bi.next_id;
             // Second DIRECT pass: inline single-return helpers (e.g. `len`) that
             // the BLOCK pass just spliced in from a multi-statement callee's body
             // (`normalize`). A single DIRECT-then-BLOCK ordering leaves those
             // un-inlined, keeping any aggregate they read-whole alive past SROA.
             // One extra pass resolves one level of BLOCK→DIRECT nesting; it can't
             // expand a recursive callee (DIRECT recursion still inlines one level
-            // per pass). `direct_id` continues so arg-binding temps stay unique.
+            // per pass). `uid` continues so arg-binding temps stay unique.
             if !direct.is_empty() {
                 let mut di = Inliner {
                     allocator,
                     candidates: direct,
                     count: 0,
-                    next_id: direct_id,
+                    next_id: *uid,
                     hoists: Vec::new(),
                     trigger: None,
                     local_names: local_names.clone(),
                 };
                 di.visit_function_body(body);
                 count += di.count;
+                *uid = di.next_id;
             }
         }
     }
@@ -461,6 +480,7 @@ pub(crate) fn inline_with<'a>(
     program: &mut Program<'a>,
     direct: &HashMap<String, Candidate<'a>>,
     block: &HashMap<String, BlockCandidate<'a>>,
+    uid: &mut u32,
 ) -> u32 {
     let local_names = Rc::new(collect_local_names(program));
     let mut count = 0;
@@ -469,25 +489,27 @@ pub(crate) fn inline_with<'a>(
             allocator,
             candidates: direct,
             count: 0,
-            next_id: 0,
+            next_id: *uid,
             hoists: Vec::new(),
             trigger: None,
             local_names: local_names.clone(),
         };
         inliner.visit_program(program);
         count += inliner.count;
+        *uid = inliner.next_id;
     }
     if !block.is_empty() {
         let mut bi = BlockInliner {
             allocator,
             candidates: block,
             count: 0,
-            next_id: 0,
+            next_id: *uid,
             trigger: None,
             local_names: local_names.clone(),
         };
         bi.visit_program(program);
         count += bi.count;
+        *uid = bi.next_id;
     }
     count
 }
@@ -760,7 +782,7 @@ impl<'a> BlockInliner<'a, '_> {
         // Allocate the id up front so α-renamed params share the inline's suffix;
         // only consume it (bump) when we actually inline.
         let id = self.next_id;
-        let Some(plan) = self.plan_for(&stmt) else { return Err(stmt) };
+        let Some(plan) = self.plan_for(&stmt, id) else { return Err(stmt) };
         self.next_id += 1;
         let needs_result = plan.result_name.is_some();
         let out = mutate_for_block_inline(
@@ -801,12 +823,12 @@ impl<'a> BlockInliner<'a, '_> {
 
     /// Recognize the call-site shape and build an owned plan (no borrow of the
     /// statement survives) — `f();` (discard), `x = f();`, `let x = f();`.
-    fn plan_for(&self, stmt: &Statement<'a>) -> Option<BlockPlan<'a>> {
+    fn plan_for(&self, stmt: &Statement<'a>, id: u32) -> Option<BlockPlan<'a>> {
         match stmt {
             Statement::ExpressionStatement(es) => match &es.expression {
                 Expression::CallExpression(call) => {
                     let cand = self.candidates.get(call_key(call)?.as_str())?;
-                    self.make_plan(call, cand, None, None)
+                    self.make_plan(call, cand, None, None, id)
                 }
                 Expression::AssignmentExpression(asn)
                     if asn.operator == AssignmentOperator::Assign =>
@@ -816,7 +838,7 @@ impl<'a> BlockInliner<'a, '_> {
                     };
                     let Expression::CallExpression(call) = &asn.right else { return None };
                     let cand = self.candidates.get(call_key(call)?.as_str())?;
-                    self.make_plan(call, cand, Some(target.name.to_string()), None)
+                    self.make_plan(call, cand, Some(target.name.to_string()), None, id)
                 }
                 _ => None,
             },
@@ -832,7 +854,7 @@ impl<'a> BlockInliner<'a, '_> {
                 let Some(Expression::CallExpression(call)) = &d.init else { return None };
                 let cand = self.candidates.get(call_key(call)?.as_str())?;
                 let name = bid.name.to_string();
-                self.make_plan(call, cand, Some(name.clone()), Some(name))
+                self.make_plan(call, cand, Some(name.clone()), Some(name), id)
             }
             _ => None,
         }
@@ -844,11 +866,12 @@ impl<'a> BlockInliner<'a, '_> {
         cand: &BlockCandidate<'a>,
         result_name: Option<String>,
         emit_let: Option<String>,
+        id: u32,
     ) -> Option<BlockPlan<'a>> {
         if !triggered(&self.trigger, call) {
             return None;
         }
-        build_block_plan(self.allocator, call, cand, result_name, emit_let, &self.local_names)
+        build_block_plan(self.allocator, call, cand, result_name, emit_let, &self.local_names, id)
     }
 
     /// Inline BLOCK candidate calls nested in `stmt`'s expressions, returning the
@@ -948,6 +971,7 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
                         Some(result.clone()),
                         None,
                         &self.local_names,
+                        id,
                     )
                 })
             }
@@ -1001,6 +1025,7 @@ fn build_block_plan<'a>(
     result_name: Option<String>,
     emit_let: Option<String>,
     local_names: &HashSet<String>,
+    id: u32,
 ) -> Option<BlockPlan<'a>> {
     if call.arguments.iter().any(Argument::is_spread) {
         return None;
@@ -1014,28 +1039,34 @@ fn build_block_plan<'a>(
     if !cand.free.is_disjoint(local_names) {
         return None;
     }
-    // α-rename: when an arg references a param name, the `let p = arg` prologue
-    // would TDZ-capture itself (`let p = …p…`). Rename the param to a fresh
-    // `p$<n>` (block_flatten's `pick_fresh` scheme — small + idiomatic, and
-    // block_flatten finalizes uniqueness across inlines) instead of bailing.
-    let mut arg_names = HashSet::new();
-    for a in &call.arguments {
-        collect_names(a.to_expression(), &mut arg_names);
+    // Shadow guard: the α-rename below is not shadow-aware, so bail if the body
+    // re-declares a param name in a nested scope (see `stmts_shadow_params`).
+    {
+        let pset: HashSet<&str> = cand.params.iter().map(String::as_str).collect();
+        if stmts_shadow_params(&cand.body, &pset) {
+            return None;
+        }
     }
+    // α-rename EVERY param to a per-expansion-unique `p__<id>` (the same `id` that
+    // suffixes the result-temp/label). Two reasons, both correctness:
+    //   1. Two inlines of the SAME helper would otherwise both bind the raw param
+    //      name (`let b = …`). Once minimize-exit-points unwraps the inline
+    //      label-blocks into the parent scope, those become duplicate same-scope
+    //      `let b`s, which `oxc_semantic` conflates into ONE symbol — corrupting
+    //      every symbol-keyed pass (inline-variables substituted one call's value
+    //      into both). The `id` suffix makes each expansion's bindings distinct.
+    //   2. It subsumes the old TDZ guard: when an arg references the param name
+    //      (`h(b)` into param `b` → `let b = b`), `let b__id = b` reads the
+    //      consumer's `b`, no self-capture.
+    // Single-use temps still fold away in inline-variables; the suffix only
+    // survives on genuinely multi-use params (rare), consistent with the
+    // result-temp/label naming already in the output.
     let mut params = cand.params.clone();
-    // Names the fresh binding must dodge: the consumer's locals, anything the args
-    // reference, and the other params (so two renamed params stay distinct).
-    let mut taken: HashSet<String> = local_names.iter().cloned().collect();
-    taken.extend(arg_names.iter().cloned());
-    taken.extend(params.iter().cloned());
     let mut renames: HashMap<String, String> = HashMap::new();
     for p in params.iter_mut() {
-        if arg_names.contains(p.as_str()) {
-            let fresh = pick_fresh(p, &taken);
-            taken.insert(fresh.clone());
-            renames.insert(p.clone(), fresh.clone());
-            *p = fresh;
-        }
+        let fresh = format!("{p}__{id}");
+        renames.insert(p.clone(), fresh.clone());
+        *p = fresh;
     }
     // Reusing an existing var as the result temp is unsafe if the body has a free
     // read of that name — bail (only relevant for init/assign shapes).
@@ -1252,6 +1283,49 @@ impl<'a> VisitMut<'a> for Renamer<'a, '_> {
             id.name = nm.into();
         }
     }
+}
+
+/// True if any `params` name is RE-DECLARED by a binding inside the visited
+/// subtree (a nested `let`/`const`/`var`, a nested function/arrow param, a
+/// function/class name, a catch param, …). The α-rename (`Renamer`/
+/// `OwnedSubstitutor`) rewrites identifier references by NAME and is NOT
+/// shadow-aware, so renaming/substituting a param whose name is shadowed inside
+/// the body would corrupt the inner binding's references (e.g.
+/// `function h(b){ let r; { let b = 5; r = b; } return r + b; }` — the inner
+/// `r = b` must keep reading the inner `b`, not the renamed param). Callers bail
+/// the inline in that case: correct, and the shadow-helper pattern is rare.
+/// `visit_binding_identifier` fires for every binding form, and callers visit
+/// only the body/value (never the param list), so any hit is a nested re-decl.
+struct ShadowDetector<'p> {
+    params: &'p HashSet<&'p str>,
+    found: bool,
+}
+impl<'a> Visit<'a> for ShadowDetector<'_> {
+    fn visit_binding_identifier(&mut self, id: &oxc_ast::ast::BindingIdentifier<'a>) {
+        if self.params.contains(id.name.as_str()) {
+            self.found = true;
+        }
+    }
+}
+
+fn stmts_shadow_params(stmts: &[Statement], params: &HashSet<&str>) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    let mut d = ShadowDetector { params, found: false };
+    for s in stmts {
+        d.visit_statement(s);
+    }
+    d.found
+}
+
+fn expr_shadows_params(e: &Expression, params: &HashSet<&str>) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    let mut d = ShadowDetector { params, found: false };
+    d.visit_expression(e);
+    d.found
 }
 
 /// Any free read of `name` in `stmts` (conservative — ignores shadowing, so a
@@ -1717,6 +1791,15 @@ fn build_inlined<'a>(
     if !cand.free.is_disjoint(local_names) {
         return None;
     }
+    // Shadow guard: `OwnedSubstitutor` (below) substitutes a param's identifier
+    // by NAME and is not shadow-aware; bail if the value re-declares a param name
+    // in a nested scope (e.g. `return [1].map(b => b)` with param `b`).
+    {
+        let pset: HashSet<&str> = cand.params.iter().map(String::as_str).collect();
+        if expr_shadows_params(&cand.value, &pset) {
+            return None;
+        }
+    }
 
     let ast = AstBuilder::new(allocator);
     // An arg used more than once is substituted into each site → re-evaluated N
@@ -1861,7 +1944,8 @@ mod tests {
     fn inline(src: &str) -> String {
         let allocator = Allocator::default();
         let mut program = crate::parse_program(&allocator, src, SourceType::ts());
-        run(&allocator, &mut program);
+        let mut uid = 0u32;
+        run(&allocator, &mut program, &mut uid);
         Codegen::new().build(&program).code
     }
 
@@ -1923,14 +2007,16 @@ mod tests {
     #[test]
     fn alpha_renames_param_when_arg_references_it() {
         // BLOCK body, args reference the param names (`v`, `k`). `v` is
-        // *reassigned* so it can't be substituted — it gets a temp, which must be
-        // α-renamed to a fresh `v$N` to avoid the `let v = v` TDZ self-capture.
+        // *reassigned* so it can't be substituted — it gets a temp, which is
+        // α-renamed to a per-expansion-unique `v__<id>` (the same scheme that
+        // keeps two inlines of one helper from colliding), avoiding the
+        // `let v = v` TDZ self-capture.
         let out = inline(
             "/* @inline */ function scale(v, k) { v = v * k; return v; }\nexport function f(v, k) { let r = scale(v, k); return r; }",
         );
         assert!(!out.contains("scale("), "inlined via α-rename instead of bailing:\n{out}");
-        assert!(out.contains("v$"), "reassigned param renamed with the $N scheme:\n{out}");
-        assert!(!out.contains("v__"), "no long __id suffix:\n{out}");
+        assert!(out.contains("v__"), "reassigned param renamed per-expansion (v__<id>):\n{out}");
+        assert!(!out.contains("let v = v"), "no TDZ self-capture:\n{out}");
     }
 
     #[test]
@@ -2083,11 +2169,12 @@ mod tests {
 
     #[test]
     fn modified_param_keeps_temp_prologue() {
-        // `a` is reassigned in the body → can't be substituted; keep `let a = …`.
+        // `a` is reassigned in the body → can't be substituted; keep the temp
+        // (now α-renamed per-expansion to `a__<id>`).
         let out = inline(
             "/* @inline */ function f(a) { a = a + 1; return a; }\nexport function g(x) { let v = f(x); return v; }",
         );
-        assert!(out.contains("let a = x"), "reassigned param keeps its temp:\n{out}");
+        assert!(out.contains("a__") && out.contains("= x"), "reassigned param keeps its (renamed) temp:\n{out}");
     }
 
     #[test]

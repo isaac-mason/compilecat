@@ -163,6 +163,15 @@ impl<'a> Collector<'a> {
     fn check_bail(&mut self, kind: AstKind<'a>) {
         match kind {
             AstKind::TryStatement(_) | AstKind::WithStatement(_) => self.bail = true,
+            // Classes and JSX have internal scoping the reaching-analysis walkers
+            // don't model precisely (super-class / field initializers / computed
+            // keys / JSX attr+child expressions are evaluated in the enclosing
+            // scope and carry reads). Rather than risk under-counting a use → a
+            // bad flow-inline, bail the CFG so flow-sensitive passes skip the whole
+            // function. Rare in hot/inlined helpers; correctness over coverage.
+            AstKind::Class(_) | AstKind::JSXElement(_) | AstKind::JSXFragment(_) => {
+                self.bail = true
+            }
             _ => {}
         }
     }

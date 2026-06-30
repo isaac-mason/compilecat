@@ -56,6 +56,7 @@
 		"test": "pnpm test:rust && pnpm test:js",
 		"test:rust": "cargo test --manifest-path rust/Cargo.toml -p compilecat_core",
 		"test:js": "vitest run",
+		"fuzz": "FUZZ=1 vitest run tst/fuzz.test.ts",
 		"version:all": "node scripts/bump-version.mjs"
 	},
 	"devDependencies": {
