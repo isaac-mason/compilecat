@@ -65,12 +65,19 @@ fn is_pure_builtin_callee(callee: &Expression) -> bool {
             if matches!(o.name.as_str(), "Math" | "Number" | "JSON")))
 }
 
+fn args_side_effect_free(args: &[Argument]) -> bool {
+    args.iter().all(|a| match a {
+        Argument::SpreadElement(s) => is_side_effect_free(&s.argument),
+        _ => a.as_expression().is_some_and(is_side_effect_free),
+    })
+}
+
 fn call_is_side_effect_free(c: &CallExpression) -> bool {
-    is_pure_builtin_callee(&c.callee)
-        && c.arguments.iter().all(|a| match a {
-            Argument::SpreadElement(s) => is_side_effect_free(&s.argument),
-            _ => a.as_expression().is_some_and(is_side_effect_free),
-        })
+    // `c.pure` is the parser-set `/*@__PURE__*/` / `/*#__PURE__*/` marker (the
+    // developer's escape hatch, à la Closure `@nosideeffects` / Terser / Rollup):
+    // it asserts the callee is side-effect-free. The arguments are still evaluated,
+    // so the whole call is side-effect-free only if they are too.
+    (c.pure || is_pure_builtin_callee(&c.callee)) && args_side_effect_free(&c.arguments)
 }
 
 /// `true` if EVALUATING `e` has no observable side effect — i.e. it's safe to
@@ -140,6 +147,8 @@ pub fn is_side_effect_free(e: &Expression) -> bool {
             ObjectPropertyKind::SpreadProperty(_) => false,
         }),
         Expression::CallExpression(c) => call_is_side_effect_free(c),
+        // `new` is effectful unless `/*@__PURE__*/`-marked (and args are pure).
+        Expression::NewExpression(n) => n.pure && args_side_effect_free(&n.arguments),
         _ => false,
     }
 }

@@ -573,6 +573,11 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         'unroll preserves effect count',
         `/* @optimize */ function entry(p, q) { let a = 0; /* @unroll */ for (let i = 0; i < 3; i++) { a += eff(i); } return a; }`,
     );
+    // /*@__PURE__*/ lets the unused call drop, but its impure ARG still runs.
+    chk(
+        'pure-annotated call keeps impure arg effect',
+        `function f(x) { return x; }\n/* @optimize */ function entry(p, q) { const v = /*@__PURE__*/ f(eff(7)); return q; }`,
+    );
 
     // Cross-file: inlining a donor whose param sits in a conditional branch
     // substituted the impure arg into that branch, dropping its effect when the

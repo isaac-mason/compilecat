@@ -26,7 +26,7 @@ use oxc_ast::{AstBuilder, AstKind};
 use oxc_ast_visit::{walk_mut, VisitMut};
 use oxc_semantic::NodeId;
 
-use super::util::is_pure;
+use super::util::{is_pure, is_side_effect_free};
 
 pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
     let mut total = 0;
@@ -68,7 +68,7 @@ fn sweep<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
                     if !matches!(&d.id, BindingPattern::BindingIdentifier(_)) {
                         continue; // destructuring — out of scope
                     }
-                    if d.init.as_ref().is_some_and(|i| !is_pure(i)) {
+                    if d.init.as_ref().is_some_and(|i| !is_side_effect_free(i)) {
                         continue; // side-effecting init — keep
                     }
                     dead_decls.insert(decl_id);
@@ -357,6 +357,18 @@ mod tests {
     fn keeps_side_effecting_init() {
         let out = run_src("const x = sideEffect();");
         assert!(out.contains("sideEffect"), "side-effecting init kept:\n{out}");
+    }
+
+    #[test]
+    fn drops_pure_annotated_and_builtin_inits() {
+        // `/*@__PURE__*/` marks the call side-effect-free (droppable); `Math.*` is
+        // an allowlisted pure builtin. A plain unknown call stays.
+        let pure = run_src("const a = /*@__PURE__*/ extern();");
+        assert!(!pure.contains("extern"), "pure-annotated dead init dropped:\n{pure}");
+        let builtin = run_src("const b = Math.max(1, 2);");
+        assert!(!builtin.contains("Math.max"), "pure builtin dead init dropped:\n{builtin}");
+        let plain = run_src("const c = extern();");
+        assert!(plain.contains("extern"), "unknown call kept:\n{plain}");
     }
 
     #[test]
