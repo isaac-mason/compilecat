@@ -43,6 +43,7 @@ function evalProgram(code: string, call: string): { ok: true; value: unknown } |
     // so it's a fair differential — the strip only removes the type annotation,
     // never the surrounding code a miscompile would have corrupted.
     const js = code
+        .replace(/^\s*import[^\n]*\n?/gm, '') // cross-file: drop import lines
         .replace(/^\s*export\s*\{[^}]*\}\s*;?/gm, '')
         .replace(/\bexport\s+/g, '')
         .replace(/ as number/g, '');
@@ -65,6 +66,31 @@ function diff(code: string): { call: string; compiled: string; want: unknown; go
     const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
     if (wv === gv) return null;
     return { call, compiled, want: want.value, got: got.ok ? got.value : '<threw>' };
+}
+
+/** Cross-file differential: compile the consumer against the donor and compare
+ *  `donor + consumer` (source) vs `donor + compiled` (output). Prepending the
+ *  donor to BOTH means a kept import resolves and an inlined copy is harmless
+ *  (top-level fn redeclare is sloppy-legal), so it's a fair, symmetric eval. */
+function crossDiff(
+    donor: string,
+    consumer: string,
+    specifier: string,
+): { compiled: string; want: unknown; got: unknown } | null {
+    const call = 'entry(7, 3)';
+    const want = evalProgram(`${donor}\n${consumer}`, call);
+    if (!want.ok) return null;
+    const compiled = compiler.compileFileCross(
+        'entry.ts',
+        withExports(consumer),
+        [{ specifier, path: '/p/donor.ts', code: donor, resolved: [] }],
+        {},
+    ).code;
+    const got = evalProgram(`${donor}\n${compiled}`, call);
+    const wv = JSON.stringify(want.value);
+    const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
+    if (wv === gv) return null;
+    return { compiled, want: want.value, got: got.ok ? got.value : '<threw>' };
 }
 
 // ── seeded PRNG (reproducible) ───────────────────────────────────────────────
@@ -94,6 +120,7 @@ interface Scope {
     nums: string[]; // in-scope number vars
     pts: string[]; // in-scope point vars (always have .x and .y)
     arrs: { name: string; len: number }[]; // in-scope number-arrays (fixed length)
+    ptArrs: { name: string; len: number }[]; // arrays of points (nested aggregate)
 }
 
 interface Helper {
@@ -122,6 +149,12 @@ class Gen {
             leaves.push(() => {
                 const a = pick(this.r, s.arrs);
                 return `${a.name}[${int(this.r, 0, a.len - 1)}]`; // always in-bounds → total
+            });
+        if (s.ptArrs.length)
+            leaves.push(() => {
+                const a = pick(this.r, s.ptArrs);
+                // nested aggregate read: arr-of-points[i].x  (in-bounds → total)
+                return `${a.name}[${int(this.r, 0, a.len - 1)}].${pick(this.r, ['x', 'y'])}`;
             });
         if (depth <= 0) return pick(this.r, leaves)();
         const numHelpers = this.helpers.filter((h) => h.kind === 'num');
@@ -165,41 +198,59 @@ class Gen {
         return `{ x: ${this.numExpr(s, 1)}, y: ${this.numExpr(s, 1)} }`;
     }
 
-    // Build the helper declarations first (entry calls them).
-    private genHelpers(): string {
-        const n = int(this.r, 1, 4);
+    // Build helper declarations and register them (so entry/consumer calls them).
+    // `prefix` keeps donor (`d*`) and consumer-local (`h*`) names disjoint;
+    // `exported` emits `export` for cross-file donors.
+    private genHelpers(count?: number, prefix = 'h', exported = false): string {
+        const n = count ?? int(this.r, 1, 4);
         const out: string[] = [];
+        const exp = exported ? 'export ' : '';
         for (let i = 0; i < n; i++) {
             const kind = pick(this.r, ['num', 'num', 'pt', 'void'] as const);
-            const h: Helper = { name: `h${i}`, kind, inline: chance(this.r, 0.6) };
+            const h: Helper = { name: `${prefix}${i}`, kind, inline: chance(this.r, 0.6) };
             this.helpers.push(h);
             const dir = h.inline ? '/* @inline */ ' : '';
-            const s: Scope = { nums: ['a', 'b'], pts: [], arrs: [] };
+            const head = `${dir}${exp}`;
+            const s: Scope = { nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] };
             if (kind === 'num') {
                 // Mix DIRECT (single return) and BLOCK (branch / temp) bodies.
                 const shape = int(this.r, 0, 2);
-                if (shape === 0) out.push(`${dir}function ${h.name}(a, b) { return ${this.numExpr(s, 2)}; }`);
+                if (shape === 0) out.push(`${head}function ${h.name}(a, b) { return ${this.numExpr(s, 2)}; }`);
                 else if (shape === 1)
-                    out.push(`${dir}function ${h.name}(a, b) { if (${this.cond(s)}) return ${this.numExpr(s, 2)}; return ${this.numExpr(s, 2)}; }`);
+                    out.push(`${head}function ${h.name}(a, b) { if (${this.cond(s)}) return ${this.numExpr(s, 2)}; return ${this.numExpr(s, 2)}; }`);
                 else
-                    out.push(`${dir}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`);
+                    out.push(`${head}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`);
             } else if (kind === 'pt') {
-                out.push(`${dir}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [] }, 1)} }; }`);
+                out.push(`${head}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)} }; }`);
             } else {
                 // void: mutate point arg0 (a is a point here, b a number).
-                const ps: Scope = { nums: ['b'], pts: ['a'], arrs: [] };
-                out.push(`${dir}function ${h.name}(a, b) { a.x = ${this.numExpr(ps, 1)}; a.y = ${this.numExpr(ps, 1)}; }`);
+                const ps: Scope = { nums: ['b'], pts: ['a'], arrs: [], ptArrs: [] };
+                out.push(`${head}function ${h.name}(a, b) { a.x = ${this.numExpr(ps, 1)}; a.y = ${this.numExpr(ps, 1)}; }`);
             }
         }
         return out.join('\n');
     }
 
+    /** Cross-file: a donor module (exported helpers, `d*`) + a consumer that
+     *  imports them and calls them (alongside its own `h*` helpers) in an
+     *  @optimize entry. Returns the two module sources + the import specifier. */
+    crossProgram(): { donor: string; consumer: string; specifier: string } {
+        const donorBody = this.genHelpers(int(this.r, 1, 3), 'd', true);
+        const donorNames = this.helpers.map((h) => h.name); // all d* so far
+        const localHelpers = this.genHelpers(int(this.r, 0, 2), 'h', false);
+        const specifier = './donor';
+        const importLine = `import { ${donorNames.join(', ')} } from "${specifier}";`;
+        const optimize = chance(this.r, 0.8) ? '/* @optimize */ ' : '';
+        const consumer = `${importLine}\n${localHelpers}\n${optimize}function entry(p, q) {\n  ${this.genEntryBody()}\n}`;
+        return { donor: donorBody, consumer, specifier };
+    }
+
     private genEntryBody(): string {
-        const s: Scope = { nums: ['p', 'q'], pts: [], arrs: [] };
+        const s: Scope = { nums: ['p', 'q'], pts: [], arrs: [], ptArrs: [] };
         const stmts: string[] = [];
         const k = int(this.r, 2, 6);
         for (let i = 0; i < k; i++) {
-            const form = int(this.r, 0, 6);
+            const form = int(this.r, 0, 9);
             if (form === 0) {
                 // const num = numExpr | helper-num-call (BLOCK in init position)
                 const v = this.fresh('v');
@@ -247,6 +298,34 @@ class Gen {
                 const dir = chance(this.r, 0.5) ? '/* @unroll */ ' : '';
                 stmts.push(`let ${acc} = 0; ${dir}for (let i = 0; i < ${lim}; i++) { ${acc} = ${acc} + ${this.numExpr(s, 1)} + i; }`);
                 s.nums.push(acc);
+            } else if (form === 6) {
+                // bounded WHILE loop (counter-driven → terminates) accumulating.
+                const acc = this.fresh('acc');
+                const ctr = this.fresh('k');
+                const lim = int(this.r, 1, 4);
+                stmts.push(
+                    `let ${acc} = 0; let ${ctr} = 0; while (${ctr} < ${lim}) { ${acc} = ${acc} + ${this.numExpr(s, 1)}; ${ctr} = ${ctr} + 1; }`,
+                );
+                s.nums.push(acc);
+            } else if (form === 7) {
+                // NESTED if/else (deeper control flow → CFG / minimize / flow).
+                const v = this.fresh('c');
+                stmts.push(
+                    `let ${v} = 0; if (${this.cond(s)}) { if (${this.cond(s)}) { ${v} = ${this.numExpr(s, 2)}; } else { ${v} = ${this.numExpr(s, 1)}; } } else { ${v} = ${this.numExpr(s, 2)}; }`,
+                );
+                s.nums.push(v);
+            } else if (form === 8) {
+                // NESTED aggregate: an array of points (sometimes @sroa), read as
+                // arr[i].x via the numExpr leaf. Stresses nested SROA.
+                const v = this.fresh('pa');
+                const len = int(this.r, 2, 3);
+                const dir = chance(this.r, 0.5) ? '/* @sroa */ ' : '';
+                const elems = Array.from(
+                    { length: len },
+                    () => `{ x: ${this.numExpr(s, 1)}, y: ${this.numExpr(s, 1)} }`,
+                ).join(', ');
+                stmts.push(`const ${v} = ${dir}[${elems}];`);
+                s.ptArrs.push({ name: v, len });
             } else {
                 // if-branch with a nested const + field/array op
                 const v = this.fresh('c');
@@ -351,6 +430,33 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
                         `call: ${md.call}   want=${JSON.stringify(md.want)} got=${JSON.stringify(md.got)}\n\n` +
                         `--- minimal source ---\n${minimal}\n\n` +
                         `--- compiled ---\n${md.compiled}\n`,
+                );
+            }
+        }
+        expect(true).toBe(true);
+    });
+
+    // Cross-file variant: a consumer imports `@inline`/plain donor helpers and
+    // uses them in an @optimize entry, compiled via `compileFileCross`. Exercises
+    // the donor-inline + cross-file SROA + global-counter-across-the-boundary
+    // paths. Fewer iters (each compiles two modules); scales with FUZZ_ITERS.
+    const XITERS = Math.max(50, Math.floor(ITERS / 2));
+    it(`${XITERS} cross-file programs preserve semantics`, () => {
+        for (let i = 0; i < XITERS; i++) {
+            const seed = (BASE ^ 0x5bd1e995) + i * 2654435761;
+            const { donor, consumer, specifier } = new Gen(mulberry32(seed >>> 0)).crossProgram();
+            let d: ReturnType<typeof crossDiff>;
+            try {
+                d = crossDiff(donor, consumer, specifier);
+            } catch (e) {
+                d = { compiled: `<compile threw: ${(e as Error).message}>`, want: 'n/a', got: 'n/a' };
+            }
+            if (d) {
+                throw new Error(
+                    `CROSS-FILE MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
+                        `entry(7, 3)   want=${JSON.stringify(d.want)} got=${JSON.stringify(d.got)}\n\n` +
+                        `--- donor ---\n${donor}\n\n--- consumer ---\n${consumer}\n\n` +
+                        `--- compiled ---\n${d.compiled}\n`,
                 );
             }
         }
