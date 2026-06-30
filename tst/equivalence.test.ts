@@ -518,4 +518,25 @@ describe('adversarial-review regressions', () => {
             'entry(7, 3)',
         );
     });
+
+    // More conditional positions the hoist must not escape (review round 2):
+    // an optional-chain call's args (`o?.m(arg)` — skipped when o is nullish) and
+    // a default-parameter initializer (`function entry(a = …)` — runs only when
+    // the arg is absent, and a hoist there escapes to MODULE scope). Both ran a
+    // recursive helper unconditionally → infinite recursion. Guarded via
+    // visit_chain_expression / visit_formal_parameter / visit_assignment_pattern.
+    it('inline-arg-in-optional-chain-not-hoisted', () => {
+        check(
+            'rev-optchain.ts',
+            `/* @inline */ function twice(x) { return x + x; }\nfunction rec() { return rec(); }\nfunction entry(o) { return o?.m(twice(rec())); }`,
+            'entry(null)',
+        );
+    });
+    it('inline-arg-in-default-param-not-hoisted', () => {
+        check(
+            'rev-default-param.ts',
+            `/* @inline */ function twice(x) { return x + x; }\nfunction rec() { return rec(); }\nfunction entry(a = twice(rec())) { return a; }`,
+            'entry(7)',
+        );
+    });
 });

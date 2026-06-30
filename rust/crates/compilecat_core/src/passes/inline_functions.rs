@@ -979,6 +979,31 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
         self.no_hoist = saved;
     }
 
+    // Optional chain (`a?.b(args)`) — everything right of a `?.` is conditional.
+    fn visit_chain_expression(&mut self, c: &mut ChainExpression<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        walk_mut::walk_chain_expression(self, c);
+        self.no_hoist = saved;
+    }
+
+    // Default value (`a = e`) — conditional, and outside any inner statement list.
+    fn visit_assignment_pattern(&mut self, p: &mut AssignmentPattern<'a>) {
+        self.visit_binding_pattern(&mut p.left);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut p.right);
+        self.no_hoist = saved;
+    }
+
+    // Formal-param default (`function f(a = e)`) — conditional + param-list scope.
+    fn visit_formal_parameter(&mut self, p: &mut FormalParameter<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        walk_mut::walk_formal_parameter(self, p);
+        self.no_hoist = saved;
+    }
+
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         walk_mut::walk_expression(self, expr); // inner calls hoist first (eval order)
 
@@ -1797,13 +1822,49 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         self.no_hoist = saved;
     }
 
+    // Optional chain `a?.b.c?.(args)`: any `?.` short-circuits everything to its
+    // right (incl. a chained call's ARGS) when the receiver is nullish, so the
+    // whole chain is conditionally evaluated. Conservatively guard it all.
+    fn visit_chain_expression(&mut self, c: &mut ChainExpression<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        walk_mut::walk_chain_expression(self, c);
+        self.no_hoist = saved;
+    }
+
+    // A default value (`const { x = e } = o`) runs only when the property is
+    // absent — conditional. (Formal-param defaults go through
+    // `visit_formal_parameter` below, which oxc routes separately.)
+    fn visit_assignment_pattern(&mut self, p: &mut AssignmentPattern<'a>) {
+        self.visit_binding_pattern(&mut p.left);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut p.right);
+        self.no_hoist = saved;
+    }
+
+    // A formal-parameter default (`function f(a = e)` / `(a = e) => …`) runs only
+    // when the arg is absent (conditional) AND sits in the param list — OUTSIDE
+    // any statement list — so an escaping hoist would drain all the way to module
+    // scope. Guard the whole parameter.
+    fn visit_formal_parameter(&mut self, p: &mut FormalParameter<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        walk_mut::walk_formal_parameter(self, p);
+        self.no_hoist = saved;
+    }
+
     // Conditionally/repeatedly-executed STATEMENT positions: a hoist from a BARE
     // (non-block) branch/body escapes to the enclosing statement list (spliced
     // before the if/loop) — i.e. unconditionally / once. A BLOCK branch is its own
     // statement list, so `visit_statements` scopes its hoists correctly; only bare
-    // ones need `no_hoist`. (Single-file is normalized to all-blocks before
-    // inlining; the cross-file path inlines pre-normalize, so it hits bare ones —
-    // and `run_all_gated`'s later normalize+inline re-inlines them safely.)
+    // ones need `no_hoist`. (Single-file is normalized to all-blocks BEFORE
+    // inlining, so this statement-position guard is essentially dead there — it
+    // only fires on the cross-file path, which inlines pre-normalize. A bailed
+    // LOCAL call is re-inlined by `run_all_gated`'s post-normalize inline pass; a
+    // bailed cross-file DONOR call is NOT (donors are only inlined by
+    // `cross_file`'s pre-normalize pass) → a narrow, permanent optimization loss.
+    // Correctness is preserved either way — the bail just leaves the call.)
     fn visit_if_statement(&mut self, s: &mut IfStatement<'a>) {
         self.visit_expression(&mut s.test); // unconditional
         self.visit_branch(&mut s.consequent);
