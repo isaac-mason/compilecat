@@ -195,6 +195,29 @@ function mk(): Vec3 { return { x: 4, y: 5, z: 6 }; }
         // ./util next to the donor (/proj/lib) seen from /proj/app → ../lib/util
         expect(out).toContain('from "../lib/util"');
     });
+
+    it('does not hoist an inline call out of a bare if-branch (cross-file, pre-normalize)', () => {
+        // Found by the cross-file fuzzer. The cross-file path inlines BEFORE the
+        // local pipeline's normalize, so a consumer @inline helper with a BARE
+        // (non-block) `if (c) return d(...)` branch hit the inliner un-block-wrapped.
+        // Inlining `d` there hoisted its eval-once `_inl_arg` temp to BEFORE the
+        // `if` (unconditional) — and since the call was recursive, every call
+        // recursed → "Maximum call stack size exceeded". The Inliner now sets
+        // `no_hoist` inside bare conditional statement positions.
+        const donor = `/* @inline */ export function d1(a, b) { return Math.max(Math.abs(b), b); }`;
+        const consumer = `import { d1 } from "./donor";
+/* @inline */ function h0(a, b) { if (a < (d1(b, 4) <= d1(b, a) ? a : 1)) return d1(Math.max(4, b), h0(b, 7)); return 7; }
+/* @optimize */ export function entry(p, q) { p *= q; return (5 >= h0(7, p) ? Math.max(p, 6) : Math.max(0, p)); }`;
+        const out = compiler.compileFileCross(
+            'entry.ts',
+            consumer,
+            [{ specifier: './donor', path: '/p/donor.ts', code: donor, resolved: [] }],
+            {},
+        ).code;
+        const expected = ev(`${donor}\n${consumer}`, 'entry(7, 3)');
+        const actual = ev(`${donor}\n${out}`, 'entry(7, 3)');
+        expect(actual).toEqual(expected);
+    });
 });
 
 // ── (a2) cross-file behavioral matrix — every BLOCK/DIRECT body shape, RUN the

@@ -250,7 +250,7 @@ class Gen {
         const stmts: string[] = [];
         const k = int(this.r, 2, 6);
         for (let i = 0; i < k; i++) {
-            const form = int(this.r, 0, 9);
+            const form = int(this.r, 0, 12);
             if (form === 0) {
                 // const num = numExpr | helper-num-call (BLOCK in init position)
                 const v = this.fresh('v');
@@ -326,6 +326,34 @@ class Gen {
                 ).join(', ');
                 stmts.push(`const ${v} = ${dir}[${elems}];`);
                 s.ptArrs.push({ name: v, len });
+            } else if (form === 9) {
+                // compound assignment to a (mutable) param — reassigned-variable
+                // handling through the optimizer.
+                const v = pick(this.r, ['p', 'q']);
+                stmts.push(`${v} ${pick(this.r, ['+=', '-=', '*='])} ${this.numExpr(s, 1)};`);
+            } else if (form === 10) {
+                // NESTED aggregate: object with both a scalar field and an ARRAY
+                // field (sometimes @sroa), read immediately. Stresses SROA of a
+                // struct containing an array.
+                const o = this.fresh('o');
+                const dir = chance(this.r, 0.5) ? '/* @sroa */ ' : '';
+                stmts.push(
+                    `const ${o} = ${dir}{ v: ${this.numExpr(s, 1)}, a: [${this.numExpr(s, 1)}, ${this.numExpr(s, 1)}] };`,
+                );
+                const sv = this.fresh('ov');
+                stmts.push(`const ${sv} = ${o}.v + ${o}.a[0] + ${o}.a[1];`);
+                s.nums.push(sv);
+            } else if (form === 11) {
+                // labeled break out of a nested bounded loop (terminating → total)
+                // — exercises minimize-exit-points / CFG label handling.
+                const acc = this.fresh('acc');
+                const lbl = `L${this.id++ % 5}`;
+                const li = int(this.r, 1, 3);
+                const lj = int(this.r, 1, 3);
+                stmts.push(
+                    `let ${acc} = 0; ${lbl}: for (let i = 0; i < ${li}; i++) { for (let j = 0; j < ${lj}; j++) { if (${this.cond(s)}) break ${lbl}; ${acc} = ${acc} + ${this.numExpr(s, 1)}; } }`,
+                );
+                s.nums.push(acc);
             } else {
                 // if-branch with a nested const + field/array op
                 const v = this.fresh('c');

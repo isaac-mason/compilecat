@@ -1759,6 +1759,23 @@ struct Inliner<'a, 'c> {
     no_hoist: bool,
 }
 
+impl<'a> Inliner<'a, '_> {
+    /// Visit a conditionally-executed branch/body. A BlockStatement is its own
+    /// statement list, so `visit_statements` scopes any hoists inside it (correct).
+    /// A BARE statement has no such list — a hoist from it would escape to the
+    /// enclosing list, becoming unconditional — so visit it with `no_hoist` set.
+    fn visit_branch(&mut self, stmt: &mut Statement<'a>) {
+        if matches!(stmt, Statement::BlockStatement(_)) {
+            self.visit_statement(stmt);
+        } else {
+            let saved = self.no_hoist;
+            self.no_hoist = true;
+            self.visit_statement(stmt);
+            self.no_hoist = saved;
+        }
+    }
+}
+
 impl<'a> VisitMut<'a> for Inliner<'a, '_> {
     // A `?:` evaluates the test unconditionally; each branch only when chosen.
     fn visit_conditional_expression(&mut self, c: &mut ConditionalExpression<'a>) {
@@ -1778,6 +1795,66 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         self.no_hoist = true;
         self.visit_expression(&mut l.right);
         self.no_hoist = saved;
+    }
+
+    // Conditionally/repeatedly-executed STATEMENT positions: a hoist from a BARE
+    // (non-block) branch/body escapes to the enclosing statement list (spliced
+    // before the if/loop) — i.e. unconditionally / once. A BLOCK branch is its own
+    // statement list, so `visit_statements` scopes its hoists correctly; only bare
+    // ones need `no_hoist`. (Single-file is normalized to all-blocks before
+    // inlining; the cross-file path inlines pre-normalize, so it hits bare ones —
+    // and `run_all_gated`'s later normalize+inline re-inlines them safely.)
+    fn visit_if_statement(&mut self, s: &mut IfStatement<'a>) {
+        self.visit_expression(&mut s.test); // unconditional
+        self.visit_branch(&mut s.consequent);
+        if let Some(alt) = s.alternate.as_mut() {
+            self.visit_branch(alt);
+        }
+    }
+    fn visit_while_statement(&mut self, s: &mut WhileStatement<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true; // test repeats
+        self.visit_expression(&mut s.test);
+        self.no_hoist = saved;
+        self.visit_branch(&mut s.body);
+    }
+    fn visit_do_while_statement(&mut self, s: &mut DoWhileStatement<'a>) {
+        self.visit_branch(&mut s.body);
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut s.test);
+        self.no_hoist = saved;
+    }
+    fn visit_for_statement(&mut self, s: &mut ForStatement<'a>) {
+        // test/update run per-iteration → never hoist them out. (init runs once,
+        // but over-suppressing it is harmless — the later pass re-inlines.)
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        if let Some(init) = s.init.as_mut() {
+            walk_mut::walk_for_statement_init(self, init);
+        }
+        if let Some(test) = s.test.as_mut() {
+            self.visit_expression(test);
+        }
+        if let Some(update) = s.update.as_mut() {
+            self.visit_expression(update);
+        }
+        self.no_hoist = saved;
+        self.visit_branch(&mut s.body);
+    }
+    fn visit_for_in_statement(&mut self, s: &mut ForInStatement<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut s.right);
+        self.no_hoist = saved;
+        self.visit_branch(&mut s.body);
+    }
+    fn visit_for_of_statement(&mut self, s: &mut ForOfStatement<'a>) {
+        let saved = self.no_hoist;
+        self.no_hoist = true;
+        self.visit_expression(&mut s.right);
+        self.no_hoist = saved;
+        self.visit_branch(&mut s.body);
     }
 
     /// Walk each statement, then splice in any arg-binding hoists its calls
