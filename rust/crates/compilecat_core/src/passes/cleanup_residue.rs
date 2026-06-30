@@ -24,6 +24,8 @@ use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::{NodeId, SemanticBuilder};
 use oxc_span::GetSpan;
 
+use super::util::is_side_effect_free;
+
 pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
     // Generated non-escaped local names (span-0 declarator, no nested-fn capture).
     let generated: HashSet<String> = {
@@ -163,60 +165,6 @@ fn droppable_write_stmt(nodes: &oxc_semantic::AstNodes, id: NodeId) -> Option<No
     None
 }
 
-/// Conservative side-effect-freedom: literals/identifiers/`this`, pure operators
-/// over pure operands, member reads (getters assumed absent — the optimizer's
-/// standing assumption, matching this pass's pre-existing behavior), TS wrappers,
-/// and array/object literals of pure non-spread parts. Everything else
-/// (calls/`new`/assignment/update/await/yield/tagged-template/spread/computed
-/// keys) is treated as effectful.
-fn is_side_effect_free(e: &Expression) -> bool {
-    match e {
-        Expression::NumericLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::BigIntLiteral(_)
-        | Expression::RegExpLiteral(_)
-        | Expression::Identifier(_)
-        | Expression::ThisExpression(_) => true,
-        Expression::ParenthesizedExpression(p) => is_side_effect_free(&p.expression),
-        Expression::TSAsExpression(t) => is_side_effect_free(&t.expression),
-        Expression::TSSatisfiesExpression(t) => is_side_effect_free(&t.expression),
-        Expression::TSNonNullExpression(t) => is_side_effect_free(&t.expression),
-        Expression::TSTypeAssertion(t) => is_side_effect_free(&t.expression),
-        Expression::UnaryExpression(u) => {
-            u.operator != UnaryOperator::Delete && is_side_effect_free(&u.argument)
-        }
-        Expression::BinaryExpression(b) => {
-            is_side_effect_free(&b.left) && is_side_effect_free(&b.right)
-        }
-        Expression::LogicalExpression(l) => {
-            is_side_effect_free(&l.left) && is_side_effect_free(&l.right)
-        }
-        Expression::ConditionalExpression(c) => {
-            is_side_effect_free(&c.test)
-                && is_side_effect_free(&c.consequent)
-                && is_side_effect_free(&c.alternate)
-        }
-        Expression::SequenceExpression(s) => s.expressions.iter().all(is_side_effect_free),
-        Expression::StaticMemberExpression(m) => is_side_effect_free(&m.object),
-        Expression::ComputedMemberExpression(m) => {
-            is_side_effect_free(&m.object) && is_side_effect_free(&m.expression)
-        }
-        Expression::ArrayExpression(a) => a.elements.iter().all(|el| match el {
-            ArrayExpressionElement::Elision(_) => true,
-            ArrayExpressionElement::SpreadElement(_) => false,
-            _ => el.as_expression().is_some_and(is_side_effect_free),
-        }),
-        Expression::ObjectExpression(o) => o.properties.iter().all(|p| match p {
-            ObjectPropertyKind::ObjectProperty(prop) => {
-                !prop.computed && is_side_effect_free(&prop.value)
-            }
-            ObjectPropertyKind::SpreadProperty(_) => false,
-        }),
-        _ => false,
-    }
-}
 
 // ── phase 1: propagation ─────────────────────────────────────────────────────
 

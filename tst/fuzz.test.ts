@@ -557,6 +557,22 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         'member-read arg still drops (getters assumed pure)',
         `/* @inline */ function h(a, b) { return b; }\n/* @optimize */ function entry(p, q) { const v = { x: 5 }; return h(v.x, q); }`,
     );
+    // Known-pure builtin (Math.*) in an unused arg is still droppable (allowlist) —
+    // value + trace unchanged (it has no effect).
+    chk(
+        'pure builtin unused arg (allowlist)',
+        `/* @inline */ function h(a, b) { return b; }\n/* @optimize */ function entry(p, q) { return h(Math.max(eff(1), 9), q); }`,
+    );
+    // A single-def impure RHS used twice must NOT be duplicated by inline-variables.
+    chk(
+        'inline-variables no-dup impure RHS',
+        `/* @optimize */ function entry(p, q) { const v = eff(p); return v + v; }`,
+    );
+    // @unroll preserves the per-iteration effect count + order.
+    chk(
+        'unroll preserves effect count',
+        `/* @optimize */ function entry(p, q) { let a = 0; /* @unroll */ for (let i = 0; i < 3; i++) { a += eff(i); } return a; }`,
+    );
 
     // Cross-file: inlining a donor whose param sits in a conditional branch
     // substituted the impure arg into that branch, dropping its effect when the

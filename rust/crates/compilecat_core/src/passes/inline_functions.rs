@@ -38,7 +38,7 @@ use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_span::GetSpan;
 
 use super::block_mutate::{mutate_for_block_inline, BlockMutateInput};
-use super::util::is_pure;
+use super::util::{is_pure, is_side_effect_free};
 
 pub(crate) struct Candidate<'a> {
     params: Vec<String>,
@@ -1260,43 +1260,6 @@ fn is_pure_with_member_reads(e: &Expression) -> bool {
 /// function/arrow bodies don't execute on evaluation, so they're skipped. Used
 /// to decide whether re-evaluating a duplicated member-read arg N times across
 /// the body is equivalent to evaluating it once.
-fn is_side_effect_free(e: &Expression) -> bool {
-    struct V {
-        ok: bool,
-    }
-    impl<'a> Visit<'a> for V {
-        fn visit_function(&mut self, _: &Function<'a>, _: oxc_semantic::ScopeFlags) {}
-        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
-        fn visit_expression(&mut self, e: &Expression<'a>) {
-            if !self.ok {
-                return;
-            }
-            match e {
-                Expression::CallExpression(_)
-                | Expression::NewExpression(_)
-                | Expression::AwaitExpression(_)
-                | Expression::YieldExpression(_)
-                | Expression::AssignmentExpression(_)
-                | Expression::UpdateExpression(_)
-                | Expression::TaggedTemplateExpression(_)
-                | Expression::ImportExpression(_) => {
-                    self.ok = false;
-                    return;
-                }
-                Expression::UnaryExpression(u) if u.operator == UnaryOperator::Delete => {
-                    self.ok = false;
-                    return;
-                }
-                _ => {}
-            }
-            walk::walk_expression(self, e);
-        }
-    }
-    let mut v = V { ok: true };
-    v.visit_expression(e);
-    v.ok
-}
-
 /// Param names reassigned (`p = …`, `p++`) anywhere in the body — these need a
 /// temp (substituting a literal/identifier and then reassigning it would be
 /// invalid or would clobber the consumer's variable).
