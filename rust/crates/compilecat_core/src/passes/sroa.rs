@@ -844,6 +844,9 @@ impl<'a> Sroa<'a> {
                 if fn_references_self(&semantic, nodes, owner, func) {
                     continue; // recursive / self-referential → could clobber mid-use
                 }
+                if owner_scope_conflicts(func, id.name.as_str(), &shape) {
+                    continue; // nested-scope shadow/capture, or a scalar-name collision
+                }
                 out.push(ModuleScratchCand { name: id.name.to_string(), shape, owner_fn_span: owner_span });
             }
         }
@@ -1172,6 +1175,72 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
         }
     }
     true
+}
+
+/// True if scalarizing `name` in `func` would be UNSAFE for a naming reason —
+/// bail conservatively. Two cases, both real miscompiles the name-based rewriter
+/// would cause otherwise:
+///   (B) the scratch name is referenced inside a NESTED function/arrow — either a
+///       closure capturing it (escape) or a nested binding that SHADOWS it (a
+///       distinct variable whose `name[i]` accesses the rewriter would wrongly
+///       hijack). oxc_semantic sees the shadow as a different symbol, so
+///       single-owner still holds; the name-based `AccessRewriter` does not.
+///   (C) a generated scalar name `{name}_{suffix}` already occurs (as a binding or
+///       reference) in the owner — emitting `let {name}_{suffix}` would merge two
+///       distinct variables (wrong value, or a `const`-reassignment crash).
+///
+/// KNOWN ACCEPTED LIMITATION (not guarded here): an EFFECTFUL getter / `valueOf` /
+/// `Proxy` trap fired by a member read or coercion between a field's write and its
+/// read could re-enter the owner and clobber the shared buffer, which the per-call
+/// scalars wouldn't reproduce. compilecat assumes member reads are side-effect-free
+/// (`assumeGettersArePure`, matching Closure) — and the target out-param pattern
+/// itself reads external object members between scratch writes, so guarding this
+/// would disable the optimization on its own use case. Same accepted unsoundness the
+/// rest of the optimizer runs under.
+fn owner_scope_conflicts(func: &Function, name: &str, shape: &Shape) -> bool {
+    let scalars: HashSet<String> = shape.suffixes().iter().map(|s| format!("{name}_{s}")).collect();
+    let mut c = ScratchSafetyChecker { name, scalars: &scalars, fn_depth: 0, conflict: false };
+    if let Some(body) = &func.body {
+        for stmt in &body.statements {
+            c.visit_statement(stmt);
+            if c.conflict {
+                return true;
+            }
+        }
+    }
+    c.conflict
+}
+
+struct ScratchSafetyChecker<'s> {
+    name: &'s str,
+    scalars: &'s HashSet<String>,
+    fn_depth: u32,
+    conflict: bool,
+}
+
+impl<'a> Visit<'a> for ScratchSafetyChecker<'_> {
+    fn visit_function(&mut self, f: &Function<'a>, flags: ScopeFlags) {
+        self.fn_depth += 1;
+        walk::walk_function(self, f, flags);
+        self.fn_depth -= 1;
+    }
+    fn visit_arrow_function_expression(&mut self, a: &ArrowFunctionExpression<'a>) {
+        self.fn_depth += 1;
+        walk::walk_arrow_function_expression(self, a);
+        self.fn_depth -= 1;
+    }
+    fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
+        if self.scalars.contains(id.name.as_str()) {
+            self.conflict = true; // (C) collision with a generated scalar name
+        }
+    }
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if self.scalars.contains(id.name.as_str())
+            || (self.fn_depth > 0 && id.name == self.name)
+        {
+            self.conflict = true; // (C) scalar collision, or (B) name used in a nested fn
+        }
+    }
 }
 
 /// True if `stmt` contains a call/new that is not provably side-effect-free —
@@ -1982,6 +2051,31 @@ mod tests {
         ));
         assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
         assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_scalar_name_collision_bailed() {
+        // A local named like a generated scalar (`_s_0`) must NOT be merged with it
+        // (would corrupt values / crash on a const reassignment). Adversarial review.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ let _s_0 = a[0]*100; add3(_s,a,b); return _s[0]+_s[1]+_s[2]+_s_0; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        // The pre-existing `_s_0` local must survive with its own initializer.
+        assert!(out.contains("* 100") || out.contains("*100"), "collided local preserved:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_nested_scope_shadow_bailed() {
+        // A nested closure whose param shadows the scratch name must NOT have its
+        // accesses hijacked by the scalarizer. Adversarial review.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); return (_s) => _s[0]+_s[1]+_s[2]; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized (nested shadow):\n{out}");
     }
 
     #[test]

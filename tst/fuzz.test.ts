@@ -529,6 +529,139 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
     });
 });
 
+// ── module-scratch generator ─────────────────────────────────────────────────
+// Exercises the single-owner module-scratch scalar-replacement (SROA GlobalOpt-
+// localize). Emits a module-level `const _s = /*@__PURE__*/ [0,…]` used as per-call
+// scratch inside an `@optimize` `entry`, in modes that SHOULD scalarize (write-then-
+// read) and modes that MUST bail (read-before-write, partial init, escape, second
+// reader, branchy write, name-collision). The oracle calls `entry` TWICE with
+// different args so the SHARED module-buffer semantics (which per-call scalars must
+// only reproduce when killed-on-entry holds) are observable — a wrong scalarization
+// diverges. Names are drawn to sometimes collide with entry's own locals/params.
+class ScratchGen {
+    private id = 0;
+    constructor(private r: Rng) {}
+    // PURE numeric expr (no `eff`): an impure call between scratch writes correctly
+    // trips the re-entrancy guard and bails, so putting `eff` here would mean the
+    // fire path is never exercised. Effect coverage comes from a leading `eff`
+    // statement emitted BEFORE the first write (the guard only fires after it).
+    private e(): string {
+        return pick(this.r, [
+            () => String(int(this.r, 0, 9)),
+            () => 'p',
+            () => 'q',
+            () => `(p ${pick(this.r, ['+', '-', '*'])} q)`,
+            () => 'Math.abs(q)',
+        ])();
+    }
+    /** { program, call } — `call` runs entry twice to expose cross-call buffer state. */
+    program(): { program: string; call: string } {
+        const n = int(this.r, 2, 3);
+        // Sometimes name the scratch so its scalars (`s_0`) collide with a local the
+        // entry also declares — the collision class reviewer C found.
+        const collide = chance(this.r, 0.25);
+        const s = collide ? 'v' : '_scr';
+        const idx = [...Array(n).keys()];
+        const readAll = idx.map((i) => `${s}[${i}]`).join(' + ');
+        const writes = idx.map((i) => `  ${s}[${i}] = ${this.e()};`);
+        const mode = pick(this.r, [
+            'ok',
+            'ok',
+            'ok',
+            'readBeforeWrite',
+            'partialRead',
+            'secondReader',
+            'escape',
+            'branchy',
+            'collideLocal',
+            'closure',
+        ]);
+        const body: string[] = [];
+        // Occasional leading effect (before any write) — preserved through
+        // scalarization, and doesn't trip the after-first-write re-entrancy guard.
+        if (chance(this.r, 0.4)) body.push(`  eff(${int(this.r, 1, 9)});`);
+        let extra = '';
+        // Only the FUNCTIONS are exported — the scratch const stays module-private
+        // (as in real crashcat). Exporting the const would make it externally
+        // initialized ⇒ always bail, so the fuzzer would exercise nothing.
+        let exports = 'entry';
+        let call = '[entry(7, 3), entry(2, 5)]';
+        if (mode === 'readBeforeWrite') {
+            body.push(`  let r0 = ${s}[0];`, ...writes, `  return r0 + ${readAll};`);
+        } else if (mode === 'partialRead') {
+            body.push(`  ${s}[0] = ${this.e()};`, `  return ${s}[0] + ${s}[${n - 1}];`);
+        } else if (mode === 'secondReader') {
+            body.push(...writes, `  return ${readAll};`);
+            extra = `\nfunction reader() { return ${s}[0] + ${s}[${n - 1}]; }`;
+            exports = 'entry, reader';
+            call = '[entry(7, 3), reader(), entry(2, 5), reader()]';
+        } else if (mode === 'escape') {
+            body.push(...writes, `  eff(${s});`, `  return ${readAll};`);
+        } else if (mode === 'branchy') {
+            body.push(`  if (p > q) { ${s}[0] = ${this.e()}; } else { ${s}[0] = ${this.e()}; }`);
+            for (let i = 1; i < n; i++) body.push(`  ${s}[${i}] = ${this.e()};`);
+            body.push(`  return ${readAll};`);
+        } else if (mode === 'collideLocal') {
+            // A local whose name equals a generated scalar (`s_0`) — must not merge.
+            body.push(`  let ${s}_0 = ${this.e()};`, ...writes, `  return ${readAll} + ${s}_0;`);
+        } else if (mode === 'closure') {
+            // Returns a closure whose PARAM shadows the scratch name — the scalarizer
+            // must not hijack the inner `${s}` binding. Called by the oracle.
+            body.push(...writes, `  return (${s}) => ${readAll};`);
+            const distinct = idx.map((i) => (i + 1) * 11).join(', ');
+            call = `[entry(7, 3)([${distinct}]), entry(2, 5)([${distinct}])]`;
+        } else {
+            body.push(...writes, `  return ${readAll};`);
+        }
+        const scr = `const ${s} = /*@__PURE__*/ [${idx.map(() => '0').join(', ')}];`;
+        const entry = `/* @optimize */ function entry(p, q) {\n${body.join('\n')}\n}`;
+        return { program: `${scr}\n${entry}${extra}`, exports, call };
+    }
+}
+
+/** Scratch differential: source vs compiled, two-call oracle. Only the functions
+ *  are exported (scratch const stays private, else it always bails). */
+function scratchDiff(
+    program: string,
+    exports: string,
+    call: string,
+): { want: unknown; got: unknown; compiled: string } | null {
+    const want = evalProgram(program, call);
+    if (!want.ok) return null;
+    const withExp = `${program}\nexport { ${exports} };`;
+    const compiled = compiler.compileChunk('scratch.ts', withExp, {}).code;
+    const got = evalProgram(compiled, call);
+    const wv = JSON.stringify(want.value);
+    const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
+    return wv === gv ? null : { want: want.value, got: got.ok ? got.value : '<threw>', compiled };
+}
+
+describe('fuzz: module-scratch scalar replacement (effect oracle, two-call)', () => {
+    const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x5e12a7c4;
+    const ITERS = Number(process.env.FUZZ_ITERS ?? 0) || 400;
+    it(`${ITERS} module-scratch programs preserve semantics across calls`, () => {
+        for (let i = 0; i < ITERS; i++) {
+            const seed = (BASE ^ 0x1b873593) + i * 2654435761;
+            const { program, call } = new ScratchGen(mulberry32(seed >>> 0)).program();
+            let d: ReturnType<typeof scratchDiff>;
+            try {
+                d = scratchDiff(program, call);
+            } catch (e) {
+                d = { want: 'n/a', got: `<compile threw: ${(e as Error).message}>` };
+            }
+            if (d) {
+                throw new Error(
+                    `SCRATCH MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
+                        `call: ${call}   want=${JSON.stringify(d.want)} got=${JSON.stringify(d.got)}\n\n` +
+                        `--- source ---\n${program}\n\n` +
+                        `--- compiled ---\n${compiler.compileChunk('scratch.ts', withExports(program), {}).code}\n`,
+                );
+            }
+        }
+        expect(true).toBe(true);
+    });
+});
+
 // Pinned minimal repros the effect oracle (value + side-effect trace) found while
 // making the optimizer Closure-aligned on side effects: an effectful expression
 // must never be dropped, reordered, duplicated, or have its count changed. `eff`
