@@ -578,6 +578,8 @@ class ScratchGen {
             'alias',
             'aliasTrailingEff',
             'blockShadow',
+            'loopBody',
+            'loopReadBeforeWrite',
         ]);
         const body: string[] = [];
         // Occasional leading effect (before any write) — preserved through
@@ -618,6 +620,29 @@ class ScratchGen {
         } else if (mode === 'aliasTrailingEff') {
             // Alias + a trailing effect AFTER the last scratch use (v2 window).
             body.push(...writesA, `  const rv = ${readAllA};`, `  eff(rv);`, `  return rv;`);
+        } else if (mode === 'loopBody') {
+            // v2 confinement: per-iteration scratch, written-then-read inside a loop.
+            const w = idx.map((i) => `    ${s}[${i}] = ${this.e()} + i;`);
+            body.push(
+                '  let acc = 0;',
+                '  for (let i = 0; i < 4; i++) {',
+                ...w,
+                `    acc += ${readAll};`,
+                '  }',
+                '  return acc;',
+            );
+        } else if (mode === 'loopReadBeforeWrite') {
+            // Read a field before its write inside the loop → reads prior iteration →
+            // must BAIL (a wrong per-call scalarization diverges).
+            const w = idx.map((i) => `    ${s}[${i}] = ${this.e()} + i;`);
+            body.push(
+                '  let acc = 0;',
+                '  for (let i = 0; i < 4; i++) {',
+                `    acc += ${s}[0];`,
+                ...w,
+                '  }',
+                '  return acc;',
+            );
         } else if (mode === 'blockShadow') {
             // A block-scoped rebind of the scratch name (distinct variable). Must NOT
             // be hijacked by the name-based rewriter. Values differ so a hijack diverges.

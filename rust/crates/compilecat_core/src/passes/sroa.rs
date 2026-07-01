@@ -39,7 +39,7 @@ use oxc_allocator::{Address, Allocator, CloneIn, TakeIn};
 use oxc_ast::ast::*;
 use oxc_ast::{AstBuilder, AstKind, NONE};
 use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
-use oxc_semantic::{NodeId, ScopeFlags, SemanticBuilder};
+use oxc_semantic::{NodeId, ScopeFlags, SemanticBuilder, Semantic, SymbolId};
 use oxc_span::SPAN;
 
 use super::util::is_side_effect_free;
@@ -861,17 +861,28 @@ impl<'a> Sroa<'a> {
                 // it); else the scratch is used directly. All the per-function gates
                 // then run on `name`, and both the alias decl + module const are
                 // deleted. (~half of crashcat's scratch sites use the alias form.)
-                let (name, aliased) = match refs.as_slice() {
+                // `rewrite_sym` = the symbol `name` must resolve to everywhere in the
+                // owner: the scratch symbol for a direct use, the alias binding's
+                // symbol for the alias form.
+                let (name, aliased, rewrite_sym) = match refs.as_slice() {
                     [only] => match single_const_alias(only.node_id(), nodes) {
-                        Some(alias) => (alias, true),
-                        None => (id.name.to_string(), false),
+                        Some((alias, alias_sym)) => (alias, true, alias_sym),
+                        None => (id.name.to_string(), false, sym),
                     },
-                    _ => (id.name.to_string(), false),
+                    _ => (id.name.to_string(), false, sym),
                 };
-                // Expected bindings of `name` in the owner: 0 for a direct scratch
-                // (bound at module scope), 1 for an alias (its own `const name = _s`).
-                if owner_scope_conflicts(func, &name, &shape, u32::from(aliased)) {
-                    continue; // nested-scope shadow/capture, or a scalar-name collision
+                // SYMBOL GATE (subsumes the old shadow/capture heuristics): every
+                // identifier named `name` in the owner must resolve to `rewrite_sym`.
+                // If any doesn't, a distinct binding SHADOWS the name and the
+                // name-based rewriter would hijack it — bail. This makes the
+                // name-based rewrite provably equivalent to a symbol-based one.
+                if owner_name_shadowed(func, &name, rewrite_sym, &semantic) {
+                    continue;
+                }
+                // A generated scalar name `{name}_{suffix}` already present would merge
+                // with the emitted scalar (separate, name-level concern).
+                if owner_has_scalar_name(func, &name, &shape) {
+                    continue;
                 }
                 out.push(ModuleScratchCand {
                     name,
@@ -1057,7 +1068,7 @@ struct ModuleScratchCand {
 /// same buffer, so member accesses through `s` can be scalarized. Requires `const`
 /// (a reassignable alias may not always equal the scratch). The other soundness
 /// gates (member-only, killed-on-entry, no nested capture) then run on `s`.
-fn single_const_alias(ref_id: NodeId, nodes: &oxc_semantic::AstNodes) -> Option<String> {
+fn single_const_alias(ref_id: NodeId, nodes: &oxc_semantic::AstNodes) -> Option<(String, SymbolId)> {
     let decl_id = nodes.parent_id(ref_id);
     let AstKind::VariableDeclarator(d) = nodes.kind(decl_id) else { return None };
     // The reference must BE the whole init (`= _scratch`), not nested (`= _scratch[0]`).
@@ -1068,7 +1079,10 @@ fn single_const_alias(ref_id: NodeId, nodes: &oxc_semantic::AstNodes) -> Option<
     let AstKind::VariableDeclaration(vd) = nodes.kind(nodes.parent_id(decl_id)) else {
         return None;
     };
-    (vd.kind == VariableDeclarationKind::Const).then(|| bid.name.to_string())
+    if vd.kind != VariableDeclarationKind::Const {
+        return None;
+    }
+    Some((bid.name.to_string(), bid.symbol_id.get()?))
 }
 
 /// `vec3` → `Vec3` (capitalize first byte) — the mathcat namespace→type convention.
@@ -1224,6 +1238,23 @@ fn remove_alias_decl<'a>(body: &mut oxc_allocator::Vec<'a, Statement<'a>>, alias
 /// compound assign to `name`, a nested write, or an unknown suffix. Assumes
 /// `escape_ok` already proved all uses are member accesses.
 fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
+    // Confinement (v2): if the scratch is used ONLY inside one nested control-flow
+    // block at this level, recurse into it — its live range is confined and per-ENTRY
+    // scalars are safe (each loop iteration / branch entry writes-before-reads, which
+    // the recursion re-checks with a fresh `written` set). Recovers the canonical
+    // "process N particles/vertices" per-iteration scratch, the biggest over-bail.
+    let mentioning: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| stmt_mentions_name(s, name))
+        .map(|(i, _)| i)
+        .collect();
+    if let [only] = mentioning.as_slice() {
+        if let Some(inner) = confining_block(&body[*only], name) {
+            return killed_on_entry(inner, name, shape);
+        }
+    }
+
     // The scratch is LIVE from its first write to its last use (read or write). A
     // re-entrant call outside that window can't affect an observed value, so the
     // guard only fires inside it (v2: lets trailing non-inlined calls like
@@ -1285,68 +1316,135 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
     true
 }
 
-/// True if scalarizing `name` in `func` would be UNSAFE for a naming reason —
-/// bail conservatively. Two cases, both real miscompiles the name-based rewriter
-/// would cause otherwise:
-///   (B) the scratch name is referenced inside a NESTED function/arrow — either a
-///       closure capturing it (escape) or a nested binding that SHADOWS it (a
-///       distinct variable whose `name[i]` accesses the rewriter would wrongly
-///       hijack). oxc_semantic sees the shadow as a different symbol, so
-///       single-owner still holds; the name-based `AccessRewriter` does not.
-///   (C) a generated scalar name `{name}_{suffix}` already occurs (as a binding or
-///       reference) in the owner — emitting `let {name}_{suffix}` would merge two
-///       distinct variables (wrong value, or a `const`-reassignment crash).
+/// SYMBOL GATE. True if some identifier named `name` in `func` does NOT resolve to
+/// `rewrite_sym` — i.e. a distinct binding SHADOWS the scratch/alias name (a nested
+/// fn param, a block-scoped `const`, etc.), whose `name[i]` accesses the name-based
+/// rewriter would wrongly hijack. Because oxc_semantic assigns the shadow its own
+/// `SymbolId`, this one principled check subsumes the earlier scope heuristics
+/// (nested-fn capture + re-binding count) and makes the name-based rewrite provably
+/// equivalent to a symbol-based one. Runs at analysis time (Semantic live).
 ///
 /// (The effectful-getter re-entrancy caveat lives on `killed_on_entry`, where the
 /// re-entrancy machinery is.)
-fn owner_scope_conflicts(func: &Function, name: &str, shape: &Shape, allowed_bindings: u32) -> bool {
-    let scalars: HashSet<String> = shape.suffixes().iter().map(|s| format!("{name}_{s}")).collect();
-    let mut c =
-        ScratchSafetyChecker { name, scalars: &scalars, fn_depth: 0, name_bindings: 0, conflict: false };
+fn owner_name_shadowed(func: &Function, name: &str, rewrite_sym: SymbolId, semantic: &Semantic) -> bool {
+    let mut c = SymShadowChecker { name, rewrite_sym, scoping: semantic.scoping(), shadowed: false };
     if let Some(body) = &func.body {
         for stmt in &body.statements {
             c.visit_statement(stmt);
         }
     }
-    // A re-binding of `name` beyond the one expected decl (0 for a direct scratch, 1
-    // for the alias's own `const name = _s`) is a SHADOW — a distinct variable whose
-    // `name[i]` the name-based rewriter would hijack. Adversarial review found this
-    // for block scopes (`if (c) { const v = q; … }`), which `fn_depth` misses.
-    c.conflict || c.name_bindings > allowed_bindings
+    c.shadowed
 }
 
-struct ScratchSafetyChecker<'s> {
+struct SymShadowChecker<'s> {
     name: &'s str,
-    scalars: &'s HashSet<String>,
-    fn_depth: u32,
-    name_bindings: u32,
-    conflict: bool,
+    rewrite_sym: SymbolId,
+    scoping: &'s oxc_semantic::Scoping,
+    shadowed: bool,
 }
 
-impl<'a> Visit<'a> for ScratchSafetyChecker<'_> {
-    fn visit_function(&mut self, f: &Function<'a>, flags: ScopeFlags) {
-        self.fn_depth += 1;
-        walk::walk_function(self, f, flags);
-        self.fn_depth -= 1;
-    }
-    fn visit_arrow_function_expression(&mut self, a: &ArrowFunctionExpression<'a>) {
-        self.fn_depth += 1;
-        walk::walk_arrow_function_expression(self, a);
-        self.fn_depth -= 1;
+impl<'a> Visit<'a> for SymShadowChecker<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name {
+            let sym = id.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id());
+            if sym != Some(self.rewrite_sym) {
+                self.shadowed = true; // a `name` ref resolving elsewhere = a shadow's use
+            }
+        }
     }
     fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
-        if self.scalars.contains(id.name.as_str()) {
-            self.conflict = true; // (C) collision with a generated scalar name
+        if id.name == self.name && id.symbol_id.get() != Some(self.rewrite_sym) {
+            self.shadowed = true; // a `name` binding that isn't the scratch/alias = a shadow decl
         }
-        if id.name == self.name {
-            self.name_bindings += 1; // (B) a binding of the scratch/alias name (shadow if extra)
+    }
+}
+
+/// True if a generated scalar name `{name}_{suffix}` already occurs (as a binding or
+/// reference) in `func` — emitting `let {name}_{suffix}` would merge two distinct
+/// variables (wrong value, or a `const`-reassignment crash). Name-level concern (the
+/// scalar doesn't exist yet, so there's no symbol to resolve).
+fn owner_has_scalar_name(func: &Function, name: &str, shape: &Shape) -> bool {
+    let scalars: HashSet<String> = shape.suffixes().iter().map(|s| format!("{name}_{s}")).collect();
+    let mut c = ScalarNameChecker { scalars: &scalars, found: false };
+    if let Some(body) = &func.body {
+        for stmt in &body.statements {
+            c.visit_statement(stmt);
+        }
+    }
+    c.found
+}
+
+struct ScalarNameChecker<'s> {
+    scalars: &'s HashSet<String>,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for ScalarNameChecker<'_> {
+    fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
+        if self.scalars.contains(id.name.as_str()) {
+            self.found = true;
         }
     }
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if self.scalars.contains(id.name.as_str())
-            || (self.fn_depth > 0 && id.name == self.name)
-        {
-            self.conflict = true; // (C) scalar collision, or (B) name captured in a nested fn
+        if self.scalars.contains(id.name.as_str()) {
+            self.found = true;
+        }
+    }
+}
+
+/// The inner statement list of a single control-flow block that FULLY confines every
+/// use of `name` (nothing in the loop header / if-test / update / else branch), else
+/// `None`. The count-equality check is what makes it sound: if any `name` reference
+/// sits outside the returned block, the recursion would miss a use the (whole-body)
+/// rewriter still rewrites.
+fn confining_block<'a>(stmt: &'a Statement<'a>, name: &str) -> Option<&'a [Statement<'a>]> {
+    let inner: &[Statement] = match stmt {
+        Statement::BlockStatement(b) => &b.body,
+        Statement::ForStatement(s) => as_stmts(&s.body),
+        Statement::WhileStatement(s) => as_stmts(&s.body),
+        Statement::DoWhileStatement(s) => as_stmts(&s.body),
+        Statement::ForInStatement(s) => as_stmts(&s.body),
+        Statement::ForOfStatement(s) => as_stmts(&s.body),
+        Statement::LabeledStatement(s) => as_stmts(&s.body),
+        // If: only when the scratch is confined to the consequent (the count check
+        // below bails when the test or the else-branch also mentions it).
+        Statement::IfStatement(s) => as_stmts(&s.consequent),
+        _ => return None,
+    };
+    (count_name(inner, name) == count_name_stmt(stmt, name)).then_some(inner)
+}
+
+/// A statement's body as a slice — the block's statements, or the single statement.
+fn as_stmts<'a>(s: &'a Statement<'a>) -> &'a [Statement<'a>] {
+    match s {
+        Statement::BlockStatement(b) => &b.body,
+        other => std::slice::from_ref(other),
+    }
+}
+
+fn count_name(stmts: &[Statement], name: &str) -> usize {
+    let mut c = NameCounter { name, count: 0 };
+    for s in stmts {
+        c.visit_statement(s);
+    }
+    c.count
+}
+
+fn count_name_stmt(stmt: &Statement, name: &str) -> usize {
+    let mut c = NameCounter { name, count: 0 };
+    c.visit_statement(stmt);
+    c.count
+}
+
+struct NameCounter<'s> {
+    name: &'s str,
+    count: usize,
+}
+
+impl<'a> Visit<'a> for NameCounter<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name {
+            self.count += 1;
         }
     }
 }
@@ -2212,6 +2310,59 @@ mod tests {
         ));
         assert!(out.contains("_s_0"), "scalarized despite trailing call:\n{out}");
         assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    const SET3: &str =
+        "/* @inline */ function set3(o, a, b, c) { o[0]=a; o[1]=b; o[2]=c; }\n";
+
+    #[test]
+    fn module_scratch_loop_body_confined_scalarized() {
+        // v2 confinement: a per-iteration scratch confined to a loop body scalarizes
+        // (killed-on-entry within each iteration). The canonical crashcat kernel.
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, n) {{ \
+             for (let i=0;i<n;i++) {{ set3(_s, a, b, a); out[i]=_s[0]+_s[1]+_s[2]; }} return out; }}"
+        ));
+        assert!(out.contains("_s_0"), "loop-body scratch scalarized:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_single_if_branch_confined_scalarized() {
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, n) {{ \
+             if (n>0) {{ set3(_s, a, b, a); out[0]=_s[0]+_s[1]+_s[2]; }} return out; }}"
+        ));
+        assert!(out.contains("_s_0"), "if-branch scratch scalarized:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_loop_read_before_write_bailed() {
+        // Read of a field before its write WITHIN the iteration → reads the prior
+        // iteration's value; per-call scalars wouldn't reproduce it. Bail.
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, n) {{ \
+             for (let i=0;i<n;i++) {{ out[i]=_s[0]; set3(_s, a, b, a); }} return out; }}"
+        ));
+        assert!(out.contains("const _s"), "module const preserved (read-before-write):\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_both_if_branches_bailed() {
+        // Written in both arms, read after → needs dominator analysis (v3). The
+        // count-equality check bails because the scratch is in the else branch too.
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, n) {{ \
+             if (n>0) {{ set3(_s,a,b,a); }} else {{ set3(_s,b,a,b); }} out[0]=_s[0]+_s[1]+_s[2]; return out; }}"
+        ));
+        assert!(out.contains("const _s"), "module const preserved (both branches):\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
     }
 
     #[test]
