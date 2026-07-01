@@ -1,9 +1,11 @@
 // Real-world correctness (+ a place to track optimality) on code lifted from
-// crashcat — the physics workloads compilecat exists to optimize. Unlike the
-// synthetic fuzzer, these are authored hot kernels (dense vec3 math, out-param
-// writes, branch-heavy). Each fixture is compiled and its output is checked to
-// compute IDENTICAL results to the source over random inputs — a real miscompile
-// on real code shows up here even if the fuzzer's grammar never generates it.
+// crashcat/mathcat — the physics workloads compilecat exists to optimize. Unlike
+// the synthetic fuzzer, these are authored hot kernels (dense vec3 math, out-param
+// writes, branch-heavy, nested @inline). Each kernel is compiled and its output is
+// checked to compute IDENTICAL results to the source over random inputs — a real
+// miscompile on real code shows up here even if the fuzzer's grammar never
+// generates the shape. `@optimize` is added to the fixture *copies* only; the
+// crashcat/mathcat sources are never modified.
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -19,10 +21,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 /** Strip TS → runnable JS, drop the ESM export so `new Function` can eval it. */
 function toJs(tsCode: string): string {
-    return transformSync(tsCode, { loader: 'ts' }).code.replace(/\bexport\s*\{[^}]*\}\s*;?/g, '').replace(/\bexport\s+/g, '');
+    return transformSync(tsCode, { loader: 'ts' }).code
+        .replace(/\bexport\s*\{[^}]*\}\s*;?/g, '')
+        .replace(/\bexport\s+/g, '');
 }
 
-/** A deterministic PRNG in [-range, range]. */
+/** Deterministic PRNG in [-range, range]. */
 function prng(seed: number, range: number): () => number {
     let s = seed >>> 0;
     return () => {
@@ -30,43 +34,72 @@ function prng(seed: number, range: number): () => number {
         return (s / 0x7fffffff) * 2 * range - range;
     };
 }
+const v3 = (r: () => number): number[] => [r(), r(), r()];
 
-describe('real-world: crashcat GJK kernels', () => {
-    it('computeClosestPointOnTriangle — compiled ≡ source (10k random triangles)', () => {
-        const ts = readFileSync(
-            resolve(here, 'fixtures/real-world/gjk-closest-point-on-triangle.ts'),
-            'utf8',
-        );
-        const compiled = compiler.compileChunk('gjk.ts', ts, {}).code;
+type Kernel = {
+    name: string;
+    fixture: string;
+    params: string[];
+    /** Statement body that calls the entry and `return`s the observable result. */
+    callBody: string;
+    inputs: (r: () => number, i: number) => unknown[];
+};
 
-        const call =
+const KERNELS: Kernel[] = [
+    {
+        name: 'gjk computeClosestPointOnTriangle',
+        fixture: 'gjk-closest-point-on-triangle.ts',
+        params: ['A', 'B', 'Cc', 'must', 'tol'],
+        callBody:
             'const out = { point: [0, 0, 0], pointSet: 0 };' +
-            'computeClosestPointOnTriangle(out, A, B, Cc, must, tol); return out;';
-        // biome-ignore lint/security/noGlobalEval: evaluating generated/compiled code under test
-        const src = new Function('A', 'B', 'Cc', 'must', 'tol', `${toJs(ts)}\n${call}`);
-        // biome-ignore lint/security/noGlobalEval: evaluating generated/compiled code under test
-        const opt = new Function('A', 'B', 'Cc', 'must', 'tol', `${toJs(compiled)}\n${call}`);
+            'computeClosestPointOnTriangle(out, A, B, Cc, must, tol); return out;',
+        inputs: (r, i) => [v3(r), v3(r), v3(r), i % 2 === 0, 1e-12],
+    },
+    {
+        name: 'barycentric computeBarycentricCoordinates3d (3d → @inline 2d)',
+        fixture: 'barycentric-coordinates.ts',
+        params: ['A', 'B', 'Cc', 'tol'],
+        callBody:
+            'const out = { u: 0, v: 0, w: 0, isValid: false };' +
+            'computeBarycentricCoordinates3d(out, A, B, Cc, tol); return out;',
+        inputs: (r, i) => [v3(r), v3(r), v3(r), i % (2 + (i & 1)) === 0 ? 1e-12 : 1e-2],
+    },
+];
 
-        const r = prng(0xc0ffee, 2);
-        for (let i = 0; i < 10000; i++) {
-            const A = [r(), r(), r()];
-            const B = [r(), r(), r()];
-            const Cc = [r(), r(), r()];
-            const must = i % 2 === 0;
-            const s = src(A, B, Cc, must, 1e-12);
-            const o = opt(A, B, Cc, must, 1e-12);
-            expect(o, `triangle #${i} A=${A} B=${B} C=${Cc} must=${must}`).toEqual(s);
-        }
-    });
+describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
+    for (const k of KERNELS) {
+        it(`${k.name} (10k random inputs)`, () => {
+            const ts = readFileSync(resolve(here, 'fixtures/real-world', k.fixture), 'utf8');
+            const compiled = compiler.compileChunk(k.fixture, ts, {}).code;
+            const make = (code: string) =>
+                // biome-ignore lint/security/noGlobalEval: evaluating compiled code under test
+                new Function(...k.params, `${toJs(code)}\n${k.callBody}`);
+            const src = make(ts);
+            const opt = make(compiled);
+
+            const r = prng(0xc0ffee, 2);
+            for (let i = 0; i < 10000; i++) {
+                const args = k.inputs(r, i);
+                expect(opt(...args), `${k.name} #${i} args=${JSON.stringify(args)}`).toEqual(
+                    src(...args),
+                );
+            }
+        });
+    }
 });
 
-// The GJK inspection surfaced a real, concrete optimality gap: compilecat has NO
-// common-subexpression-elimination / load-hoisting, so source-level redundancy
-// (`cx-ax` computed as both `ac_x` and `ac2x`, `inC[0]` loaded 6×) passes through.
-// It is NOT the compiler pessimizing — it just doesn't dedupe. These minimal cases
-// PIN the current (pre-CSE) output; when a purity-gated CSE pass lands the counts
-// drop and these asserts flip — a visible win, tracked here, not a silent gap.
-describe('optimality gaps — CSE / load-hoisting (v2 target, tracked)', () => {
+// The GJK inspection surfaced a concrete pattern: compilecat has NO common-
+// subexpression-elimination / value-numbering, so source-level redundancy (`cx-ax`
+// as both `ac_x` and `ac2x`; `inC[0]` loaded 6×) passes through. Closure also has
+// no GVN — it relies on the JIT. BUT whether that's the right call for compilecat
+// is UNMEASURED and OPEN: (a) V8's load-elimination is bounded by effect analysis —
+// it must reload across any call it can't prove pure, and compilecat's purity
+// analysis is exactly what could CSE across a PURE call (JIT-impossible); (b) naive
+// microbenchmarks of JIT load-elimination are unreliable (gave contradictory 2.1× /
+// 0.95× / 0.15× results). A proper end-to-end benchmark on a real kernel is needed
+// before deciding. These cases just PIN today's output so a future CSE pass is a
+// visible, deliberate change — NOT a claim that skipping it is optimal.
+describe('optimality gaps — CSE / GVN (UNMEASURED trade-off; tracked, not yet decided)', () => {
     const optCount = (body: string, re: RegExp): number => {
         const out = compiler.compileChunk(
             'g.ts',
@@ -76,13 +109,11 @@ describe('optimality gaps — CSE / load-hoisting (v2 target, tracked)', () => {
         return (out.match(re) || []).length;
     };
 
-    it('pure duplicate subexpr recomputed (v2 CSE → 1)', () => {
-        // `(a-b)*(a-b) + (a-b)` — `a-b` is pure, computed 3× today.
+    it('pure duplicate subexpr recomputed (left to the JIT)', () => {
         expect(optCount('return (a - b) * (a - b) + (a - b);', /a - b/g)).toBe(3);
     });
 
-    it('repeated array load not hoisted (v2 load-hoist → 1)', () => {
-        // `v[0]` (member read, assumed pure) loaded 3× today.
+    it('repeated array load not hoisted (left to the JIT)', () => {
         expect(optCount('return v[0] * v[0] + v[0];', /v\[0\]/g)).toBe(3);
     });
 });
