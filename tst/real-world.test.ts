@@ -35,6 +35,7 @@ function prng(seed: number, range: number): () => number {
     };
 }
 const v3 = (r: () => number): number[] => [r(), r(), r()];
+const q4 = (r: () => number): number[] => [r(), r(), r(), r()];
 
 type Kernel = {
     name: string;
@@ -63,6 +64,27 @@ const KERNELS: Kernel[] = [
             'const out = { u: 0, v: 0, w: 0, isValid: false };' +
             'computeBarycentricCoordinates3d(out, A, B, Cc, tol); return out;',
         inputs: (r, i) => [v3(r), v3(r), v3(r), i % (2 + (i & 1)) === 0 ? 1e-12 : 1e-2],
+    },
+    {
+        name: 'module-scratch: updatePosition (direct vec3 scratch → scalarized)',
+        fixture: 'scratch-transform-point.ts',
+        params: ['scm', 'quat', 'com'],
+        callBody: 'const out = [0, 0, 0]; updatePosition(out, scm, quat, com); return out;',
+        inputs: (r) => [v3(r), q4(r), v3(r)],
+    },
+    {
+        name: 'module-scratch: updatePositionAliased (local-alias scratch → v1 bails)',
+        fixture: 'scratch-transform-point.ts',
+        params: ['scm', 'quat', 'com'],
+        callBody: 'const out = [0, 0, 0]; updatePositionAliased(out, scm, quat, com); return out;',
+        inputs: (r) => [v3(r), q4(r), v3(r)],
+    },
+    {
+        name: 'module-scratch: tangent (direct vec3 cross scratch → scalarized)',
+        fixture: 'scratch-transform-point.ts',
+        params: ['a', 'b', 'c'],
+        callBody: 'const out = [0, 0, 0]; tangent(out, a, b, c); return out;',
+        inputs: (r) => [v3(r), v3(r), v3(r)],
     },
 ];
 
@@ -99,6 +121,36 @@ describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
 // 0.95× / 0.15× results). A proper end-to-end benchmark on a real kernel is needed
 // before deciding. These cases just PIN today's output so a future CSE pass is a
 // visible, deliberate change — NOT a claim that skipping it is optimal.
+// Module-scratch scalar replacement (SROA GlobalOpt-localize) on the real crashcat
+// patterns: a module-level `const _s = /*@__PURE__*/ vec3.create()` reused as
+// per-call scratch. Pins v1's coverage — what actually fires on production shapes —
+// so a change (v2 alias-following, wider window) is a visible, deliberate move. The
+// KERNELS above already prove these compile ≡ source; this pins the OPTIMIZATION.
+describe('module-scratch scalar replacement — real crashcat patterns', () => {
+    const compiledFixture = (fixture: string): string =>
+        compiler.compileChunk(
+            fixture,
+            readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'),
+            {},
+        ).code;
+
+    it('DIRECT scratch use scalarizes (const deleted, member reads → scalars)', () => {
+        const out = compiledFixture('scratch-transform-point.ts');
+        // The directly-used scratch buffers become scalar locals and their consts go.
+        expect(out).toMatch(/_scratch_0/);
+        expect(out).not.toContain('const _scratch =');
+        expect(out).toMatch(/_scratchCross_0/);
+        expect(out).not.toContain('const _scratchCross =');
+    });
+
+    it('LOCAL-ALIAS scratch use bails (v2 opportunity — pinned, not yet handled)', () => {
+        const out = compiledFixture('scratch-transform-point.ts');
+        // `const s = _scratchAliased` reads as an escape today → left intact.
+        expect(out).toContain('_scratchAliased');
+        expect(out).not.toMatch(/_scratchAliased_0/);
+    });
+});
+
 describe('optimality gaps — CSE / GVN (UNMEASURED trade-off; tracked, not yet decided)', () => {
     const optCount = (body: string, re: RegExp): number => {
         const out = compiler.compileChunk(
