@@ -1351,7 +1351,8 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
 /// (The effectful-getter re-entrancy caveat lives on `killed_on_entry`, where the
 /// re-entrancy machinery is.)
 fn owner_name_shadowed(func: &Function, name: &str, rewrite_sym: SymbolId, semantic: &Semantic) -> bool {
-    let mut c = SymShadowChecker { name, rewrite_sym, scoping: semantic.scoping(), shadowed: false };
+    let mut c =
+        SymShadowChecker { name, rewrite_sym, scoping: semantic.scoping(), fn_depth: 0, shadowed: false };
     if let Some(body) = &func.body {
         for stmt in &body.statements {
             c.visit_statement(stmt);
@@ -1364,15 +1365,31 @@ struct SymShadowChecker<'s> {
     name: &'s str,
     rewrite_sym: SymbolId,
     scoping: &'s oxc_semantic::Scoping,
+    fn_depth: u32,
     shadowed: bool,
 }
 
 impl<'a> Visit<'a> for SymShadowChecker<'_> {
+    fn visit_function(&mut self, f: &Function<'a>, flags: ScopeFlags) {
+        self.fn_depth += 1;
+        walk::walk_function(self, f, flags);
+        self.fn_depth -= 1;
+    }
+    fn visit_arrow_function_expression(&mut self, a: &ArrowFunctionExpression<'a>) {
+        self.fn_depth += 1;
+        walk::walk_arrow_function_expression(self, a);
+        self.fn_depth -= 1;
+    }
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
         if id.name == self.name {
             let sym = id.reference_id.get().and_then(|r| self.scoping.get_reference(r).symbol_id());
-            if sym != Some(self.rewrite_sym) {
-                self.shadowed = true; // a `name` ref resolving elsewhere = a shadow's use
+            // A `name` ref resolving elsewhere = a shadow's use; a `name` ref inside a
+            // NESTED function = a closure CAPTURE that may outlive the call (the symbol
+            // gate alone can't see the capture — it resolves to the same symbol — so
+            // this restores the capture guard, load-bearing on the alias path where
+            // single-owner runs on the module const, not the alias).
+            if sym != Some(self.rewrite_sym) || self.fn_depth > 0 {
+                self.shadowed = true;
             }
         }
     }
@@ -2461,6 +2478,20 @@ mod tests {
         assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
         // The pre-existing `_s_0` local must survive with its own initializer.
         assert!(out.contains("* 100") || out.contains("*100"), "collided local preserved:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_alias_captured_in_closure_bailed() {
+        // Self-review regression: an ALIAS captured in a returned/stored closure
+        // observes the shared buffer across calls — per-call scalars would diverge.
+        // The symbol gate sees the same symbol, so a nested-function capture guard is
+        // required (direct scratches get this free via single-owner).
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(a, b) {{ const s = _s; add3(s,a,b); return () => s[0]+s[1]+s[2]; }}"
+        ));
+        assert!(out.contains("const _s"), "module const preserved (alias capture):\n{out}");
+        assert!(!out.contains("s_0"), "not scalarized (alias capture):\n{out}");
     }
 
     #[test]

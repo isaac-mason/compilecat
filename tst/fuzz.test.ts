@@ -580,13 +580,17 @@ class ScratchGen {
             'blockShadow',
             'loopBody',
             'loopReadBeforeWrite',
+            'aliasClosure',
         ]);
         const body: string[] = [];
         // Occasional leading effect (before any write) — preserved through
         // scalarization, and doesn't trip the after-first-write re-entrancy guard.
         if (chance(this.r, 0.4)) body.push(`  eff(${int(this.r, 1, 9)});`);
         // v2 alias-following: reach the scratch through a `const <s> = _s` alias.
-        const acc = mode === 'alias' || mode === 'aliasTrailingEff' ? `${s}a` : s;
+        const acc =
+            mode === 'alias' || mode === 'aliasTrailingEff' || mode === 'aliasClosure'
+                ? `${s}a`
+                : s;
         if (acc !== s) body.push(`  const ${acc} = ${s};`);
         const readAllA = idx.map((i) => `${acc}[${i}]`).join(' + ');
         const writesA = idx.map((i) => `  ${acc}[${i}] = ${this.e()};`);
@@ -643,6 +647,12 @@ class ScratchGen {
                 '  }',
                 '  return acc;',
             );
+        } else if (mode === 'aliasClosure') {
+            // Alias captured in a RETURNED closure → observes the shared buffer across
+            // calls; must BAIL. The deferred call (both entries run, then both closures
+            // invoked) exposes a wrong per-call scalarization.
+            body.push(...writesA, `  return () => ${readAllA};`);
+            call = '(() => { const c1 = entry(7, 3); const c2 = entry(2, 5); return [c1(), c2()]; })()';
         } else if (mode === 'blockShadow') {
             // A block-scoped rebind of the scratch name (distinct variable). Must NOT
             // be hijacked by the name-based rewriter. Values differ so a hijack diverges.
