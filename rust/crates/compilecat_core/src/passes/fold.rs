@@ -12,6 +12,8 @@
 //! behavior to port yet), tagged templates, bigint `/` `%` `**` and
 //! bitwise/shift on bigint.
 
+use std::collections::HashSet;
+
 use oxc_allocator::{Allocator, TakeIn};
 use oxc_ast::ast::*;
 use oxc_ast::AstBuilder;
@@ -28,7 +30,8 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
 }
 
 pub fn run_with<'a>(allocator: &'a Allocator, program: &mut Program<'a>, gate: Gate) -> u32 {
-    let mut v = Folder { ast: AstBuilder::new(allocator), folded: 0, gate };
+    let mut v =
+        Folder { ast: AstBuilder::new(allocator), folded: 0, gate, numeric: HashSet::default() };
     v.visit_program(program);
     v.folded
 }
@@ -37,18 +40,29 @@ struct Folder<'a> {
     ast: AstBuilder<'a>,
     folded: u32,
     gate: Gate,
+    /// Names bound in the enclosing function(s) to params typed `: number` — the
+    /// type-aware gate that lets `x + 0 → x` fold when `x` is provably numeric
+    /// (Closure can't; it has no types). Cloned/restored per function so a nested
+    /// `x: string` param soundly shadows an outer numeric `x`.
+    numeric: HashSet<String>,
 }
 
 impl<'a> VisitMut<'a> for Folder<'a> {
     fn visit_function(&mut self, func: &mut Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        let saved = self.numeric.clone();
+        self.track_numeric_params(&func.params);
         let s = self.gate.enter_fn(func.span.start);
         walk_mut::walk_function(self, func, flags);
         self.gate.exit(s);
+        self.numeric = saved;
     }
     fn visit_arrow_function_expression(&mut self, arrow: &mut ArrowFunctionExpression<'a>) {
+        let saved = self.numeric.clone();
+        self.track_numeric_params(&arrow.params);
         let s = self.gate.enter_fn(arrow.span.start);
         walk_mut::walk_arrow_function_expression(self, arrow);
         self.gate.exit(s);
+        self.numeric = saved;
     }
     fn visit_statement(&mut self, stmt: &mut Statement<'a>) {
         let s = self.gate.enter_scope(stmt.span().start);
@@ -68,6 +82,67 @@ impl<'a> VisitMut<'a> for Folder<'a> {
 }
 
 impl<'a> Folder<'a> {
+    /// Record which simple params are typed `: number` into `self.numeric` (and
+    /// un-record any shadowed name that is re-bound to a non-number). Only exact
+    /// `number` counts — `number | undefined` etc. is not provably a number.
+    fn track_numeric_params(&mut self, params: &FormalParameters<'a>) {
+        for p in &params.items {
+            if let BindingPattern::BindingIdentifier(id) = &p.pattern {
+                let is_num = matches!(
+                    &p.type_annotation,
+                    Some(ta) if matches!(ta.type_annotation, TSType::TSNumberKeyword(_))
+                );
+                if is_num {
+                    self.numeric.insert(id.name.to_string());
+                } else {
+                    self.numeric.remove(id.name.as_str());
+                }
+            }
+        }
+    }
+
+    /// True if `e` provably evaluates to a number, so a numeric identity fold
+    /// (`e+0`/`e-0`/`e*1`/`e/1` → `e`) is value-preserving. Structural + sound:
+    /// numeric literals; the always-ToNumber arithmetic/bitwise/shift operators;
+    /// unary `+`/`-`/`~`; `Math.*` calls; and identifiers bound to a `: number`
+    /// param (`self.numeric`). `+` counts only when BOTH sides are numbers.
+    fn produces_number(&self, e: &Expression<'a>) -> bool {
+        match e {
+            Expression::NumericLiteral(_) => true,
+            Expression::Identifier(id) => self.numeric.contains(id.name.as_str()),
+            Expression::UnaryExpression(u) => matches!(
+                u.operator,
+                UnaryOperator::UnaryNegation
+                    | UnaryOperator::UnaryPlus
+                    | UnaryOperator::BitwiseNot
+            ),
+            Expression::BinaryExpression(b) => match b.operator {
+                BinaryOperator::Subtraction
+                | BinaryOperator::Multiplication
+                | BinaryOperator::Division
+                | BinaryOperator::Remainder
+                | BinaryOperator::Exponential
+                | BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseOR
+                | BinaryOperator::BitwiseXOR
+                | BinaryOperator::ShiftLeft
+                | BinaryOperator::ShiftRight
+                | BinaryOperator::ShiftRightZeroFill => true,
+                BinaryOperator::Addition => {
+                    self.produces_number(&b.left) && self.produces_number(&b.right)
+                }
+                _ => false,
+            },
+            Expression::ParenthesizedExpression(p) => self.produces_number(&p.expression),
+            Expression::TSAsExpression(t) => self.produces_number(&t.expression),
+            Expression::TSNonNullExpression(t) => self.produces_number(&t.expression),
+            // `Math.*(…)` always returns a number.
+            Expression::CallExpression(c) => matches!(&c.callee, Expression::StaticMemberExpression(m)
+                if matches!(&m.object, Expression::Identifier(o) if o.name == "Math")),
+            _ => false,
+        }
+    }
+
     fn fold(&self, expr: &mut Expression<'a>) -> Option<Expression<'a>> {
         match expr {
             Expression::UnaryExpression(_) => self.fold_unary(expr),
@@ -205,14 +280,22 @@ impl<'a> Folder<'a> {
             }
         }
 
-        // Identities (drop one side — only when the kept side is pure).
+        // Numeric identities (`x+0`, `x-0`, `x*1`, `x/1` → x). SOUND ONLY when the
+        // kept operand is a NUMBER: `"a"+0` is `"a0"`, `"a"*1` is `NaN` — dropping
+        // the op would corrupt a string/object. So gate on `produces_number` (the
+        // type-aware win over Closure, which can't fold these without a proven
+        // numeric type). Still requires the kept side pure (dropping the other side).
         let alloc = self.ast.allocator;
-        let keep_left = rv == Some(0.0) && op == BinaryOperator::Addition && is_pure(&b.left)
-            || rv == Some(0.0) && op == BinaryOperator::Subtraction && is_pure(&b.left)
-            || rv == Some(1.0) && op == BinaryOperator::Multiplication && is_pure(&b.left)
-            || rv == Some(1.0) && op == BinaryOperator::Division && is_pure(&b.left);
-        let keep_right = lv == Some(0.0) && op == BinaryOperator::Addition && is_pure(&b.right)
-            || lv == Some(1.0) && op == BinaryOperator::Multiplication && is_pure(&b.right);
+        let keep_left = (rv == Some(0.0) && op == BinaryOperator::Addition
+            || rv == Some(0.0) && op == BinaryOperator::Subtraction
+            || rv == Some(1.0) && op == BinaryOperator::Multiplication
+            || rv == Some(1.0) && op == BinaryOperator::Division)
+            && is_pure(&b.left)
+            && self.produces_number(&b.left);
+        let keep_right = (lv == Some(0.0) && op == BinaryOperator::Addition
+            || lv == Some(1.0) && op == BinaryOperator::Multiplication)
+            && is_pure(&b.right)
+            && self.produces_number(&b.right);
         if keep_left {
             return Some(b.left.take_in(alloc));
         }
@@ -322,6 +405,7 @@ fn chain_element_is_optional(el: &ChainElement) -> bool {
         ChainElement::TSNonNullExpression(_) => false,
     }
 }
+
 
 // ── value helpers ───────────────────────────────────────────────────────────
 
@@ -525,6 +609,23 @@ mod tests {
         let (out, n) = f(r#"var n = +"123";"#);
         assert!(out.contains("var n = 123"), "got: {out}");
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn numeric_identity_folds_only_when_provably_number() {
+        // Structurally-numeric operand (arithmetic result) → fold.
+        assert!(f("var y = (a - b) + 0;").0.contains("var y = a - b"));
+        assert!(f("var y = (a * b) * 1;").0.contains("var y = a * b"));
+        // `: number` param → type-aware fold (the win over Closure).
+        assert_eq!(f("function g(x: number) { return x + 0; }").1, 1);
+        assert!(f("function g(x: number) { return x + 0; }").0.contains("return x"));
+        assert!(f("function g(x: number) { return x * 1; }").0.contains("return x"));
+        // Untyped / non-number operand → NOT folded (`\"a\"+0` is `\"a0\"`).
+        assert_eq!(f("function g(x) { return x + 0; }").1, 0);
+        assert_eq!(f("function g(x: string) { return x + 0; }").1, 0);
+        assert_eq!(f("function g(x: number | undefined) { return x + 0; }").1, 0);
+        // Bare unbound identifier → NOT folded.
+        assert_eq!(f("var y = z + 0;").1, 0);
     }
 
     #[test]
