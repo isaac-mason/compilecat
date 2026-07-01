@@ -44,6 +44,9 @@ use oxc_span::SPAN;
 
 use super::util::is_side_effect_free;
 
+use crate::analysis::cfg::{self, ControlFlowGraph};
+use crate::analysis::data_flow::{analyze, DataFlow, Direction};
+use crate::analysis::graph::NodeId as CfgNodeId;
 use crate::analysis::type_shape::{
     build_type_map, reconstruct, resolve_ast, shape_of, NameSrc, ResolvedType, Shape,
 };
@@ -884,6 +887,15 @@ impl<'a> Sroa<'a> {
                 if owner_has_scalar_name(func, &name, &shape) {
                     continue;
                 }
+                // Escape + killed-on-entry gates run HERE (analysis phase, `&Function`
+                // available for the CFG). The AST is unmutated between here and the
+                // rewrite, so `process_owner` trusts these.
+                let Some(fb) = func.body.as_ref() else { continue };
+                if !escape_ok(&fb.statements, &name, &shape)
+                    || !killed_on_entry(fb, &name, &shape)
+                {
+                    continue;
+                }
                 out.push(ModuleScratchCand {
                     name,
                     module_const: id.name.to_string(),
@@ -1197,20 +1209,10 @@ impl<'a> ScratchMutator<'a, '_> {
         body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
         cands: &[ModuleScratchCand],
     ) {
-        // Gate placement: single-owner / recursion / alias / shape / scope-conflict
-        // gates ran at analysis time in `find_module_scratch` (they need the semantic
-        // model). `escape_ok` + `killed_on_entry` run HERE because they need the live
-        // post-inline body — all uses are member load/stores (escape) AND killed-on-
-        // entry (every read preceded by a write). Both are checked before any rewrite.
-        let passing: Vec<&ModuleScratchCand> = cands
-            .iter()
-            .filter(|c| {
-                escape_ok(body, &c.name, &c.shape) && killed_on_entry(body, &c.name, &c.shape)
-            })
-            .collect();
-        if passing.is_empty() {
-            return;
-        }
+        // All gates (single-owner / recursion / alias / shape / scope-conflict / escape
+        // / killed-on-entry) ran at analysis time in `find_module_scratch` on the same
+        // (unmutated) AST, so every candidate here is already validated — just rewrite.
+        let passing: Vec<&ModuleScratchCand> = cands.iter().collect();
         // Rewrite `name[i]`/`name.f` → `name_i` for every passing scratch (`name` is
         // the alias for the aliased form, else the scratch itself).
         let shapes: HashMap<String, Shape> =
@@ -1275,89 +1277,255 @@ fn remove_alias_decl<'a>(body: &mut oxc_allocator::Vec<'a, Statement<'a>>, alias
     });
 }
 
-/// v1 straight-line killed-on-entry: over `body`'s TOP-LEVEL statements (post-inline
-/// these scratch chains are flat), every field READ of `name` must be preceded by a
-/// WRITE of that field. Bails (returns false) on anything not provably straight-line
-/// safe: a read before its write, `name` under any control flow / nested block, a
-/// compound assign to `name`, a nested write, or an unknown suffix. Assumes
-/// `escape_ok` already proved all uses are member accesses.
-fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
-    // Confinement (v2): if the scratch is used ONLY inside one nested control-flow
-    // block at this level, recurse into it — its live range is confined and per-ENTRY
-    // scalars are safe (each loop iteration / branch entry writes-before-reads, which
-    // the recursion re-checks with a fresh `written` set). Recovers the canonical
-    // "process N particles/vertices" per-iteration scratch, the biggest over-bail.
-    let mentioning: Vec<usize> = body
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| stmt_mentions_name(s, name))
-        .map(|(i, _)| i)
-        .collect();
-    if let [only] = mentioning.as_slice() {
-        if let Some(inner) = confining_block(&body[*only], name) {
-            return killed_on_entry(inner, name, shape);
+// ── killed-on-entry as must-reaching-definitions over the owner's CFG ─────────
+// The soundness proof — every READ of field `i` is preceded by a WRITE of field `i`
+// on ALL paths — IS must-reaching-defs. Rather than hand-roll each control-flow
+// shape (straight-line, loop, branch, switch), express it once on the shared CFG +
+// dataflow tier (`analysis::cfg`/`data_flow`). This handles straight-line, loops,
+// both-if-branches, and switch UNIFORMLY; `try`/generator/async make `cfg::build`
+// return None, which we treat as a (sound) bail. `escape_ok` (run first) has already
+// proved every use of `name` is a member access.
+
+/// Per-CFG-node scratch effect. `None` from `node_fx` = an unhandleable use → bail.
+#[derive(Default, Clone, Copy)]
+struct NodeFx {
+    /// Fields UNCONDITIONALLY written at this node (a clean `name[i] = RHS`), bitmask.
+    writes: u32,
+    /// Fields READ at this node that must already be must-written, bitmask.
+    reads: u32,
+    /// This node evaluates a non-side-effect-free call/new (re-entrancy candidate).
+    reentrant: bool,
+}
+
+/// Bit for field `suffix` under `shape` (tuple index / object field position).
+fn field_bit(suffix: &str, shape: &Shape) -> Option<u32> {
+    let idx = match shape {
+        Shape::Tuple(n) => {
+            let i: usize = suffix.parse().ok()?;
+            if i >= *n {
+                return None;
+            }
+            i
+        }
+        Shape::Object(fields) => fields.iter().position(|f| f == suffix)?,
+    };
+    (idx < 32).then(|| 1u32 << idx)
+}
+
+fn full_mask(shape: &Shape) -> u32 {
+    let n = match shape {
+        Shape::Tuple(n) => *n,
+        Shape::Object(f) => f.len(),
+    };
+    if n >= 32 { u32::MAX } else { (1u32 << n) - 1 }
+}
+
+fn reads_mask(e: &Expression, name: &str, shape: &Shape) -> Option<u32> {
+    let mut m = 0u32;
+    for r in collect_reads(e, name, shape)? {
+        m |= field_bit(&r, shape)?;
+    }
+    Some(m)
+}
+
+/// Classify one expression: a clean `name[i] = RHS` contributes write `i` + RHS
+/// reads; anything else contributes its scratch reads (and `collect_reads` bails to
+/// None on a scratch write-target it can't model — compound/nested write).
+fn classify_expr(e: &Expression, name: &str, shape: &Shape, fx: &mut NodeFx) -> Option<()> {
+    if let Expression::AssignmentExpression(a) = e {
+        if a.operator == AssignmentOperator::Assign {
+            if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
+                fx.writes |= field_bit(&suffix, shape)?;
+                fx.reads |= reads_mask(&a.right, name, shape)?;
+                return Some(());
+            }
+        }
+    }
+    fx.reads |= reads_mask(e, name, shape)?;
+    Some(())
+}
+
+/// The scratch effect of ONE CFG node. Mirrors `reaching::MustWalk`'s per-kind
+/// dispatch: each node contributes only its DIRECT expression (a compound
+/// statement's branches/body are their own CFG nodes), so reads are attributed to
+/// the right node — the property confinement needs. `None` on any use the model
+/// can't represent (bails the whole scratch).
+fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
+    let mut fx = NodeFx::default();
+    let mut read = |e: &Expression, fx: &mut NodeFx| -> Option<()> {
+        fx.reentrant |= expr_has_reentrant_call(e);
+        fx.reads |= reads_mask(e, name, shape)?;
+        Some(())
+    };
+    match kind {
+        AstKind::ExpressionStatement(s) => {
+            fx.reentrant |= expr_has_reentrant_call(&s.expression);
+            classify_expr(&s.expression, name, shape, &mut fx)?;
+        }
+        AstKind::VariableDeclaration(vd) => {
+            for d in &vd.declarations {
+                if let Some(init) = &d.init {
+                    read(init, &mut fx)?;
+                }
+            }
+        }
+        AstKind::ReturnStatement(s) => {
+            if let Some(a) = &s.argument {
+                read(a, &mut fx)?;
+            }
+        }
+        AstKind::ThrowStatement(s) => read(&s.argument, &mut fx)?,
+        AstKind::IfStatement(s) => read(&s.test, &mut fx)?,
+        AstKind::WhileStatement(s) => read(&s.test, &mut fx)?,
+        AstKind::DoWhileStatement(s) => read(&s.test, &mut fx)?,
+        AstKind::ForStatement(s) => {
+            if let Some(t) = &s.test {
+                read(t, &mut fx)?;
+            }
+        }
+        AstKind::ForInStatement(s) => read(&s.right, &mut fx)?,
+        AstKind::ForOfStatement(s) => read(&s.right, &mut fx)?,
+        AstKind::SwitchStatement(s) => read(&s.discriminant, &mut fx)?,
+        AstKind::SwitchCase(c) => {
+            if let Some(t) = &c.test {
+                read(t, &mut fx)?;
+            }
+        }
+        // A standalone assignment CFG node (e.g. a for-init/update): model a clean
+        // write; a compound assign to the scratch can't be modelled → bail.
+        AstKind::AssignmentExpression(a) => {
+            fx.reentrant |= expr_has_reentrant_call(&a.right);
+            if a.operator == AssignmentOperator::Assign {
+                if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
+                    fx.writes |= field_bit(&suffix, shape)?;
+                }
+                fx.reads |= reads_mask(&a.right, name, shape)?;
+            } else if assign_target_suffix(&a.left, name, shape).is_some() {
+                return None; // compound assign to the scratch
+            } else {
+                fx.reads |= reads_mask(&a.right, name, shape)?;
+            }
+        }
+        // Other node kinds (Block/Break/Continue/Empty/label/…) carry no direct
+        // scratch expression — their statements are separate CFG nodes.
+        _ => {}
+    }
+    Some(fx)
+}
+
+/// True if `e` contains a non-side-effect-free call/new (re-entrancy candidate).
+fn expr_has_reentrant_call(e: &Expression) -> bool {
+    let mut v = ReentrantCallFinder { found: false };
+    v.visit_expression(e);
+    v.found
+}
+
+/// The must-write dataflow: lattice = bitmask of fields written on ALL paths so far.
+struct ScratchKill<'x> {
+    fx: &'x [NodeFx],
+    full: u32,
+}
+
+impl DataFlow for ScratchKill<'_> {
+    type Lattice = u32;
+    fn direction(&self) -> Direction {
+        Direction::Forward
+    }
+    fn flow_through(&self, node: CfgNodeId, _cfg: &ControlFlowGraph, input: &u32) -> u32 {
+        input | self.fx[node].writes
+    }
+    fn join(&self, a: &u32, b: &u32) -> u32 {
+        a & b // must = written on all incoming paths
+    }
+    fn equals(&self, a: &u32, b: &u32) -> bool {
+        a == b
+    }
+    fn bottom(&self) -> u32 {
+        self.full // TOP for an intersection lattice (narrows toward the real must-set)
+    }
+    fn entry(&self) -> u32 {
+        0 // nothing written at function entry
+    }
+}
+
+/// CFG-based killed-on-entry: build the owner's CFG, prove every field read is
+/// must-reached by a same-field write, and reject re-entrant clobbering.
+fn killed_on_entry(func_body: &FunctionBody, name: &str, shape: &Shape) -> bool {
+    let Some(cfg) = cfg::build(AstKind::FunctionBody(func_body)) else {
+        return false; // try / generator / async — sound bail
+    };
+    let n = cfg.node_count();
+    let full = full_mask(shape);
+
+    // Per-node effects (write/read/reentrant). Any unmodellable use → bail.
+    let mut fx = Vec::with_capacity(n);
+    for id in 0..n {
+        let f = match cfg.node(id) {
+            Some(k) => node_fx(k, name, shape),
+            None => Some(NodeFx::default()),
+        };
+        match f {
+            Some(f) => fx.push(f),
+            None => return false,
         }
     }
 
-    // The scratch is LIVE from its first write to its last use (read or write). A
-    // re-entrant call outside that window can't affect an observed value, so the
-    // guard only fires inside it (v2: lets trailing non-inlined calls like
-    // `updateAABB()` after the last scratch use through).
-    let last_use = body.iter().rposition(|s| stmt_mentions_name(s, name));
-    let mut written: HashSet<String> = HashSet::new();
-    for (i, stmt) in body.iter().enumerate() {
-        // Re-entrancy guard: once the scratch holds live values (some field written)
-        // AND we're still within its live window, an IMPURE call could transitively
-        // re-enter the owner and clobber the shared buffer — which the per-call
-        // scalars would NOT reproduce. So bail on any non-side-effect-free call/new.
-        // `fn_references_self` covers direct recursion; this covers mutual/indirect.
-        // Pure builtins (`Math.*`) can't re-enter, so they don't trip it.
-        //
-        // KNOWN ACCEPTED LIMITATION: an EFFECTFUL getter / `valueOf` / `Proxy` trap
-        // fired by a member read or coercion (NOT a call/new node) between a field's
-        // write and its read could also re-enter and clobber the buffer, and is NOT
-        // guarded here. compilecat assumes member reads are side-effect-free
-        // (`assumeGettersArePure`, matching Closure) — and the target out-param pattern
-        // itself reads external object members between scratch writes, so guarding it
-        // would disable the optimization on its own use case. Same accepted unsoundness
-        // the rest of the optimizer runs under.
-        if !written.is_empty()
-            && last_use.is_some_and(|l| i <= l)
-            && stmt_has_reentrant_call(stmt)
+    let Ok(states) = analyze(&cfg, &ScratchKill { fx: &fx, full }) else {
+        return false; // divergence guard — shouldn't happen (finite lattice)
+    };
+
+    // (1) Every field read must be must-written on entry to its node.
+    for id in 0..n {
+        if fx[id].reads & !states[id].in_ != 0 {
+            return false;
+        }
+    }
+
+    // (2) Re-entrancy: an impure call reachable FROM a scratch write AND reaching a
+    // scratch read is on a live-window path where a re-entrant clobber would diverge
+    // from the per-call scalars. Bail (sound; may-may over-approximation — leading
+    // calls before any write and trailing calls after all reads still pass).
+    let writes: Vec<bool> = fx.iter().map(|f| f.writes != 0).collect();
+    let reads: Vec<bool> = fx.iter().map(|f| f.reads != 0).collect();
+    for id in 0..n {
+        if fx[id].reentrant
+            && reachable_from_any(&cfg, id, &writes, false)
+            && reachable_from_any(&cfg, id, &reads, true)
         {
             return false;
         }
-        // Simple write `name[i] = RHS` (only field-writes take this form).
-        if let Statement::ExpressionStatement(es) = stmt {
-            if let Expression::AssignmentExpression(a) = &es.expression {
-                if a.operator == AssignmentOperator::Assign {
-                    if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
-                        // All `name` reads in the RHS must already be covered.
-                        match collect_reads(&a.right, name, shape) {
-                            Some(reads) => {
-                                if reads.iter().any(|r| !written.contains(r)) {
-                                    return false;
-                                }
-                            }
-                            None => return false, // nonmember / nested write in RHS
-                        }
-                        written.insert(suffix);
-                        continue;
-                    }
-                }
-            }
-        }
-        // Otherwise: `name` may appear only in read positions, all covered.
-        match collect_reads_stmt(stmt, name, shape) {
-            Some(reads) => {
-                if reads.iter().any(|r| !written.contains(r)) {
-                    return false;
-                }
-            }
-            None => return false, // escape / write / control-flow use of `name`
-        }
     }
     true
+}
+
+/// True if, searching `forward` (successors) or backward (predecessors) from
+/// `start`, any node with `flag[node]` is reachable (inclusive of `start` itself).
+fn reachable_from_any(cfg: &ControlFlowGraph, start: CfgNodeId, flag: &[bool], forward: bool) -> bool {
+    let n = cfg.node_count();
+    let mut seen = vec![false; n];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(cur) = stack.pop() {
+        if flag[cur] {
+            return true;
+        }
+        if forward {
+            for (d, _) in cfg.successors(cur) {
+                if !seen[d] {
+                    seen[d] = true;
+                    stack.push(d);
+                }
+            }
+        } else {
+            for (s, _) in cfg.predecessors(cur) {
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+    }
+    false
 }
 
 /// SYMBOL GATE. True if some identifier named `name` in `func` does NOT resolve to
@@ -1453,93 +1621,6 @@ impl<'a> Visit<'a> for ScalarNameChecker<'_> {
     }
 }
 
-/// The inner statement list of a single control-flow block that FULLY confines every
-/// use of `name` (nothing in the loop header / if-test / update / else branch), else
-/// `None`. The count-equality check is what makes it sound: if any `name` reference
-/// sits outside the returned block, the recursion would miss a use the (whole-body)
-/// rewriter still rewrites.
-fn confining_block<'a>(stmt: &'a Statement<'a>, name: &str) -> Option<&'a [Statement<'a>]> {
-    let inner: &[Statement] = match stmt {
-        Statement::BlockStatement(b) => &b.body,
-        Statement::ForStatement(s) => as_stmts(&s.body),
-        Statement::WhileStatement(s) => as_stmts(&s.body),
-        Statement::DoWhileStatement(s) => as_stmts(&s.body),
-        Statement::ForInStatement(s) => as_stmts(&s.body),
-        Statement::ForOfStatement(s) => as_stmts(&s.body),
-        Statement::LabeledStatement(s) => as_stmts(&s.body),
-        // If: only when the scratch is confined to the consequent (the count check
-        // below bails when the test or the else-branch also mentions it).
-        Statement::IfStatement(s) => as_stmts(&s.consequent),
-        _ => return None,
-    };
-    (count_name(inner, name) == count_name_stmt(stmt, name)).then_some(inner)
-}
-
-/// A statement's body as a slice — the block's statements, or the single statement.
-fn as_stmts<'a>(s: &'a Statement<'a>) -> &'a [Statement<'a>] {
-    match s {
-        Statement::BlockStatement(b) => &b.body,
-        other => std::slice::from_ref(other),
-    }
-}
-
-fn count_name(stmts: &[Statement], name: &str) -> usize {
-    let mut c = NameCounter { name, count: 0 };
-    for s in stmts {
-        c.visit_statement(s);
-    }
-    c.count
-}
-
-fn count_name_stmt(stmt: &Statement, name: &str) -> usize {
-    let mut c = NameCounter { name, count: 0 };
-    c.visit_statement(stmt);
-    c.count
-}
-
-struct NameCounter<'s> {
-    name: &'s str,
-    count: usize,
-}
-
-impl<'a> Visit<'a> for NameCounter<'_> {
-    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if id.name == self.name {
-            self.count += 1;
-        }
-    }
-}
-
-/// True if `stmt` references `name` at all (any read or write of a field — after
-/// `escape_ok`, every use of `name` is a member access). Used to bound the scratch's
-/// live window for the re-entrancy guard.
-fn stmt_mentions_name(stmt: &Statement, name: &str) -> bool {
-    let mut v = NameMention { name, found: false };
-    v.visit_statement(stmt);
-    v.found
-}
-
-struct NameMention<'s> {
-    name: &'s str,
-    found: bool,
-}
-
-impl<'a> Visit<'a> for NameMention<'_> {
-    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
-        if id.name == self.name {
-            self.found = true;
-        }
-    }
-}
-
-/// True if `stmt` contains a call/new that is not provably side-effect-free —
-/// i.e. one that could transitively re-enter the scratch's owner.
-fn stmt_has_reentrant_call(stmt: &Statement) -> bool {
-    let mut v = ReentrantCallFinder { found: false };
-    v.visit_statement(stmt);
-    v.found
-}
-
 struct ReentrantCallFinder {
     found: bool,
 }
@@ -1581,12 +1662,6 @@ fn assign_target_suffix(t: &AssignmentTarget, name: &str, shape: &Shape) -> Opti
 fn collect_reads(e: &Expression, name: &str, shape: &Shape) -> Option<Vec<String>> {
     let mut c = ReadCollector { name, shape, reads: Vec::new(), bad: false };
     c.visit_expression(e);
-    (!c.bad).then_some(c.reads)
-}
-
-fn collect_reads_stmt(stmt: &Statement, name: &str, shape: &Shape) -> Option<Vec<String>> {
-    let mut c = ReadCollector { name, shape, reads: Vec::new(), bad: false };
-    c.visit_statement(stmt);
     (!c.bad).then_some(c.reads)
 }
 
@@ -2414,15 +2489,54 @@ mod tests {
     }
 
     #[test]
-    fn module_scratch_both_if_branches_bailed() {
-        // Written in both arms, read after → needs dominator analysis (v3). The
-        // count-equality check bails because the scratch is in the else branch too.
+    fn module_scratch_both_if_branches_scalarized() {
+        // v3 (CFG must-reaching): both arms write ALL fields, so at the merge every
+        // read field is must-written on all paths → scalarizes. (Was a v2 over-bail.)
         let out = inline_then_sroa(&format!(
             "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
              /* @optimize */ export function f(out, a, b, n) {{ \
              if (n>0) {{ set3(_s,a,b,a); }} else {{ set3(_s,b,a,b); }} out[0]=_s[0]+_s[1]+_s[2]; return out; }}"
         ));
-        assert!(out.contains("const _s"), "module const preserved (both branches):\n{out}");
+        assert!(out.contains("_s_0"), "both-branches scratch scalarized:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_switch_dispatch_scalarized() {
+        // v3 (CFG): a switch where every case writes all read fields (the crashcat
+        // `getSupport` shape) scalarizes — the CFG models switch uniformly.
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, k) {{ \
+             switch (k) {{ case 0: {{ set3(_s,a,b,a); break; }} case 1: {{ set3(_s,b,a,b); break; }} \
+             default: {{ set3(_s,a,a,a); }} }} out[0]=_s[0]+_s[1]+_s[2]; return out; }}"
+        ));
+        assert!(out.contains("_s_0"), "switch scratch scalarized:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_try_body_bailed() {
+        // `cfg::build` bails on `try` (exceptional control flow) → killed_on_entry
+        // returns false → not scalarized. Sound.
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b) {{ \
+             try {{ set3(_s,a,b,a); out[0]=_s[0]+_s[1]+_s[2]; }} catch (e) {{}} return out; }}"
+        ));
+        assert!(out.contains("const _s"), "module const preserved (try):\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_partial_branch_write_bailed() {
+        // One arm writes only SOME of the fields read after → NOT must-written on all
+        // paths → must bail (soundness of the CFG merge).
+        let out = inline_then_sroa(&format!(
+            "{SET3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(out, a, b, n) {{ \
+             if (n>0) {{ set3(_s,a,b,a); }} else {{ _s[0]=b; }} out[0]=_s[0]+_s[1]+_s[2]; return out; }}"
+        ));
+        assert!(out.contains("const _s"), "module const preserved (partial branch):\n{out}");
         assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
     }
 

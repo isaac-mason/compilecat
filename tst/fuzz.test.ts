@@ -581,6 +581,9 @@ class ScratchGen {
             'loopBody',
             'loopReadBeforeWrite',
             'aliasClosure',
+            'bothBranches',
+            'switchWrite',
+            'partialBranch',
         ]);
         const body: string[] = [];
         // Occasional leading effect (before any write) — preserved through
@@ -653,6 +656,23 @@ class ScratchGen {
             // invoked) exposes a wrong per-call scalarization.
             body.push(...writesA, `  return () => ${readAllA};`);
             call = '(() => { const c1 = entry(7, 3); const c2 = entry(2, 5); return [c1(), c2()]; })()';
+        } else if (mode === 'bothBranches') {
+            // v3 CFG: both arms write all fields → must-written at merge → scalarizes.
+            const w1 = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            const w2 = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            body.push(`  if (p > q) { ${w1} } else { ${w2} }`, `  return ${readAll};`);
+        } else if (mode === 'switchWrite') {
+            // v3 CFG: a switch where every case writes all fields (getSupport shape).
+            const w = () => idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            body.push(
+                `  switch (p % 3) { case 0: { ${w()} break; } case 1: { ${w()} break; } default: { ${w()} } }`,
+                `  return ${readAll};`,
+            );
+        } else if (mode === 'partialBranch') {
+            // One arm writes only field 0 → the read of the rest is NOT must-written on
+            // that path → must bail (a wrong scalarization diverges).
+            const w = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            body.push(`  if (p > q) { ${w} } else { ${s}[0] = ${this.e()}; }`, `  return ${readAll};`);
         } else if (mode === 'blockShadow') {
             // A block-scoped rebind of the scratch name (distinct variable). Must NOT
             // be hijacked by the name-based rewriter. Values differ so a hijack diverges.
