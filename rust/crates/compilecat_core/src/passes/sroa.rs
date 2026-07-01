@@ -1382,9 +1382,28 @@ fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
             if let Some(t) = &s.test {
                 read(t, &mut fx)?;
             }
+            // A scratch use in the for-INIT or -UPDATE becomes its OWN bare-expression
+            // CFG node (a Sequence/Update/Call/…), which `node_fx` can't attribute a
+            // read to — so bail here (the whole scratch). Adversarial review found a
+            // for-update `(out[0]=_s[0], i++)` reading the scratch invisibly otherwise.
+            if s.init.as_ref().is_some_and(|i| for_init_mentions(i, name))
+                || s.update.as_ref().is_some_and(|u| expr_mentions(u, name))
+            {
+                return None;
+            }
         }
-        AstKind::ForInStatement(s) => read(&s.right, &mut fx)?,
-        AstKind::ForOfStatement(s) => read(&s.right, &mut fx)?,
+        AstKind::ForInStatement(s) => {
+            read(&s.right, &mut fx)?;
+            if for_left_mentions(&s.left, name) {
+                return None;
+            }
+        }
+        AstKind::ForOfStatement(s) => {
+            read(&s.right, &mut fx)?;
+            if for_left_mentions(&s.left, name) {
+                return None;
+            }
+        }
         AstKind::SwitchStatement(s) => read(&s.discriminant, &mut fx)?,
         AstKind::SwitchCase(c) => {
             if let Some(t) = &c.test {
@@ -1406,11 +1425,59 @@ fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
                 fx.reads |= reads_mask(&a.right, name, shape)?;
             }
         }
-        // Other node kinds (Block/Break/Continue/Empty/label/…) carry no direct
-        // scratch expression — their statements are separate CFG nodes.
+        // Bare-expression CFG nodes (for-headers, or any other position they occupy):
+        // if one touches the scratch we can't attribute a read to a modelled slot, so
+        // bail. Belt-and-braces alongside the for-header check above.
+        AstKind::SequenceExpression(_)
+        | AstKind::UpdateExpression(_)
+        | AstKind::CallExpression(_) => {
+            if bare_expr_mentions(kind, name) {
+                return None;
+            }
+        }
+        // Other node kinds (Block/Break/Continue/Empty/label/FunctionBody/…) carry no
+        // direct scratch expression — their statements are separate CFG nodes.
         _ => {}
     }
     Some(fx)
+}
+
+/// Whether `name` appears as an identifier reference anywhere in the node.
+struct NameFinder<'s> {
+    name: &'s str,
+    found: bool,
+}
+impl<'a> Visit<'a> for NameFinder<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name {
+            self.found = true;
+        }
+    }
+}
+fn expr_mentions(e: &Expression, name: &str) -> bool {
+    let mut f = NameFinder { name, found: false };
+    f.visit_expression(e);
+    f.found
+}
+fn for_init_mentions(init: &ForStatementInit, name: &str) -> bool {
+    let mut f = NameFinder { name, found: false };
+    walk::walk_for_statement_init(&mut f, init);
+    f.found
+}
+fn for_left_mentions(left: &ForStatementLeft, name: &str) -> bool {
+    let mut f = NameFinder { name, found: false };
+    walk::walk_for_statement_left(&mut f, left);
+    f.found
+}
+fn bare_expr_mentions(kind: AstKind, name: &str) -> bool {
+    let mut f = NameFinder { name, found: false };
+    match kind {
+        AstKind::SequenceExpression(s) => f.visit_sequence_expression(s),
+        AstKind::UpdateExpression(u) => f.visit_update_expression(u),
+        AstKind::CallExpression(c) => f.visit_call_expression(c),
+        _ => {}
+    }
+    f.found
 }
 
 /// True if `e` contains a non-side-effect-free call/new (re-entrancy candidate).
@@ -2513,6 +2580,23 @@ mod tests {
         ));
         assert!(out.contains("_s_0"), "switch scratch scalarized:\n{out}");
         assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_for_header_use_bailed() {
+        // Adversarial review (CFG): a scratch read/write hidden in a for-init/-update
+        // becomes an unattributable bare-expression CFG node → bail. Read variant
+        // (returns 7 in source, undefined if wrongly scalarized) and write variant.
+        let read = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [7,0,0];\n\
+             /* @optimize */ export function f(out) { for (let i=0;i<1;(out[0]=_s[0], i++)) {} }",
+        );
+        assert!(read.contains("const _s"), "for-update read bailed:\n{read}");
+        let write = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function f(out) { for (let i=0;i<3;_s[0]=i,i++) {} out[0]=_s[0]; }",
+        );
+        assert!(write.contains("const _s"), "for-update write bailed:\n{write}");
     }
 
     #[test]
