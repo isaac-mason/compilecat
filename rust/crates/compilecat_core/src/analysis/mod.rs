@@ -24,6 +24,8 @@ pub mod live_vars;
 #[allow(dead_code)]
 pub mod local_var_table;
 #[allow(dead_code)]
+pub mod purity;
+#[allow(dead_code)]
 pub mod reaching;
 #[allow(dead_code)]
 pub(crate) mod tri;
