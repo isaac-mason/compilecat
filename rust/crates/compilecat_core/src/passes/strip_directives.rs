@@ -20,7 +20,11 @@ use oxc_ast::ast::Program;
 use oxc_ast::AstBuilder;
 use oxc_span::Span;
 
-use super::directives::DIRECTIVES;
+/// Authored markers to strip from output: the optimization directives PLUS the
+/// purity assertion `@pure`. (`@pure` is stripped but NOT in `DIRECTIVES` — it
+/// doesn't gate optimization; and `"@__PURE__".contains("@pure")` is false, so the
+/// emitted `/*@__PURE__*/` propagation markers are left intact.)
+const STRIP: [&str; 6] = ["@inline", "@flatten", "@sroa", "@unroll", "@optimize", "@pure"];
 
 /// Returns the number of comments removed or rewritten.
 pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
@@ -35,7 +39,7 @@ pub fn run<'a>(allocator: &'a Allocator, program: &mut Program<'a>) -> u32 {
 
     for mut c in taken {
         let text = &src[c.span.start as usize..c.span.end as usize];
-        if !DIRECTIVES.iter().any(|d| text.contains(d)) {
+        if !STRIP.iter().any(|d| text.contains(d)) {
             kept.push(c);
             continue;
         }
@@ -78,13 +82,13 @@ fn clean_comment(full: &str) -> Option<String> {
 
     let mut out_lines: Vec<String> = Vec::new();
     for line in inner.split('\n') {
-        let had_directive = DIRECTIVES.iter().any(|d| line.contains(d));
+        let had_directive = STRIP.iter().any(|d| line.contains(d));
         if !had_directive {
             out_lines.push(line.to_string());
             continue;
         }
         let mut l = line.to_string();
-        for d in DIRECTIVES {
+        for d in STRIP {
             l = l.replace(d, "");
         }
         // If the directive line is now only whitespace / `*` filler, drop it.

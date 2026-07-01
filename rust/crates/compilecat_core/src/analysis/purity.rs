@@ -149,13 +149,61 @@ pub fn pure_function_names(program: &Program) -> HashSet<String> {
     summaries.into_iter().filter(|(_, s)| s.effects.is_pure()).map(|(k, _)| k).collect()
 }
 
+/// Names of top-level functions/const-fns the developer ASSERTED pure via a
+/// `/* @pure */` directive (ported from the old Babel compiler's `@pure`). The
+/// override for what the analysis can't prove — a fn calling an imported/dynamic
+/// callee it treats as impure, but the author knows is side-effect-free.
+pub fn pure_annotated_names(program: &Program) -> HashSet<String> {
+    let spans = crate::passes::directives::annotated_spans_with_exports(program, &["@pure"]);
+    let mut names = HashSet::new();
+    if spans.is_empty() {
+        return names;
+    }
+    let mut consider = |name: &str, span_start: u32| {
+        if spans.contains(&span_start) {
+            names.insert(name.to_string());
+        }
+    };
+    for stmt in &program.body {
+        let decl = match stmt {
+            Statement::ExportNamedDeclaration(e) => e.declaration.as_ref(),
+            _ => stmt.as_declaration(),
+        };
+        match decl {
+            Some(Declaration::FunctionDeclaration(f)) => {
+                if let Some(id) = &f.id {
+                    consider(id.name.as_str(), f.span.start);
+                }
+            }
+            Some(Declaration::VariableDeclaration(vd)) => {
+                for d in &vd.declarations {
+                    if let (BindingPattern::BindingIdentifier(id), Some(init)) = (&d.id, &d.init) {
+                        if matches!(
+                            init,
+                            Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
+                        ) {
+                            consider(id.name.as_str(), vd.span.start);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 /// Stamp `CallExpression.pure = true` on every call whose plain-identifier callee
 /// is a proven-pure function (Closure's `markPureFunctionCalls`, restricted to the
 /// identifier-callee case). `is_side_effect_free` already honors `c.pure`, so this
 /// is the single point that feeds the whole drop/reorder/substitute machinery — and
 /// codegen emits `/*@__PURE__*/` for downstream. Returns the number stamped.
 pub fn stamp_pure_calls(program: &mut Program) -> u32 {
-    let pure = pure_function_names(program);
+    let mut pure = pure_function_names(program);
+    // Union the developer-asserted `@pure` names — the override for the
+    // un-analyzable tail (a fn calling an import / dynamic dispatch the analysis
+    // conservatively treats as impure, but the author knows is side-effect-free).
+    pure.extend(pure_annotated_names(program));
     if pure.is_empty() {
         return 0;
     }
@@ -578,6 +626,20 @@ mod tests {
         let p = pure_set("function f(x) { return ext(x); }");
         assert!(!p.contains("f"), "{p:?}");
     }
+    #[test]
+    fn pure_annotation_detected() {
+        let allocator = Allocator::default();
+        let program = crate::parse_program(
+            &allocator,
+            "/* @pure */ function f(x) { return ext(x); }\nfunction g(x) { return x; }\n/* @pure */ const h = (x) => ext(x);",
+            SourceType::ts(),
+        );
+        let ann = pure_annotated_names(&program);
+        assert!(ann.contains("f"), "{ann:?}");
+        assert!(ann.contains("h"), "{ann:?}");
+        assert!(!ann.contains("g"), "{ann:?}");
+    }
+
     #[test]
     fn fixpoint_mutual_recursion_pure() {
         let p = pure_set(
