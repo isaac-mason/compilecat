@@ -791,6 +791,16 @@ impl<'a> Sroa<'a> {
     /// non-recursive function. Uses `oxc_semantic` for sound single-owner + escape
     /// resolution (symbol identity, not names — handles shadowing).
     fn find_module_scratch(&self, program: &Program<'a>) -> Vec<ModuleScratchCand> {
+        // Early-out: skip the whole-module `SemanticBuilder` build unless at least one
+        // top-level `const _x = <aggregate>` even exists (the common case is none).
+        let has_candidate = program.body.iter().any(|s| {
+            let Statement::VariableDeclaration(vd) = s else { return false };
+            vd.kind == VariableDeclarationKind::Const
+                && vd.declarations.iter().any(|d| self.module_scratch_shape(d).is_some())
+        });
+        if !has_candidate {
+            return Vec::new();
+        }
         let semantic = SemanticBuilder::new().build(program).semantic;
         let nodes = semantic.nodes();
         let scoping = semantic.scoping();
@@ -937,6 +947,14 @@ fn object_literal_fields<'a>(
         }
         let PropertyKey::StaticIdentifier(key) = &p.key else { return None }; // string/numeric/computed
         let fname = key.name.to_string();
+        // `{ __proto__: v }` (colon form) is the prototype-initializer syntax — it
+        // sets the prototype and creates NO own property, and `obj.__proto__` reads
+        // go through `Object.prototype`. Scalarizing those would change behavior, so
+        // bail. (Shorthand `{ __proto__ }` IS a real own property, but this field
+        // name is unrealistic enough that a blanket bail is the safe simple choice.)
+        if fname == "__proto__" {
+            return None;
+        }
         if fields.contains(&fname) {
             return None; // duplicate key
         }
@@ -1121,9 +1139,11 @@ impl<'a> ScratchMutator<'a, '_> {
         body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
         cands: &[ModuleScratchCand],
     ) {
-        // Gate each candidate on the CURRENT body: all uses are member load/stores
-        // (escape) AND killed-on-entry (every read preceded by a write). Both are
-        // checked before any rewrite.
+        // Gate placement: single-owner / recursion / alias / shape / scope-conflict
+        // gates ran at analysis time in `find_module_scratch` (they need the semantic
+        // model). `escape_ok` + `killed_on_entry` run HERE because they need the live
+        // post-inline body — all uses are member load/stores (escape) AND killed-on-
+        // entry (every read preceded by a write). Both are checked before any rewrite.
         let passing: Vec<&ModuleScratchCand> = cands
             .iter()
             .filter(|c| {
@@ -1217,6 +1237,15 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
         // scalars would NOT reproduce. So bail on any non-side-effect-free call/new.
         // `fn_references_self` covers direct recursion; this covers mutual/indirect.
         // Pure builtins (`Math.*`) can't re-enter, so they don't trip it.
+        //
+        // KNOWN ACCEPTED LIMITATION: an EFFECTFUL getter / `valueOf` / `Proxy` trap
+        // fired by a member read or coercion (NOT a call/new node) between a field's
+        // write and its read could also re-enter and clobber the buffer, and is NOT
+        // guarded here. compilecat assumes member reads are side-effect-free
+        // (`assumeGettersArePure`, matching Closure) — and the target out-param pattern
+        // itself reads external object members between scratch writes, so guarding it
+        // would disable the optimization on its own use case. Same accepted unsoundness
+        // the rest of the optimizer runs under.
         if !written.is_empty()
             && last_use.is_some_and(|l| i <= l)
             && stmt_has_reentrant_call(stmt)
@@ -1268,14 +1297,8 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
 ///       reference) in the owner — emitting `let {name}_{suffix}` would merge two
 ///       distinct variables (wrong value, or a `const`-reassignment crash).
 ///
-/// KNOWN ACCEPTED LIMITATION (not guarded here): an EFFECTFUL getter / `valueOf` /
-/// `Proxy` trap fired by a member read or coercion between a field's write and its
-/// read could re-enter the owner and clobber the shared buffer, which the per-call
-/// scalars wouldn't reproduce. compilecat assumes member reads are side-effect-free
-/// (`assumeGettersArePure`, matching Closure) — and the target out-param pattern
-/// itself reads external object members between scratch writes, so guarding this
-/// would disable the optimization on its own use case. Same accepted unsoundness the
-/// rest of the optimizer runs under.
+/// (The effectful-getter re-entrancy caveat lives on `killed_on_entry`, where the
+/// re-entrancy machinery is.)
 fn owner_scope_conflicts(func: &Function, name: &str, shape: &Shape, allowed_bindings: u32) -> bool {
     let scalars: HashSet<String> = shape.suffixes().iter().map(|s| format!("{name}_{s}")).collect();
     let mut c =
@@ -2189,6 +2212,20 @@ mod tests {
         ));
         assert!(out.contains("_s_0"), "scalarized despite trailing call:\n{out}");
         assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn object_scratch_proto_field_bailed() {
+        // `{ __proto__: v }` (colon form) sets the prototype, creates NO own property;
+        // scalarizing `_s.__proto__` would diverge. Bail (shared SROA helper).
+        // Adversarial completeness review.
+        let out = sroa(
+            "const _s = /*@__PURE__*/ { __proto__: 0, x: 0 };\n\
+             /* @optimize */ export function f(p, q) { _s.__proto__ = p; _s.x = q; return _s.x; }",
+        )
+        .0;
+        assert!(out.contains("__proto__"), "proto-form object not scalarized:\n{out}");
+        assert!(!out.contains("_s_x"), "not scalarized:\n{out}");
     }
 
     #[test]
