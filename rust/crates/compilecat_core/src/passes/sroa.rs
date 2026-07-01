@@ -977,6 +977,19 @@ fn object_literal_fields<'a>(
 
 // ── escape analysis ─────────────────────────────────────────────────────────
 
+/// True if `e` is a member access `name[…]` / `name.f` (used to reject `delete`).
+fn is_member_of(e: &Expression, name: &str) -> bool {
+    match e {
+        Expression::ComputedMemberExpression(m) => {
+            matches!(&m.object, Expression::Identifier(o) if o.name == name)
+        }
+        Expression::StaticMemberExpression(m) => {
+            matches!(&m.object, Expression::Identifier(o) if o.name == name)
+        }
+        _ => false,
+    }
+}
+
 fn escape_ok(body: &[Statement], name: &str, shape: &Shape) -> bool {
     let mut c = EscapeChecker { name, shape, bad: false };
     for stmt in body {
@@ -1031,6 +1044,17 @@ impl<'a> Visit<'a> for EscapeChecker<'_> {
         if id.name == self.name {
             self.bad = true; // any non-member-accounted reference escapes
         }
+    }
+
+    fn visit_unary_expression(&mut self, u: &UnaryExpression<'a>) {
+        // `delete v[i]` / `delete v.f` removes the element/property — it is neither a
+        // read nor a representable scalar write, and scalarizing it to `delete v_i`
+        // (a `let` local) changes behavior / is a strict-mode SyntaxError. Bail.
+        if u.operator == UnaryOperator::Delete && is_member_of(&u.argument, self.name) {
+            self.bad = true;
+            return;
+        }
+        walk::walk_unary_expression(self, u);
     }
 
     fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
@@ -2314,6 +2338,23 @@ mod tests {
 
     const SET3: &str =
         "/* @inline */ function set3(o, a, b, c) { o[0]=a; o[1]=b; o[2]=c; }\n";
+
+    #[test]
+    fn scratch_delete_member_bailed() {
+        // `delete v[i]` removes the element — scalarizing to `delete v_i` (a `let`)
+        // changes behavior / is a strict-mode SyntaxError. Bail. Adversarial review;
+        // shared escape check, so covers module-scratch AND plain local SROA.
+        let mod_out = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function f(p) { _s[0]=p; delete _s[0]; return _s[0]; }",
+        );
+        assert!(mod_out.contains("const _s"), "module scratch preserved (delete):\n{mod_out}");
+        assert!(!mod_out.contains("_s_0"), "not scalarized:\n{mod_out}");
+        // Plain local SROA path (same helper):
+        let (loc_out, n) =
+            sroa("/* @optimize */ function f(p) { const v = [p, p]; delete v[0]; return v[0] + v[1]; }");
+        assert_eq!(n, 0, "local aggregate not scalarized (delete):\n{loc_out}");
+    }
 
     #[test]
     fn module_scratch_loop_body_confined_scalarized() {
