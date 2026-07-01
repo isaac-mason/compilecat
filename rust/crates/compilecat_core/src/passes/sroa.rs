@@ -1008,6 +1008,14 @@ impl<'a> Visit<'a> for EscapeChecker<'_> {
     fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
         if let Expression::Identifier(obj) = &m.object {
             if obj.name == self.name {
+                // `v?.[i]` — an OPTIONAL member access parses as this node wrapped in a
+                // `ChainExpression`, which `AccessRewriter` doesn't descend into, so it
+                // would be left dangling on the deleted binding. The analysis and the
+                // rewriter must agree, so bail. (Adversarial review.)
+                if m.optional {
+                    self.bad = true;
+                    return;
+                }
                 if let (Shape::Tuple(size), Expression::NumericLiteral(lit)) =
                     (self.shape, &m.expression)
                 {
@@ -1028,6 +1036,10 @@ impl<'a> Visit<'a> for EscapeChecker<'_> {
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
         if let Expression::Identifier(obj) = &m.object {
             if obj.name == self.name {
+                if m.optional {
+                    self.bad = true; // `v?.f` — see the computed case above.
+                    return;
+                }
                 if let Shape::Object(fields) = self.shape {
                     if fields.iter().any(|f| f == m.property.name.as_str()) {
                         return; // valid `v.field` — accounted for
@@ -2355,6 +2367,22 @@ mod tests {
 
     const SET3: &str =
         "/* @inline */ function set3(o, a, b, c) { o[0]=a; o[1]=b; o[2]=c; }\n";
+
+    #[test]
+    fn scratch_optional_chain_read_bailed() {
+        // `v?.[i]` parses as a member wrapped in a ChainExpression that AccessRewriter
+        // doesn't descend into — the analysis would accept it but the rewrite would
+        // leave it dangling on the deleted binding (ReferenceError). Bail. Adversarial
+        // review; shared escape check → covers module-scratch AND local SROA.
+        let (out, n) =
+            sroa("/* @optimize */ export function f(x) { const v = [x, x]; return v?.[0] + v[1]; }");
+        assert_eq!(n, 0, "optional-chain member not scalarized:\n{out}");
+        let mod_out = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function f(x) { _s[0]=x; return _s?.[0] + _s[1]; }",
+        );
+        assert!(mod_out.contains("const _s"), "module scratch preserved (optional):\n{mod_out}");
+    }
 
     #[test]
     fn scratch_delete_member_bailed() {
