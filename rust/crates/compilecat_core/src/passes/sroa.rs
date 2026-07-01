@@ -1352,7 +1352,7 @@ fn classify_expr(e: &Expression, name: &str, shape: &Shape, fx: &mut NodeFx) -> 
 /// can't represent (bails the whole scratch).
 fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
     let mut fx = NodeFx::default();
-    let mut read = |e: &Expression, fx: &mut NodeFx| -> Option<()> {
+    let read = |e: &Expression, fx: &mut NodeFx| -> Option<()> {
         fx.reentrant |= expr_has_reentrant_call(e);
         fx.reads |= reads_mask(e, name, shape)?;
         Some(())
@@ -1382,14 +1382,22 @@ fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
             if let Some(t) = &s.test {
                 read(t, &mut fx)?;
             }
-            // A scratch use in the for-INIT or -UPDATE becomes its OWN bare-expression
-            // CFG node (a Sequence/Update/Call/…), which `node_fx` can't attribute a
-            // read to — so bail here (the whole scratch). Adversarial review found a
-            // for-update `(out[0]=_s[0], i++)` reading the scratch invisibly otherwise.
+            // The for-INIT and -UPDATE are separate bare-expression CFG nodes
+            // (Sequence/Update/Call/…) that `node_fx` can't model, so FOLD their
+            // effects into this loop-head node (a sound over-approximation for the
+            // may-may reachability): bail on a scratch use, and flag re-entrancy so an
+            // impure call there (`for(…;…;g())`) is caught by the guard. Adversarial
+            // review found both a for-update scratch READ and a re-entrant CALL slip
+            // through otherwise.
             if s.init.as_ref().is_some_and(|i| for_init_mentions(i, name))
                 || s.update.as_ref().is_some_and(|u| expr_mentions(u, name))
             {
                 return None;
+            }
+            if s.init.as_ref().is_some_and(for_init_reentrant)
+                || s.update.as_ref().is_some_and(|u| expr_has_reentrant_call(u))
+            {
+                fx.reentrant = true;
             }
         }
         AstKind::ForInStatement(s) => {
@@ -1463,6 +1471,11 @@ fn for_init_mentions(init: &ForStatementInit, name: &str) -> bool {
     let mut f = NameFinder { name, found: false };
     walk::walk_for_statement_init(&mut f, init);
     f.found
+}
+fn for_init_reentrant(init: &ForStatementInit) -> bool {
+    let mut v = ReentrantCallFinder { found: false };
+    walk::walk_for_statement_init(&mut v, init);
+    v.found
 }
 fn for_left_mentions(left: &ForStatementLeft, name: &str) -> bool {
     let mut f = NameFinder { name, found: false };
@@ -1554,8 +1567,8 @@ fn killed_on_entry(func_body: &FunctionBody, name: &str, shape: &Shape) -> bool 
     // calls before any write and trailing calls after all reads still pass).
     let writes: Vec<bool> = fx.iter().map(|f| f.writes != 0).collect();
     let reads: Vec<bool> = fx.iter().map(|f| f.reads != 0).collect();
-    for id in 0..n {
-        if fx[id].reentrant
+    for (id, f) in fx.iter().enumerate() {
+        if f.reentrant
             && reachable_from_any(&cfg, id, &writes, false)
             && reachable_from_any(&cfg, id, &reads, true)
         {
@@ -2597,6 +2610,24 @@ mod tests {
              /* @optimize */ export function f(out) { for (let i=0;i<3;_s[0]=i,i++) {} out[0]=_s[0]; }",
         );
         assert!(write.contains("const _s"), "for-update write bailed:\n{write}");
+    }
+
+    #[test]
+    fn module_scratch_for_header_reentrant_call_bailed() {
+        // Adversarial review (CFG): a re-entrant call in the for-init/-update slot
+        // doesn't mention the scratch, so the mention-bail misses it — but it can
+        // clobber the shared buffer between a write and a read. The loop-head node
+        // must be flagged re-entrant. (source 208 vs compiled 30 if wrongly scalarized)
+        let update = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function f(a, n) { _s[1]=a; let r=0; for (let i=0;i<n;g()) { r+=_s[1]; i++; } return r; }",
+        );
+        assert!(update.contains("const _s"), "reentrant for-update bailed:\n{update}");
+        let init = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function f(a) { _s[1]=a; let r=0; for (g(); r<1; r++) { r+=_s[1]; } return r; }",
+        );
+        assert!(init.contains("const _s"), "reentrant for-init bailed:\n{init}");
     }
 
     #[test]
