@@ -42,6 +42,8 @@ use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::ScopeFlags;
 use oxc_span::SPAN;
 
+use super::util::is_side_effect_free;
+
 use crate::analysis::type_shape::{
     build_type_map, reconstruct, resolve_ast, shape_of, NameSrc, ResolvedType, Shape,
 };
@@ -930,6 +932,80 @@ fn declarator_addr(d: &VariableDeclarator) -> Address {
 /// assigned exactly once (`v = E;`) and read exactly once, with the read in the
 /// statement immediately after the assignment. Returns (decl index, assign
 /// index, name). See `collapse_result_temps`.
+/// True if the single read of `name` in `stmt` is in an UNCONDITIONAL position —
+/// not under a `?:` branch, a short-circuit `&&`/`||`/`??` RHS, or an if/loop/
+/// switch body. Conservative: unhandled conditional-ish constructs count as
+/// conditional (returns false).
+fn read_is_unconditional(stmt: &Statement, name: &str) -> bool {
+    struct V<'n> {
+        name: &'n str,
+        cond_depth: u32,
+        conditional_read: bool,
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+            if id.name == self.name && self.cond_depth > 0 {
+                self.conditional_read = true;
+            }
+        }
+        fn visit_conditional_expression(&mut self, c: &ConditionalExpression<'a>) {
+            self.visit_expression(&c.test);
+            self.cond_depth += 1;
+            self.visit_expression(&c.consequent);
+            self.visit_expression(&c.alternate);
+            self.cond_depth -= 1;
+        }
+        fn visit_logical_expression(&mut self, l: &LogicalExpression<'a>) {
+            self.visit_expression(&l.left);
+            self.cond_depth += 1; // RHS is short-circuit-conditional
+            self.visit_expression(&l.right);
+            self.cond_depth -= 1;
+        }
+        fn visit_if_statement(&mut self, s: &IfStatement<'a>) {
+            self.visit_expression(&s.test);
+            self.cond_depth += 1;
+            self.visit_statement(&s.consequent);
+            if let Some(a) = &s.alternate {
+                self.visit_statement(a);
+            }
+            self.cond_depth -= 1;
+        }
+        fn visit_while_statement(&mut self, s: &WhileStatement<'a>) {
+            self.visit_expression(&s.test);
+            self.cond_depth += 1;
+            self.visit_statement(&s.body);
+            self.cond_depth -= 1;
+        }
+        fn visit_do_while_statement(&mut self, s: &DoWhileStatement<'a>) {
+            // Body runs at least once, but the read may be after a conditional `break`;
+            // treat as conditional to be safe.
+            self.cond_depth += 1;
+            self.visit_statement(&s.body);
+            self.visit_expression(&s.test);
+            self.cond_depth -= 1;
+        }
+        fn visit_for_statement(&mut self, s: &ForStatement<'a>) {
+            self.cond_depth += 1;
+            walk::walk_for_statement(self, s);
+            self.cond_depth -= 1;
+        }
+        fn visit_switch_statement(&mut self, s: &SwitchStatement<'a>) {
+            self.visit_expression(&s.discriminant);
+            self.cond_depth += 1;
+            for c in &s.cases {
+                walk::walk_switch_case(self, c);
+            }
+            self.cond_depth -= 1;
+        }
+        // Nested functions don't run here.
+        fn visit_function(&mut self, _f: &Function<'a>, _flags: ScopeFlags) {}
+        fn visit_arrow_function_expression(&mut self, _a: &ArrowFunctionExpression<'a>) {}
+    }
+    let mut v = V { name, cond_depth: 0, conditional_read: false };
+    v.visit_statement(stmt);
+    !v.conditional_read
+}
+
 fn find_collapsible_temp(list: &[Statement]) -> Option<(usize, usize, String)> {
     for (di, s) in list.iter().enumerate() {
         let Statement::VariableDeclaration(vd) = s else { continue };
@@ -952,6 +1028,21 @@ fn find_collapsible_temp(list: &[Statement]) -> Option<(usize, usize, String)> {
         }
         // The single read must be (solely) in the statement right after the assign.
         if count_name_uses(name, std::slice::from_ref(&list[ai + 1])).0 != 1 {
+            continue;
+        }
+        // If `E` has side effects, collapsing it into the read is only sound when the
+        // read is UNCONDITIONAL — otherwise the effect moves into a `?:`/`&&`/if/loop
+        // branch and runs conditionally (dropping when the branch isn't taken). E was
+        // evaluated eagerly at `v = E`; a pure E may move anywhere, an impure one only
+        // to an unconditional position.
+        let e_impure = match &list[ai] {
+            Statement::ExpressionStatement(es) => match &es.expression {
+                Expression::AssignmentExpression(asgn) => !is_side_effect_free(&asgn.right),
+                _ => true,
+            },
+            _ => true,
+        };
+        if e_impure && !read_is_unconditional(&list[ai + 1], name) {
             continue;
         }
         return Some((di, ai, name.to_string()));

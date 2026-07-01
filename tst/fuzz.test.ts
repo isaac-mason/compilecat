@@ -56,7 +56,10 @@ function evalProgram(code: string, call: string): { ok: true; value: unknown } |
         // `"use strict"` — cross-file evals depend on sloppy fn redeclaration.
         // biome-ignore lint/security/noGlobalEval: intentionally evaluating generated/compiled code
         const value = new Function(
-            `const __t = [];\nconst eff = (x) => { __t.push(x); return x; };\n${js}\nreturn [(${call}), __t];`,
+            // `__g` is an observable module-level mutable a generated helper may
+            // write (a free-variable side effect) — returned alongside the trace so
+            // a wrongly-dropped `__g = …` write (mis-proven-pure function) diverges.
+            `const __t = [];\nlet __g = 0;\nconst eff = (x) => { __t.push(x); return x; };\n${js}\nreturn [(${call}), __t, __g];`,
         )();
         return { ok: true, value };
     } catch {
@@ -227,13 +230,23 @@ class Gen {
             const head = `${dir}${exp}`;
             const s: Scope = { nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] };
             if (kind === 'num') {
-                // Mix DIRECT (single return) and BLOCK (branch / temp) bodies.
-                const shape = int(this.r, 0, 2);
+                // Mix DIRECT (single return) and BLOCK (branch / temp) bodies, plus
+                // two purity-analysis stressors: local-aggregate mutation (immutable
+                // math — PURE unless its numExpr contains an `eff`), and a free-var
+                // write to `__g` (always IMPURE — MUTATES_GLOBAL). Both are observed
+                // by the value+trace+__g oracle, so a mis-classification is caught.
+                const shape = int(this.r, 0, 4);
                 if (shape === 0) out.push(`${head}function ${h.name}(a, b) { return ${this.numExpr(s, 2)}; }`);
                 else if (shape === 1)
                     out.push(`${head}function ${h.name}(a, b) { if (${this.cond(s)}) return ${this.numExpr(s, 2)}; return ${this.numExpr(s, 2)}; }`);
-                else
+                else if (shape === 2)
                     out.push(`${head}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`);
+                else if (shape === 3)
+                    // fresh-local aggregate mutation — pure iff no `eff` leaks in.
+                    out.push(`${head}function ${h.name}(a, b) { const o = [a, b]; o[0] = ${this.numExpr(s, 1)}; o[1] = ${this.numExpr(s, 1)}; return o[0] + o[1]; }`);
+                else
+                    // free-variable write — a MUTATES_GLOBAL side effect.
+                    out.push(`${head}function ${h.name}(a, b) { __g = ${this.numExpr(s, 1)}; return a + b; }`);
             } else if (kind === 'pt') {
                 out.push(`${head}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)} }; }`);
             } else {
@@ -573,6 +586,15 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         'unroll preserves effect count',
         `/* @optimize */ function entry(p, q) { let a = 0; /* @unroll */ for (let i = 0; i < 3; i++) { a += eff(i); } return a; }`,
     );
+    // SROA's collapse_result_temps inlined a single-use temp `let b=eff(…)` into its
+    // read even when the read sat in a conditional (`… ? 2 : b`) — moving the effect
+    // into a branch → dropped when not taken. Now impure temps only collapse into an
+    // UNCONDITIONAL read. Found by the purity-broadened fuzzer.
+    chk(
+        'sroa collapse keeps impure temp out of a conditional read',
+        `/* @inline */ function h0(a, b) { if (Math.abs(a) === eff(9)) return (a === eff(4) ? 2 : b); return Math.abs(eff(a)); }\nfunction h1(a, b) { return eff(h0(a, 9)); }\n/* @optimize */ function entry(p, q) { return h0(q, h1(p, q)); }`,
+    );
+
     // /*@__PURE__*/ lets the unused call drop, but its impure ARG still runs.
     chk(
         'pure-annotated call keeps impure arg effect',
