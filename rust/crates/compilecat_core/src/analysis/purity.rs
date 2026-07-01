@@ -75,7 +75,7 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::*;
 use oxc_ast::AstKind;
-use oxc_ast_visit::{walk, Visit};
+use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_semantic::{NodeId, ScopeFlags, Semantic, SemanticBuilder, SymbolId};
 
 /// Whether a name resolves to a binding LOCAL to the analyzed function.
@@ -147,6 +147,39 @@ pub fn pure_function_names(program: &Program) -> HashSet<String> {
     let mut summaries = analyze(program);
     propagate(&mut summaries);
     summaries.into_iter().filter(|(_, s)| s.effects.is_pure()).map(|(k, _)| k).collect()
+}
+
+/// Stamp `CallExpression.pure = true` on every call whose plain-identifier callee
+/// is a proven-pure function (Closure's `markPureFunctionCalls`, restricted to the
+/// identifier-callee case). `is_side_effect_free` already honors `c.pure`, so this
+/// is the single point that feeds the whole drop/reorder/substitute machinery — and
+/// codegen emits `/*@__PURE__*/` for downstream. Returns the number stamped.
+pub fn stamp_pure_calls(program: &mut Program) -> u32 {
+    let pure = pure_function_names(program);
+    if pure.is_empty() {
+        return 0;
+    }
+    let mut st = Stamper { pure: &pure, count: 0 };
+    st.visit_program(program);
+    st.count
+}
+
+struct Stamper<'p> {
+    pure: &'p HashSet<String>,
+    count: u32,
+}
+impl<'a> VisitMut<'a> for Stamper<'_> {
+    fn visit_call_expression(&mut self, c: &mut CallExpression<'a>) {
+        walk_mut::walk_call_expression(self, c);
+        if !c.pure {
+            if let Expression::Identifier(id) = &c.callee {
+                if self.pure.contains(id.name.as_str()) {
+                    c.pure = true;
+                    self.count += 1;
+                }
+            }
+        }
+    }
 }
 
 /// The nearest enclosing function/arrow node of `start` (exclusive), or None at

@@ -66,6 +66,13 @@ pub fn run_all_gated<'a>(
     normalize::run(allocator, program);
     let _ = mode; // inline cross-file (PerFile) path not yet ported
 
+    // Closure-aligned purity: stamp `CallExpression.pure` on calls to functions the
+    // analysis proves side-effect-free, BEFORE inline — so `is_side_effect_free`
+    // (which honors `c.pure`) lets the drop/reorder/substitute passes optimize the
+    // pure calls that survive inlining (recursive / un-inlined helpers), and codegen
+    // emits `/*@__PURE__*/` for downstream. Verified sound by the effect-trace fuzzer.
+    crate::analysis::purity::stamp_pure_calls(program);
+
     // Inline first (self-gated on directives); it returns the directive-free
     // consumers it inlined into so their residue can join the cleanup gate.
     let mut uid = uid_base;
