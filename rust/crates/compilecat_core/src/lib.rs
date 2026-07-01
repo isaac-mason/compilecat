@@ -659,7 +659,11 @@ mod tests {
 
     #[test]
     fn mcond_double_not() {
-        assert!(mcond("var b = !!x;").contains("var b = x"), "got: {}", mcond("var b = !!x;"));
+        // `!!x` (unknown x) is ToBoolean — kept in a value context; a boolean-valued
+        // inner (`a < c`) cancels.
+        assert!(mcond("var b = !!x;").contains("!!x"), "value kept: {}", mcond("var b = !!x;"));
+        let out = mcond("var b = !!(a < c);");
+        assert!(out.contains("a < c") && !out.contains("!!"), "boolean-valued cancels: {out}");
     }
 
     #[test]

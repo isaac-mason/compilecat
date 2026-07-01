@@ -436,6 +436,18 @@ describe('adversarial-review regressions', () => {
         expect(run(compiled, call)).toEqual(expected);
     };
 
+    // minimize-conditions dropped a double-negation in a VALUE context: `!!x` → `x`.
+    // But `!!x` is `ToBoolean(x)` (`!!5` is `true`, not `5`), only identity for a
+    // boolean-valued inner. Found by diffing compilecat vs the real Closure compiler
+    // (llm/closure-testbed) — the fuzzer grammar never emits `!!`.
+    it('double-negation-not-identity-in-value-context', () => {
+        for (const arg of ['5', '0', '""', '"a"', 'null', '[]']) {
+            check('rev-double-not.ts', `/* @optimize */ function entry(x) { return !!x; }`, `entry(${arg})`);
+        }
+        // boolean-valued inner still cancels (a valid optimization).
+        check('rev-double-not2.ts', `/* @optimize */ function entry(a, b) { return !!(a < b); }`, 'entry(1, 2)');
+    });
+
     // bug #1 fix introduced a shadow regression: renaming a param whose name is
     // re-declared in a nested block corrupted the inner binding. Now bails.
     it('inline-param-shadowed-in-nested-block', () => {

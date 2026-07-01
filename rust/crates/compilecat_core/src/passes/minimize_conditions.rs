@@ -165,8 +165,17 @@ impl<'a> Minimizer<'a> {
 
     fn minimize_not(&self, u: &mut UnaryExpression<'a>) -> Option<Expression<'a>> {
         match &mut u.argument {
-            // `!!x` → x
-            Expression::UnaryExpression(inner) if inner.operator == UnaryOperator::LogicalNot => {
+            // `!!x` → x — ONLY when `x` is already boolean. `!!x` is `ToBoolean(x)`,
+            // so dropping the double-negation is NOT identity for a value (`!!5` is
+            // `true`, not `5`) — it's only sound when `x` is boolean-valued (a
+            // comparison / inner `!` / boolean literal) or in a boolean context (the
+            // if/while/`?:`-test slots, handled by `minimize_cond_slot`). This
+            // general value-context path must guard. (Closure keeps `!!a` for
+            // unknown `a`; a fuzzer-invisible miscompile the Closure-diff caught.)
+            Expression::UnaryExpression(inner)
+                if inner.operator == UnaryOperator::LogicalNot
+                    && is_boolean_valued(&inner.argument) =>
+            {
                 Some(inner.argument.take_in(self.alloc()))
             }
             // `!(a == b)` → `a != b` (equality ops only; relational is NaN-unsafe)
@@ -394,6 +403,33 @@ fn is_unlabeled_break_branch(stmt: &Statement) -> bool {
     }
 }
 
+/// True if evaluating `e` ALWAYS yields a boolean — so `!!e` ≡ `e` and dropping
+/// the double-negation is sound even in a value context. Comparisons, an inner
+/// `!`, and boolean literals qualify; a bare identifier / arithmetic does NOT
+/// (`!!x` would coerce). Conservative — logical `&&`/`||` return an operand, not
+/// necessarily a boolean, so they're excluded.
+fn is_boolean_valued(e: &Expression) -> bool {
+    match e {
+        Expression::BooleanLiteral(_) => true,
+        Expression::UnaryExpression(u) => u.operator == UnaryOperator::LogicalNot,
+        Expression::BinaryExpression(b) => matches!(
+            b.operator,
+            BinaryOperator::LessThan
+                | BinaryOperator::LessEqualThan
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::GreaterEqualThan
+                | BinaryOperator::Equality
+                | BinaryOperator::Inequality
+                | BinaryOperator::StrictEquality
+                | BinaryOperator::StrictInequality
+                | BinaryOperator::In
+                | BinaryOperator::Instanceof
+        ),
+        Expression::ParenthesizedExpression(p) => is_boolean_valued(&p.expression),
+        _ => false,
+    }
+}
+
 fn negate_equality(op: BinaryOperator) -> Option<BinaryOperator> {
     Some(match op {
         BinaryOperator::Equality => BinaryOperator::Inequality,
@@ -466,7 +502,12 @@ mod tests {
 
     #[test]
     fn cancels_double_negation() {
-        assert!(mc("var b = !!x;").0.contains("var b = x"));
+        // `!!x` for unknown `x` is `ToBoolean(x)`, NOT `x` — must be KEPT in a value
+        // context (`!!5` is `true`, not `5`).
+        assert!(mc("var b = !!x;").0.contains("!!x"), "value !!x kept: {}", mc("var b = !!x;").0);
+        // But a boolean-valued inner cancels: `!!(a < c)` → `a < c`.
+        let out = mc("var b = !!(a < c);").0;
+        assert!(out.contains("a < c") && !out.contains("!!"), "boolean-valued cancels: {out}");
     }
 
     #[test]
