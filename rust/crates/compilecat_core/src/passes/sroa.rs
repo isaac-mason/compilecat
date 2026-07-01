@@ -37,9 +37,9 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Address, Allocator, CloneIn, TakeIn};
 use oxc_ast::ast::*;
-use oxc_ast::{AstBuilder, NONE};
+use oxc_ast::{AstBuilder, AstKind, NONE};
 use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
-use oxc_semantic::ScopeFlags;
+use oxc_semantic::{NodeId, ScopeFlags, SemanticBuilder};
 use oxc_span::SPAN;
 
 use super::util::is_side_effect_free;
@@ -72,6 +72,11 @@ pub fn run<'a>(
         types.entry(name.clone()).or_insert_with(|| reconstruct(shape));
     }
     let mut s = Sroa { ast: AstBuilder::new(allocator), sroa_spans, depth: 0, count: 0, types };
+    // Single-owner module-scratch scalarization (LLVM GlobalOpt-localize fused into
+    // SROA) — runs first, atomically emits scalars into the owning function and
+    // deletes the module const, so a local aggregate is never materialized (no
+    // per-call allocation). See `scalarize_module_scratch`.
+    s.scalarize_module_scratch(program);
     // Program scope first, then recurse into functions.
     let prog_annotated = s.depth > 0;
     let body = &mut program.body;
@@ -739,6 +744,155 @@ impl<'a> Sroa<'a> {
             init: SroaInit::Destructure(init.clone_in(self.alloc())),
         })
     }
+
+    // ── module-scratch scalarization (GlobalOpt-localize fused into SROA) ────────
+
+    /// Scalar-replace single-owner module-level scratch buffers: a program-level
+    /// `const _s = <pure aggregate>` used ONLY as per-call scratch inside one
+    /// annotated function `F` is replaced by fresh uninitialized scalars in `F`
+    /// (`let _s_0, _s_1, _s_2;`), its `_s[i]` accesses rewritten to `_s_i`, and the
+    /// module const deleted. This is LLVM's global-localization + SROA, FUSED into
+    /// one atomic act so the local aggregate never exists (no per-call allocation):
+    /// SROA either scalarizes fully or leaves the module const untouched — never a
+    /// half state. Preconditions (ported from `GlobalOpt::processInternalGlobal`):
+    /// single owner, not exported, owner non-recursive, killed-on-entry (every read
+    /// preceded by a write — v1 straight-line), and all uses direct member
+    /// load/stores (escape check).
+    fn scalarize_module_scratch(&mut self, program: &mut Program<'a>) {
+        let cands = self.find_module_scratch(program);
+        if cands.is_empty() {
+            return;
+        }
+        let mut by_owner: HashMap<u32, Vec<ModuleScratchCand>> = HashMap::new();
+        for c in cands {
+            by_owner.entry(c.owner_fn_span).or_default().push(c);
+        }
+        let mut consumed: HashSet<String> = HashSet::new();
+        let mut count = 0u32;
+        let mut m =
+            ScratchMutator { ast: self.ast, by_owner: &by_owner, consumed: &mut consumed, count: &mut count };
+        m.visit_program(program);
+        self.count += count;
+        // Delete the consumed module consts (now zero-referenced). Strip matching
+        // declarators; drop a declaration that loses all of them.
+        if !consumed.is_empty() {
+            program.body.retain_mut(|stmt| {
+                let Statement::VariableDeclaration(vd) = stmt else { return true };
+                vd.declarations.retain(|d| {
+                    !matches!(&d.id, BindingPattern::BindingIdentifier(id)
+                        if consumed.contains(id.name.as_str()))
+                });
+                !vd.declarations.is_empty()
+            });
+        }
+    }
+
+    /// Find program-level scratch consts owned solely by one annotated,
+    /// non-recursive function. Uses `oxc_semantic` for sound single-owner + escape
+    /// resolution (symbol identity, not names — handles shadowing).
+    fn find_module_scratch(&self, program: &Program<'a>) -> Vec<ModuleScratchCand> {
+        let semantic = SemanticBuilder::new().build(program).semantic;
+        let nodes = semantic.nodes();
+        let scoping = semantic.scoping();
+        let mut out = Vec::new();
+        for stmt in &program.body {
+            let Statement::VariableDeclaration(vd) = stmt else { continue };
+            if vd.kind != VariableDeclarationKind::Const {
+                continue; // a reassignable `let`/`var` global isn't a pure scratch
+            }
+            for d in &vd.declarations {
+                let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
+                let Some(init) = &d.init else { continue };
+                if !is_side_effect_free(init) {
+                    continue; // deleting the module slot must drop only an allocation
+                }
+                let Some(shape) = self.module_scratch_shape(d) else { continue };
+                let Some(sym) = id.symbol_id.get() else { continue };
+
+                // Single owner: every resolved reference is inside the SAME function
+                // (none at module scope). LLVM `!HasMultipleAccessingFunctions`.
+                let mut owner: Option<NodeId> = None;
+                let mut any = false;
+                let mut ok = true;
+                for r in scoping.get_resolved_references(sym) {
+                    any = true;
+                    match enclosing_function(nodes, r.node_id()) {
+                        None => {
+                            ok = false; // referenced at module scope → not owned
+                            break;
+                        }
+                        Some(f) => match owner {
+                            None => owner = Some(f),
+                            Some(o) if o == f => {}
+                            Some(_) => {
+                                ok = false; // multiple owners
+                                break;
+                            }
+                        },
+                    }
+                }
+                if !ok || !any {
+                    continue;
+                }
+                let owner = owner.unwrap();
+                let AstKind::Function(func) = nodes.kind(owner) else { continue };
+                let owner_span = func.span.start;
+                // Owner must be opted-in (`@optimize`/`@sroa`) and non-recursive.
+                if !self.sroa_spans.contains(&owner_span) {
+                    continue;
+                }
+                if fn_references_self(&semantic, nodes, owner, func) {
+                    continue; // recursive / self-referential → could clobber mid-use
+                }
+                out.push(ModuleScratchCand { name: id.name.to_string(), shape, owner_fn_span: owner_span });
+            }
+        }
+        out
+    }
+
+    /// Shape of a module scratch declarator, from a literal init, a type
+    /// annotation, or a `<ns>.create()`-style constructor whose capitalized
+    /// namespace (`vec3`→`Vec3`) resolves in the type oracle. `None` = don't touch.
+    fn module_scratch_shape(&self, d: &VariableDeclarator<'a>) -> Option<Shape> {
+        let init = d.init.as_ref()?;
+        let bounded = |s: Shape| (MIN_FIELDS..=MAX_FIELDS).contains(&s.len()).then_some(s);
+        match init {
+            Expression::ArrayExpression(arr) => {
+                if arr.elements.iter().any(|e| {
+                    matches!(
+                        e,
+                        ArrayExpressionElement::SpreadElement(_)
+                            | ArrayExpressionElement::Elision(_)
+                    )
+                }) {
+                    return None;
+                }
+                bounded(Shape::Tuple(arr.elements.len()))
+            }
+            Expression::ObjectExpression(obj) => {
+                let (fields, _) = object_literal_fields(obj, self.alloc())?;
+                bounded(Shape::Object(fields))
+            }
+            _ => {
+                // Typed annotation `const _s: Vec3 = …`, else a `<ns>.create()` ctor.
+                if let Some(ta) = &d.type_annotation {
+                    let mut seen = HashSet::new();
+                    let rt =
+                        resolve_ast(&ta.type_annotation, &NameSrc::Resolved(&self.types), &mut seen)?;
+                    return bounded(shape_of(&rt)?);
+                }
+                let Expression::CallExpression(call) = init else { return None };
+                let Expression::StaticMemberExpression(m) = &call.callee else { return None };
+                let Expression::Identifier(ns) = &m.object else { return None };
+                if !matches!(m.property.name.as_str(), "create" | "clone" | "identity" | "fromValues")
+                {
+                    return None;
+                }
+                let ty = capitalize(&ns.name);
+                bounded(shape_of(self.types.get(&ty)?)?)
+            }
+        }
+    }
 }
 
 /// Extract `(field names, value exprs)` from an object literal if every property
@@ -834,6 +988,319 @@ impl<'a> Visit<'a> for EscapeChecker<'_> {
             return;
         }
         walk::walk_function(self, func, flags);
+    }
+}
+
+// ── module scratch: candidate + mutation + killed-on-entry ──────────────────
+
+struct ModuleScratchCand {
+    name: String,
+    shape: Shape,
+    /// `span.start` of the sole owning function (its identity for the mutation walk).
+    owner_fn_span: u32,
+}
+
+/// `vec3` → `Vec3` (capitalize first byte) — the mathcat namespace→type convention.
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().chain(c).collect(),
+        None => String::new(),
+    }
+}
+
+/// Nearest enclosing function/arrow node of `start` (exclusive), or None at module
+/// top level. (Mirror of `analysis::purity::enclosing_function`.)
+fn enclosing_function(nodes: &oxc_semantic::AstNodes, start: NodeId) -> Option<NodeId> {
+    let mut id = nodes.parent_id(start);
+    loop {
+        match nodes.kind(id) {
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => return Some(id),
+            _ => {}
+        }
+        let p = nodes.parent_id(id);
+        if p == id {
+            return None;
+        }
+        id = p;
+    }
+}
+
+/// True if the function's own name is referenced anywhere inside its body
+/// (recursion / self-reference) — conservative bail for the "non-recursive owner"
+/// precondition (LLVM `doesNotRecurse`).
+fn fn_references_self(
+    semantic: &oxc_semantic::Semantic,
+    nodes: &oxc_semantic::AstNodes,
+    owner: NodeId,
+    func: &Function,
+) -> bool {
+    let Some(fid) = func.id.as_ref().and_then(|b| b.symbol_id.get()) else { return false };
+    semantic
+        .scoping()
+        .get_resolved_references(fid)
+        .any(|r| enclosing_function(nodes, r.node_id()) == Some(owner))
+}
+
+/// Walks the program, and for each function whose `span.start` owns module scratch,
+/// scalarizes the qualifying candidates in place.
+struct ScratchMutator<'a, 'b> {
+    ast: AstBuilder<'a>,
+    by_owner: &'b HashMap<u32, Vec<ModuleScratchCand>>,
+    consumed: &'b mut HashSet<String>,
+    count: &'b mut u32,
+}
+
+impl<'a> VisitMut<'a> for ScratchMutator<'a, '_> {
+    fn visit_function(&mut self, func: &mut Function<'a>, flags: ScopeFlags) {
+        if let Some(cands) = self.by_owner.get(&func.span.start) {
+            if let Some(body) = func.body.as_mut() {
+                self.process_owner(&mut body.statements, cands);
+            }
+        }
+        walk_mut::walk_function(self, func, flags);
+    }
+}
+
+impl<'a> ScratchMutator<'a, '_> {
+    fn process_owner(
+        &mut self,
+        body: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+        cands: &[ModuleScratchCand],
+    ) {
+        // Gate each candidate on the CURRENT body: all uses are member load/stores
+        // (escape) AND killed-on-entry (every read preceded by a write). Both are
+        // checked before any rewrite.
+        let passing: Vec<(String, Shape)> = cands
+            .iter()
+            .filter(|c| {
+                escape_ok(body, &c.name, &c.shape) && killed_on_entry(body, &c.name, &c.shape)
+            })
+            .map(|c| (c.name.clone(), c.shape.clone()))
+            .collect();
+        if passing.is_empty() {
+            return;
+        }
+        // Rewrite `_s[i]`/`_s.f` → `_s_i` for every passing scratch.
+        let shapes: HashMap<String, Shape> = passing.iter().cloned().collect();
+        let mut rw = AccessRewriter { ast: self.ast, shapes: &shapes };
+        for stmt in body.iter_mut() {
+            rw.visit_statement(stmt);
+        }
+        // Prepend fresh uninitialized scalars (killed-on-entry ⇒ the init value is
+        // never observed, so no init call — that is what keeps it allocation-free).
+        for (name, shape) in passing.iter().rev() {
+            let decl = self.uninit_scalar_decl(name, shape);
+            body.insert(0, decl);
+            self.consumed.insert(name.clone());
+            *self.count += 1;
+        }
+    }
+
+    /// `let _s_0, _s_1, _s_2;` — one bare (no-init) scalar per field.
+    fn uninit_scalar_decl(&self, name: &str, shape: &Shape) -> Statement<'a> {
+        let suffixes = shape.suffixes();
+        let mut declarators = self.ast.vec_with_capacity(suffixes.len());
+        for suffix in &suffixes {
+            let sname = self.ast.allocator.alloc_str(&format!("{name}_{suffix}"));
+            let id = self.ast.binding_pattern_binding_identifier(SPAN, sname);
+            declarators.push(self.ast.variable_declarator(
+                SPAN,
+                VariableDeclarationKind::Let,
+                id,
+                NONE,
+                None,
+                false,
+            ));
+        }
+        Statement::VariableDeclaration(self.ast.alloc(self.ast.variable_declaration(
+            SPAN,
+            VariableDeclarationKind::Let,
+            declarators,
+            false,
+        )))
+    }
+}
+
+/// v1 straight-line killed-on-entry: over `body`'s TOP-LEVEL statements (post-inline
+/// these scratch chains are flat), every field READ of `name` must be preceded by a
+/// WRITE of that field. Bails (returns false) on anything not provably straight-line
+/// safe: a read before its write, `name` under any control flow / nested block, a
+/// compound assign to `name`, a nested write, or an unknown suffix. Assumes
+/// `escape_ok` already proved all uses are member accesses.
+fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
+    let mut written: HashSet<String> = HashSet::new();
+    for stmt in body {
+        // Re-entrancy guard: once the scratch holds live values (some field written),
+        // an IMPURE call could transitively re-enter the owner and clobber the shared
+        // buffer — which the per-call scalars would NOT reproduce. So bail on any
+        // non-side-effect-free call/new after the first write. `fn_references_self`
+        // covers direct recursion; this covers the mutual/indirect case. Pure builtins
+        // (`Math.*`) can't re-enter, so they don't trip it; post-inline scratch chains
+        // are call-free, so this is free for the target pattern.
+        if !written.is_empty() && stmt_has_reentrant_call(stmt) {
+            return false;
+        }
+        // Simple write `name[i] = RHS` (only field-writes take this form).
+        if let Statement::ExpressionStatement(es) = stmt {
+            if let Expression::AssignmentExpression(a) = &es.expression {
+                if a.operator == AssignmentOperator::Assign {
+                    if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
+                        // All `name` reads in the RHS must already be covered.
+                        match collect_reads(&a.right, name, shape) {
+                            Some(reads) => {
+                                if reads.iter().any(|r| !written.contains(r)) {
+                                    return false;
+                                }
+                            }
+                            None => return false, // nonmember / nested write in RHS
+                        }
+                        written.insert(suffix);
+                        continue;
+                    }
+                }
+            }
+        }
+        // Otherwise: `name` may appear only in read positions, all covered.
+        match collect_reads_stmt(stmt, name, shape) {
+            Some(reads) => {
+                if reads.iter().any(|r| !written.contains(r)) {
+                    return false;
+                }
+            }
+            None => return false, // escape / write / control-flow use of `name`
+        }
+    }
+    true
+}
+
+/// True if `stmt` contains a call/new that is not provably side-effect-free —
+/// i.e. one that could transitively re-enter the scratch's owner.
+fn stmt_has_reentrant_call(stmt: &Statement) -> bool {
+    let mut v = ReentrantCallFinder { found: false };
+    v.visit_statement(stmt);
+    v.found
+}
+
+struct ReentrantCallFinder {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for ReentrantCallFinder {
+    fn visit_expression(&mut self, e: &Expression<'a>) {
+        if self.found {
+            return;
+        }
+        if matches!(e, Expression::CallExpression(_) | Expression::NewExpression(_))
+            && !is_side_effect_free(e)
+        {
+            self.found = true;
+            return;
+        }
+        walk::walk_expression(self, e);
+    }
+}
+
+/// The field suffix if `t` is a write target `name[<lit>]` / `name.<field>` in
+/// range for `shape`, else None.
+fn assign_target_suffix(t: &AssignmentTarget, name: &str, shape: &Shape) -> Option<String> {
+    match t {
+        AssignmentTarget::ComputedMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else { return None };
+            if obj.name != name {
+                return None;
+            }
+            let (Shape::Tuple(size), Expression::NumericLiteral(lit)) = (shape, &m.expression) else {
+                return None;
+            };
+            valid_index(lit.value, *size).then(|| (lit.value as usize).to_string())
+        }
+        AssignmentTarget::StaticMemberExpression(m) => {
+            let Expression::Identifier(obj) = &m.object else { return None };
+            if obj.name != name {
+                return None;
+            }
+            let Shape::Object(fields) = shape else { return None };
+            fields
+                .iter()
+                .any(|f| f == m.property.name.as_str())
+                .then(|| m.property.name.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Collect the field suffixes of `name` READ in an expression. `None` if `name`
+/// escapes (bare identifier) or is written (assignment target) inside — i.e. any
+/// use that the straight-line model can't account for as a plain read.
+fn collect_reads(e: &Expression, name: &str, shape: &Shape) -> Option<Vec<String>> {
+    let mut c = ReadCollector { name, shape, reads: Vec::new(), bad: false };
+    c.visit_expression(e);
+    (!c.bad).then_some(c.reads)
+}
+
+fn collect_reads_stmt(stmt: &Statement, name: &str, shape: &Shape) -> Option<Vec<String>> {
+    let mut c = ReadCollector { name, shape, reads: Vec::new(), bad: false };
+    c.visit_statement(stmt);
+    (!c.bad).then_some(c.reads)
+}
+
+struct ReadCollector<'s> {
+    name: &'s str,
+    shape: &'s Shape,
+    reads: Vec<String>,
+    bad: bool,
+}
+
+impl<'a> Visit<'a> for ReadCollector<'_> {
+    fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
+        if let Expression::Identifier(obj) = &m.object {
+            if obj.name == self.name {
+                if let (Shape::Tuple(size), Expression::NumericLiteral(lit)) =
+                    (self.shape, &m.expression)
+                {
+                    if valid_index(lit.value, *size) {
+                        self.reads.push((lit.value as usize).to_string());
+                        self.visit_expression(&m.expression);
+                        return;
+                    }
+                }
+                self.bad = true;
+                return;
+            }
+        }
+        walk::walk_computed_member_expression(self, m);
+    }
+
+    fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
+        if let Expression::Identifier(obj) = &m.object {
+            if obj.name == self.name {
+                if let Shape::Object(fields) = self.shape {
+                    if fields.iter().any(|f| f == m.property.name.as_str()) {
+                        self.reads.push(m.property.name.to_string());
+                        return;
+                    }
+                }
+                self.bad = true;
+                return;
+            }
+        }
+        walk::walk_static_member_expression(self, m);
+    }
+
+    fn visit_assignment_expression(&mut self, a: &AssignmentExpression<'a>) {
+        // A write to `name` inside a read region can't be modelled straight-line.
+        if assign_target_suffix(&a.left, self.name, self.shape).is_some() {
+            self.bad = true;
+            return;
+        }
+        walk::walk_assignment_expression(self, a);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name {
+            self.bad = true; // bare `name` escapes
+        }
     }
 }
 
@@ -1463,5 +1930,81 @@ mod tests {
         assert!(out.contains("let v = [1, 2]"), "decl preserved:\n{out}");
         assert!(out.contains("v = [3, 4]"), "reassignment preserved:\n{out}");
         assert!(out.contains("v[0] + v[1]"), "accesses preserved:\n{out}");
+    }
+
+    // ── module scratch (GlobalOpt-localize fused into SROA) ──────────────────
+
+    const ADD3: &str =
+        "/* @inline */ function add3(o, a, b) { o[0]=a[0]+b[0]; o[1]=a[1]+b[1]; o[2]=a[2]+b[2]; }\n";
+
+    #[test]
+    fn module_scratch_single_owner_scalarized() {
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); add3(out,_s,a); return out; }}"
+        ));
+        assert!(out.contains("_s_0") && out.contains("_s_1") && out.contains("_s_2"), "scalars:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+        // No local aggregate materialized (no per-call allocation / self-prank).
+        assert!(!out.contains("[0, 0, 0]") && !out.contains("[0,0,0]"), "no local aggregate:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_multi_owner_bailed() {
+        // A second reader → not single-owner → left as a module const (no self-prank).
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); add3(out,_s,a); return out; }}\n\
+             export function other() {{ return _s[0]; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_read_before_write_bailed() {
+        // `out[0]=_s[0]` before any write of `_s[0]` → killed-on-entry fails.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ out[0]=_s[0]; add3(_s,a,b); return out; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_escape_bailed() {
+        // `_s` passed as a bare argument to a non-inlined call escapes.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}function sink(x) {{ return x; }}\n\
+             const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); sink(_s); add3(out,_s,a); return out; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_reentrant_call_bailed() {
+        // An opaque impure call after the first write could transitively re-enter
+        // the owner and clobber the shared buffer; the per-call scalars wouldn't
+        // reproduce that, so bail (mutual/indirect recursion guard).
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); ext(); out[0]=_s[0]; return out; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_unannotated_owner_bailed() {
+        // Owner not `@optimize`/`@sroa` → opt-in not satisfied.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             export function foo(out, a, b) {{ add3(_s,a,b); add3(out,_s,a); return out; }}"
+        ));
+        assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
+        assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
     }
 }
