@@ -575,11 +575,19 @@ class ScratchGen {
             'branchy',
             'collideLocal',
             'closure',
+            'alias',
+            'aliasTrailingEff',
+            'blockShadow',
         ]);
         const body: string[] = [];
         // Occasional leading effect (before any write) — preserved through
         // scalarization, and doesn't trip the after-first-write re-entrancy guard.
         if (chance(this.r, 0.4)) body.push(`  eff(${int(this.r, 1, 9)});`);
+        // v2 alias-following: reach the scratch through a `const <s> = _s` alias.
+        const acc = mode === 'alias' || mode === 'aliasTrailingEff' ? `${s}a` : s;
+        if (acc !== s) body.push(`  const ${acc} = ${s};`);
+        const readAllA = idx.map((i) => `${acc}[${i}]`).join(' + ');
+        const writesA = idx.map((i) => `  ${acc}[${i}] = ${this.e()};`);
         let extra = '';
         // Only the FUNCTIONS are exported — the scratch const stays module-private
         // (as in real crashcat). Exporting the const would make it externally
@@ -604,6 +612,19 @@ class ScratchGen {
         } else if (mode === 'collideLocal') {
             // A local whose name equals a generated scalar (`s_0`) — must not merge.
             body.push(`  let ${s}_0 = ${this.e()};`, ...writes, `  return ${readAll} + ${s}_0;`);
+        } else if (mode === 'alias') {
+            // v2: write/read the scratch through the `const ${s}a = ${s}` alias.
+            body.push(...writesA, `  return ${readAllA};`);
+        } else if (mode === 'aliasTrailingEff') {
+            // Alias + a trailing effect AFTER the last scratch use (v2 window).
+            body.push(...writesA, `  const rv = ${readAllA};`, `  eff(rv);`, `  return rv;`);
+        } else if (mode === 'blockShadow') {
+            // A block-scoped rebind of the scratch name (distinct variable). Must NOT
+            // be hijacked by the name-based rewriter. Values differ so a hijack diverges.
+            body.push(...writes, `  let acc = ${readAll};`);
+            const lit = `[${idx.map(() => int(this.r, 1, 9)).join(', ')}]`;
+            body.push(`  if (p > q) { const ${s} = ${lit}; acc += ${s}[0] + ${s}[${n - 1}]; }`);
+            body.push(`  return acc;`);
         } else if (mode === 'closure') {
             // Returns a closure whose PARAM shadows the scratch name — the scalarizer
             // must not hijack the inner `${s}` binding. Called by the oracle.

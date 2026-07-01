@@ -143,11 +143,12 @@ describe('module-scratch scalar replacement — real crashcat patterns', () => {
         expect(out).not.toContain('const _scratchCross =');
     });
 
-    it('LOCAL-ALIAS scratch use bails (v2 opportunity — pinned, not yet handled)', () => {
+    it('LOCAL-ALIAS scratch use scalarizes (v2 alias-following)', () => {
         const out = compiledFixture('scratch-transform-point.ts');
-        // `const s = _scratchAliased` reads as an escape today → left intact.
-        expect(out).toContain('_scratchAliased');
-        expect(out).not.toMatch(/_scratchAliased_0/);
+        // `const s = _scratchAliased; …s[i]…` — the alias `s` is scalarized and BOTH
+        // the alias decl and the module const are deleted.
+        expect(out).not.toContain('const _scratchAliased');
+        expect(out).toMatch(/\bs_0\b/);
     });
 });
 

@@ -72,7 +72,7 @@ fn args_side_effect_free(args: &[Argument]) -> bool {
     })
 }
 
-fn call_is_side_effect_free(c: &CallExpression) -> bool {
+pub(crate) fn call_is_side_effect_free(c: &CallExpression) -> bool {
     // `c.pure` is the parser-set `/*@__PURE__*/` / `/*#__PURE__*/` marker (the
     // developer's escape hatch, à la Closure `@nosideeffects` / Terser / Rollup):
     // it asserts the callee is side-effect-free. The arguments are still evaluated,

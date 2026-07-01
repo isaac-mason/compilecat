@@ -811,11 +811,13 @@ impl<'a> Sroa<'a> {
 
                 // Single owner: every resolved reference is inside the SAME function
                 // (none at module scope). LLVM `!HasMultipleAccessingFunctions`.
+                let refs: Vec<_> = scoping.get_resolved_references(sym).collect();
+                if refs.is_empty() {
+                    continue;
+                }
                 let mut owner: Option<NodeId> = None;
-                let mut any = false;
                 let mut ok = true;
-                for r in scoping.get_resolved_references(sym) {
-                    any = true;
+                for r in &refs {
                     match enclosing_function(nodes, r.node_id()) {
                         None => {
                             ok = false; // referenced at module scope → not owned
@@ -831,7 +833,7 @@ impl<'a> Sroa<'a> {
                         },
                     }
                 }
-                if !ok || !any {
+                if !ok {
                     continue;
                 }
                 let owner = owner.unwrap();
@@ -844,10 +846,30 @@ impl<'a> Sroa<'a> {
                 if fn_references_self(&semantic, nodes, owner, func) {
                     continue; // recursive / self-referential → could clobber mid-use
                 }
-                if owner_scope_conflicts(func, id.name.as_str(), &shape) {
+                // v2 alias-following: if the ONLY reference is `const s = _scratch`,
+                // analyze/rewrite the alias `s` (the real member accesses go through
+                // it); else the scratch is used directly. All the per-function gates
+                // then run on `name`, and both the alias decl + module const are
+                // deleted. (~half of crashcat's scratch sites use the alias form.)
+                let (name, aliased) = match refs.as_slice() {
+                    [only] => match single_const_alias(only.node_id(), nodes) {
+                        Some(alias) => (alias, true),
+                        None => (id.name.to_string(), false),
+                    },
+                    _ => (id.name.to_string(), false),
+                };
+                // Expected bindings of `name` in the owner: 0 for a direct scratch
+                // (bound at module scope), 1 for an alias (its own `const name = _s`).
+                if owner_scope_conflicts(func, &name, &shape, u32::from(aliased)) {
                     continue; // nested-scope shadow/capture, or a scalar-name collision
                 }
-                out.push(ModuleScratchCand { name: id.name.to_string(), shape, owner_fn_span: owner_span });
+                out.push(ModuleScratchCand {
+                    name,
+                    module_const: id.name.to_string(),
+                    aliased,
+                    shape,
+                    owner_fn_span: owner_span,
+                });
             }
         }
         out
@@ -997,10 +1019,38 @@ impl<'a> Visit<'a> for EscapeChecker<'_> {
 // ── module scratch: candidate + mutation + killed-on-entry ──────────────────
 
 struct ModuleScratchCand {
+    /// The name to analyze/rewrite/scalarize in the owner. For a DIRECT scratch this
+    /// equals `module_const`. For an ALIASED scratch (`const s = _scratch`) it's the
+    /// local alias `s` — all real member accesses go through it (v2 alias-following).
     name: String,
+    /// The module-level const to delete once scalarized (always the scratch itself).
+    module_const: String,
+    /// True when `name` is a local alias `const name = module_const` (delete that
+    /// alias declarator too).
+    aliased: bool,
     shape: Shape,
     /// `span.start` of the sole owning function (its identity for the mutation walk).
     owner_fn_span: u32,
+}
+
+/// If the reference at `ref_id` is the initializer of a `const <s> = <ref>`
+/// declarator, return the alias name `s`. This is the crashcat local-alias form
+/// (`const rotation = _setMassProperties_rotation;`) — `s` is a second name for the
+/// same buffer, so member accesses through `s` can be scalarized. Requires `const`
+/// (a reassignable alias may not always equal the scratch). The other soundness
+/// gates (member-only, killed-on-entry, no nested capture) then run on `s`.
+fn single_const_alias(ref_id: NodeId, nodes: &oxc_semantic::AstNodes) -> Option<String> {
+    let decl_id = nodes.parent_id(ref_id);
+    let AstKind::VariableDeclarator(d) = nodes.kind(decl_id) else { return None };
+    // The reference must BE the whole init (`= _scratch`), not nested (`= _scratch[0]`).
+    if !matches!(&d.init, Some(Expression::Identifier(_))) {
+        return None;
+    }
+    let BindingPattern::BindingIdentifier(bid) = &d.id else { return None };
+    let AstKind::VariableDeclaration(vd) = nodes.kind(nodes.parent_id(decl_id)) else {
+        return None;
+    };
+    (vd.kind == VariableDeclarationKind::Const).then(|| bid.name.to_string())
 }
 
 /// `vec3` → `Vec3` (capitalize first byte) — the mathcat namespace→type convention.
@@ -1074,28 +1124,36 @@ impl<'a> ScratchMutator<'a, '_> {
         // Gate each candidate on the CURRENT body: all uses are member load/stores
         // (escape) AND killed-on-entry (every read preceded by a write). Both are
         // checked before any rewrite.
-        let passing: Vec<(String, Shape)> = cands
+        let passing: Vec<&ModuleScratchCand> = cands
             .iter()
             .filter(|c| {
                 escape_ok(body, &c.name, &c.shape) && killed_on_entry(body, &c.name, &c.shape)
             })
-            .map(|c| (c.name.clone(), c.shape.clone()))
             .collect();
         if passing.is_empty() {
             return;
         }
-        // Rewrite `_s[i]`/`_s.f` → `_s_i` for every passing scratch.
-        let shapes: HashMap<String, Shape> = passing.iter().cloned().collect();
+        // Rewrite `name[i]`/`name.f` → `name_i` for every passing scratch (`name` is
+        // the alias for the aliased form, else the scratch itself).
+        let shapes: HashMap<String, Shape> =
+            passing.iter().map(|c| (c.name.clone(), c.shape.clone())).collect();
         let mut rw = AccessRewriter { ast: self.ast, shapes: &shapes };
         for stmt in body.iter_mut() {
             rw.visit_statement(stmt);
         }
+        // For an aliased scratch, drop the now-dead `const name = module_const;` decl.
+        for c in &passing {
+            if c.aliased {
+                remove_alias_decl(body, &c.name, &c.module_const);
+            }
+        }
         // Prepend fresh uninitialized scalars (killed-on-entry ⇒ the init value is
         // never observed, so no init call — that is what keeps it allocation-free).
-        for (name, shape) in passing.iter().rev() {
-            let decl = self.uninit_scalar_decl(name, shape);
+        // Mark the MODULE const (not the alias) for program-level deletion.
+        for c in passing.iter().rev() {
+            let decl = self.uninit_scalar_decl(&c.name, &c.shape);
             body.insert(0, decl);
-            self.consumed.insert(name.clone());
+            self.consumed.insert(c.module_const.clone());
             *self.count += 1;
         }
     }
@@ -1125,6 +1183,20 @@ impl<'a> ScratchMutator<'a, '_> {
     }
 }
 
+/// Remove a dead alias declarator `const <alias> = <module_const>;` from `body`
+/// (its accesses have been rewritten to scalars). Strips just that declarator;
+/// drops the statement if it becomes empty.
+fn remove_alias_decl<'a>(body: &mut oxc_allocator::Vec<'a, Statement<'a>>, alias: &str, module_const: &str) {
+    body.retain_mut(|stmt| {
+        let Statement::VariableDeclaration(vd) = stmt else { return true };
+        vd.declarations.retain(|d| {
+            !(matches!(&d.id, BindingPattern::BindingIdentifier(id) if id.name == alias)
+                && matches!(&d.init, Some(Expression::Identifier(i)) if i.name == module_const))
+        });
+        !vd.declarations.is_empty()
+    });
+}
+
 /// v1 straight-line killed-on-entry: over `body`'s TOP-LEVEL statements (post-inline
 /// these scratch chains are flat), every field READ of `name` must be preceded by a
 /// WRITE of that field. Bails (returns false) on anything not provably straight-line
@@ -1132,16 +1204,23 @@ impl<'a> ScratchMutator<'a, '_> {
 /// compound assign to `name`, a nested write, or an unknown suffix. Assumes
 /// `escape_ok` already proved all uses are member accesses.
 fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
+    // The scratch is LIVE from its first write to its last use (read or write). A
+    // re-entrant call outside that window can't affect an observed value, so the
+    // guard only fires inside it (v2: lets trailing non-inlined calls like
+    // `updateAABB()` after the last scratch use through).
+    let last_use = body.iter().rposition(|s| stmt_mentions_name(s, name));
     let mut written: HashSet<String> = HashSet::new();
-    for stmt in body {
-        // Re-entrancy guard: once the scratch holds live values (some field written),
-        // an IMPURE call could transitively re-enter the owner and clobber the shared
-        // buffer — which the per-call scalars would NOT reproduce. So bail on any
-        // non-side-effect-free call/new after the first write. `fn_references_self`
-        // covers direct recursion; this covers the mutual/indirect case. Pure builtins
-        // (`Math.*`) can't re-enter, so they don't trip it; post-inline scratch chains
-        // are call-free, so this is free for the target pattern.
-        if !written.is_empty() && stmt_has_reentrant_call(stmt) {
+    for (i, stmt) in body.iter().enumerate() {
+        // Re-entrancy guard: once the scratch holds live values (some field written)
+        // AND we're still within its live window, an IMPURE call could transitively
+        // re-enter the owner and clobber the shared buffer — which the per-call
+        // scalars would NOT reproduce. So bail on any non-side-effect-free call/new.
+        // `fn_references_self` covers direct recursion; this covers mutual/indirect.
+        // Pure builtins (`Math.*`) can't re-enter, so they don't trip it.
+        if !written.is_empty()
+            && last_use.is_some_and(|l| i <= l)
+            && stmt_has_reentrant_call(stmt)
+        {
             return false;
         }
         // Simple write `name[i] = RHS` (only field-writes take this form).
@@ -1197,24 +1276,27 @@ fn killed_on_entry(body: &[Statement], name: &str, shape: &Shape) -> bool {
 /// itself reads external object members between scratch writes, so guarding this
 /// would disable the optimization on its own use case. Same accepted unsoundness the
 /// rest of the optimizer runs under.
-fn owner_scope_conflicts(func: &Function, name: &str, shape: &Shape) -> bool {
+fn owner_scope_conflicts(func: &Function, name: &str, shape: &Shape, allowed_bindings: u32) -> bool {
     let scalars: HashSet<String> = shape.suffixes().iter().map(|s| format!("{name}_{s}")).collect();
-    let mut c = ScratchSafetyChecker { name, scalars: &scalars, fn_depth: 0, conflict: false };
+    let mut c =
+        ScratchSafetyChecker { name, scalars: &scalars, fn_depth: 0, name_bindings: 0, conflict: false };
     if let Some(body) = &func.body {
         for stmt in &body.statements {
             c.visit_statement(stmt);
-            if c.conflict {
-                return true;
-            }
         }
     }
-    c.conflict
+    // A re-binding of `name` beyond the one expected decl (0 for a direct scratch, 1
+    // for the alias's own `const name = _s`) is a SHADOW — a distinct variable whose
+    // `name[i]` the name-based rewriter would hijack. Adversarial review found this
+    // for block scopes (`if (c) { const v = q; … }`), which `fn_depth` misses.
+    c.conflict || c.name_bindings > allowed_bindings
 }
 
 struct ScratchSafetyChecker<'s> {
     name: &'s str,
     scalars: &'s HashSet<String>,
     fn_depth: u32,
+    name_bindings: u32,
     conflict: bool,
 }
 
@@ -1233,12 +1315,37 @@ impl<'a> Visit<'a> for ScratchSafetyChecker<'_> {
         if self.scalars.contains(id.name.as_str()) {
             self.conflict = true; // (C) collision with a generated scalar name
         }
+        if id.name == self.name {
+            self.name_bindings += 1; // (B) a binding of the scratch/alias name (shadow if extra)
+        }
     }
     fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
         if self.scalars.contains(id.name.as_str())
             || (self.fn_depth > 0 && id.name == self.name)
         {
-            self.conflict = true; // (C) scalar collision, or (B) name used in a nested fn
+            self.conflict = true; // (C) scalar collision, or (B) name captured in a nested fn
+        }
+    }
+}
+
+/// True if `stmt` references `name` at all (any read or write of a field — after
+/// `escape_ok`, every use of `name` is a member access). Used to bound the scratch's
+/// live window for the re-entrancy guard.
+fn stmt_mentions_name(stmt: &Statement, name: &str) -> bool {
+    let mut v = NameMention { name, found: false };
+    v.visit_statement(stmt);
+    v.found
+}
+
+struct NameMention<'s> {
+    name: &'s str,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for NameMention<'_> {
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if id.name == self.name {
+            self.found = true;
         }
     }
 }
@@ -1256,17 +1363,23 @@ struct ReentrantCallFinder {
 }
 
 impl<'a> Visit<'a> for ReentrantCallFinder {
-    fn visit_expression(&mut self, e: &Expression<'a>) {
-        if self.found {
-            return;
-        }
-        if matches!(e, Expression::CallExpression(_) | Expression::NewExpression(_))
-            && !is_side_effect_free(e)
-        {
+    // Override the invocation NODES directly (not `visit_expression`) so wrapped
+    // forms are caught too: an optional call `f?.()` is a `CallExpression` inside a
+    // `ChainExpression` (reached via `visit_call_expression`, never `visit_expression`),
+    // and a tagged template `` tag`` `` / `new` are separate node kinds entirely.
+    // Adversarial review found both slipping past the old `matches!` on `visit_expression`.
+    fn visit_call_expression(&mut self, c: &CallExpression<'a>) {
+        if !crate::passes::util::call_is_side_effect_free(c) {
             self.found = true;
             return;
         }
-        walk::walk_expression(self, e);
+        walk::walk_call_expression(self, c); // a pure call's args may hold impure ones
+    }
+    fn visit_new_expression(&mut self, _n: &NewExpression<'a>) {
+        self.found = true; // a constructor call can run arbitrary user code
+    }
+    fn visit_tagged_template_expression(&mut self, _t: &TaggedTemplateExpression<'a>) {
+        self.found = true; // invokes the tag function
     }
 }
 
@@ -2051,6 +2164,61 @@ mod tests {
         ));
         assert!(out.contains("const _s = ["), "module const preserved:\n{out}");
         assert!(!out.contains("_s_0"), "not scalarized:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_local_alias_scalarized() {
+        // v2 alias-following: `const s = _scratch; …s[i]…` scalarizes `s`; BOTH the
+        // alias decl and the module const are deleted.
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ const s = _s; add3(s,a,b); add3(out,s,a); return out; }}"
+        ));
+        assert!(out.contains("s_0") && out.contains("s_1") && out.contains("s_2"), "alias scalarized:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+        assert!(!out.contains("const s = _s"), "alias decl deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_trailing_impure_call_scalarized() {
+        // v2 window: an impure call AFTER the scratch's last use can't clobber it →
+        // scalarizes (the pre-v2 guard bailed on any impure call after first write).
+        let out = inline_then_sroa(&format!(
+            "{ADD3}const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function foo(out, a, b) {{ add3(_s,a,b); add3(out,_s,a); ext(); return out; }}"
+        ));
+        assert!(out.contains("_s_0"), "scalarized despite trailing call:\n{out}");
+        assert!(!out.contains("const _s"), "module const deleted:\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_block_scope_shadow_bailed() {
+        // Adversarial review (v2): a block-scoped `const v = q` shadow of the alias
+        // name is a DISTINCT variable — the name-based rewriter must not hijack its
+        // `v[0]`. `fn_depth` missed block scopes; the re-binding count catches it.
+        let out = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0,0];\n\
+             /* @optimize */ export function f(p, q, c) { const v = _s; v[0]=p; v[1]=p; v[2]=p; \
+             let out = v[0]+v[1]+v[2]; if (c) { const v = q; out += v[0]; } return out; }",
+        );
+        assert!(out.contains("const _s"), "module const preserved (shadow):\n{out}");
+        assert!(!out.contains("v_0"), "not scalarized (shadow):\n{out}");
+    }
+
+    #[test]
+    fn module_scratch_wrapped_reentrant_call_bailed() {
+        // Adversarial review (v2): a tagged template / optional call re-enters the
+        // owner but isn't a `CallExpression` node — the guard must still fire.
+        let tagged = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function owner(x, tag) { _s[0]=x; tag``; return _s[0]; }",
+        );
+        assert!(!tagged.contains("_s_0"), "tagged-template re-entry not scalarized:\n{tagged}");
+        let optional = inline_then_sroa(
+            "const _s = /*@__PURE__*/ [0,0];\n\
+             /* @optimize */ export function owner(x, f) { _s[0]=x; f?.(); return _s[0]; }",
+        );
+        assert!(!optional.contains("_s_0"), "optional-call re-entry not scalarized:\n{optional}");
     }
 
     #[test]
