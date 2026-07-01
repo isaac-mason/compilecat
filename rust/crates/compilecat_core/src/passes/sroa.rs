@@ -990,6 +990,39 @@ fn is_member_of(e: &Expression, name: &str) -> bool {
     }
 }
 
+/// True if `e` is exactly the identifier `name` (a member-access object).
+fn member_obj_is(e: &Expression, name: &str) -> bool {
+    matches!(e, Expression::Identifier(o) if o.name == name)
+}
+
+// ── the single member-access classifier ─────────────────────────────────────
+// THE one source of truth for "is this a valid, REWRITABLE member access of `name`
+// for `shape`?" → the field suffix, else None. EVERY analysis (escape, read-collect,
+// write-target) AND the rewriter consult these, so they cannot drift — a form the
+// analysis accepts but the rewriter can't handle leaves a dangling reference (the
+// `delete` and `v?.[i]` optional-chain miscompiles were exactly that drift). Rejects
+// a different object, an OPTIONAL access (`v?.[i]`/`v?.f` — parses wrapped in a
+// `ChainExpression` the rewriter won't descend into), a dynamic/out-of-range tuple
+// index, and a wrong-shape access.
+
+fn computed_member_suffix(m: &ComputedMemberExpression, name: &str, shape: &Shape) -> Option<String> {
+    if !member_obj_is(&m.object, name) || m.optional {
+        return None;
+    }
+    let (Shape::Tuple(size), Expression::NumericLiteral(lit)) = (shape, &m.expression) else {
+        return None;
+    };
+    valid_index(lit.value, *size).then(|| (lit.value as usize).to_string())
+}
+
+fn static_member_suffix(m: &StaticMemberExpression, name: &str, shape: &Shape) -> Option<String> {
+    if !member_obj_is(&m.object, name) || m.optional {
+        return None;
+    }
+    let Shape::Object(fields) = shape else { return None };
+    fields.iter().any(|f| f == m.property.name.as_str()).then(|| m.property.name.to_string())
+}
+
 fn escape_ok(body: &[Statement], name: &str, shape: &Shape) -> bool {
     let mut c = EscapeChecker { name, shape, bad: false };
     for stmt in body {
@@ -1006,48 +1039,23 @@ struct EscapeChecker<'s> {
 
 impl<'a> Visit<'a> for EscapeChecker<'_> {
     fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
-        if let Expression::Identifier(obj) = &m.object {
-            if obj.name == self.name {
-                // `v?.[i]` — an OPTIONAL member access parses as this node wrapped in a
-                // `ChainExpression`, which `AccessRewriter` doesn't descend into, so it
-                // would be left dangling on the deleted binding. The analysis and the
-                // rewriter must agree, so bail. (Adversarial review.)
-                if m.optional {
-                    self.bad = true;
-                    return;
-                }
-                if let (Shape::Tuple(size), Expression::NumericLiteral(lit)) =
-                    (self.shape, &m.expression)
-                {
-                    if valid_index(lit.value, *size) {
-                        // Valid `v[<lit>]` — only audit the index expression,
-                        // not the (accounted-for) object identifier.
-                        self.visit_expression(&m.expression);
-                        return;
-                    }
-                }
-                self.bad = true; // dynamic/out-of-range index, or a record indexed
-                return;
+        if member_obj_is(&m.object, self.name) {
+            if computed_member_suffix(m, self.name, self.shape).is_some() {
+                self.visit_expression(&m.expression); // valid — audit only the index
+            } else {
+                self.bad = true; // `name` in a non-rewritable access (optional/dynamic/wrong-shape)
             }
+            return;
         }
         walk::walk_computed_member_expression(self, m);
     }
 
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
-        if let Expression::Identifier(obj) = &m.object {
-            if obj.name == self.name {
-                if m.optional {
-                    self.bad = true; // `v?.f` — see the computed case above.
-                    return;
-                }
-                if let Shape::Object(fields) = self.shape {
-                    if fields.iter().any(|f| f == m.property.name.as_str()) {
-                        return; // valid `v.field` — accounted for
-                    }
-                }
-                self.bad = true; // unknown field, or a tuple accessed by property
-                return;
+        if member_obj_is(&m.object, self.name) {
+            if static_member_suffix(m, self.name, self.shape).is_none() {
+                self.bad = true; // optional / unknown field / tuple-by-property
             }
+            return;
         }
         walk::walk_static_member_expression(self, m);
     }
@@ -1561,27 +1569,8 @@ impl<'a> Visit<'a> for ReentrantCallFinder {
 /// range for `shape`, else None.
 fn assign_target_suffix(t: &AssignmentTarget, name: &str, shape: &Shape) -> Option<String> {
     match t {
-        AssignmentTarget::ComputedMemberExpression(m) => {
-            let Expression::Identifier(obj) = &m.object else { return None };
-            if obj.name != name {
-                return None;
-            }
-            let (Shape::Tuple(size), Expression::NumericLiteral(lit)) = (shape, &m.expression) else {
-                return None;
-            };
-            valid_index(lit.value, *size).then(|| (lit.value as usize).to_string())
-        }
-        AssignmentTarget::StaticMemberExpression(m) => {
-            let Expression::Identifier(obj) = &m.object else { return None };
-            if obj.name != name {
-                return None;
-            }
-            let Shape::Object(fields) = shape else { return None };
-            fields
-                .iter()
-                .any(|f| f == m.property.name.as_str())
-                .then(|| m.property.name.to_string())
-        }
+        AssignmentTarget::ComputedMemberExpression(m) => computed_member_suffix(m, name, shape),
+        AssignmentTarget::StaticMemberExpression(m) => static_member_suffix(m, name, shape),
         _ => None,
     }
 }
@@ -1610,36 +1599,26 @@ struct ReadCollector<'s> {
 
 impl<'a> Visit<'a> for ReadCollector<'_> {
     fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
-        if let Expression::Identifier(obj) = &m.object {
-            if obj.name == self.name {
-                if let (Shape::Tuple(size), Expression::NumericLiteral(lit)) =
-                    (self.shape, &m.expression)
-                {
-                    if valid_index(lit.value, *size) {
-                        self.reads.push((lit.value as usize).to_string());
-                        self.visit_expression(&m.expression);
-                        return;
-                    }
+        if member_obj_is(&m.object, self.name) {
+            match computed_member_suffix(m, self.name, self.shape) {
+                Some(s) => {
+                    self.reads.push(s);
+                    self.visit_expression(&m.expression); // audit only the index
                 }
-                self.bad = true;
-                return;
+                None => self.bad = true,
             }
+            return;
         }
         walk::walk_computed_member_expression(self, m);
     }
 
     fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
-        if let Expression::Identifier(obj) = &m.object {
-            if obj.name == self.name {
-                if let Shape::Object(fields) = self.shape {
-                    if fields.iter().any(|f| f == m.property.name.as_str()) {
-                        self.reads.push(m.property.name.to_string());
-                        return;
-                    }
-                }
-                self.bad = true;
-                return;
+        if member_obj_is(&m.object, self.name) {
+            match static_member_suffix(m, self.name, self.shape) {
+                Some(s) => self.reads.push(s),
+                None => self.bad = true,
             }
+            return;
         }
         walk::walk_static_member_expression(self, m);
     }
@@ -1668,25 +1647,21 @@ struct AccessRewriter<'a, 's> {
 }
 
 impl<'a> AccessRewriter<'a, '_> {
-    /// `v[<lit>]` → `v_<lit>` when `v` is a tuple shape and the index is in range.
-    fn tuple_scalar(&self, object: &Expression<'a>, index: &Expression<'a>) -> Option<&'a str> {
-        let Expression::Identifier(obj) = object else { return None };
-        let Some(Shape::Tuple(size)) = self.shapes.get(obj.name.as_str()) else { return None };
-        let Expression::NumericLiteral(lit) = index else { return None };
-        if !valid_index(lit.value, *size) {
-            return None;
-        }
-        Some(self.ast.allocator.alloc_str(&format!("{}_{}", obj.name, lit.value as usize)))
+    /// The scalar name `{obj}_{suffix}` for `obj[i]`/`obj.f` when `obj` is a tracked
+    /// candidate and the access is valid+rewritable — via the SHARED classifier, so
+    /// the rewrite matches exactly what the analysis accounted for.
+    fn scalar_computed(&self, m: &ComputedMemberExpression<'a>) -> Option<&'a str> {
+        let Expression::Identifier(obj) = &m.object else { return None };
+        let shape = self.shapes.get(obj.name.as_str())?;
+        let suffix = computed_member_suffix(m, obj.name.as_str(), shape)?;
+        Some(self.ast.allocator.alloc_str(&format!("{}_{}", obj.name, suffix)))
     }
 
-    /// `v.field` → `v_field` when `v` is a record shape with that field.
-    fn object_scalar(&self, object: &Expression<'a>, field: &str) -> Option<&'a str> {
-        let Expression::Identifier(obj) = object else { return None };
-        let Some(Shape::Object(fields)) = self.shapes.get(obj.name.as_str()) else { return None };
-        if !fields.iter().any(|f| f == field) {
-            return None;
-        }
-        Some(self.ast.allocator.alloc_str(&format!("{}_{}", obj.name, field)))
+    fn scalar_static(&self, m: &StaticMemberExpression<'a>) -> Option<&'a str> {
+        let Expression::Identifier(obj) = &m.object else { return None };
+        let shape = self.shapes.get(obj.name.as_str())?;
+        let suffix = static_member_suffix(m, obj.name.as_str(), shape)?;
+        Some(self.ast.allocator.alloc_str(&format!("{}_{}", obj.name, suffix)))
     }
 }
 
@@ -1694,13 +1669,13 @@ impl<'a> VisitMut<'a> for AccessRewriter<'a, '_> {
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         match &*expr {
             Expression::ComputedMemberExpression(m) => {
-                if let Some(name) = self.tuple_scalar(&m.object, &m.expression) {
+                if let Some(name) = self.scalar_computed(m) {
                     *expr = self.ast.expression_identifier(SPAN, name);
                     return;
                 }
             }
             Expression::StaticMemberExpression(m) => {
-                if let Some(name) = self.object_scalar(&m.object, m.property.name.as_str()) {
+                if let Some(name) = self.scalar_static(m) {
                     *expr = self.ast.expression_identifier(SPAN, name);
                     return;
                 }
@@ -1713,14 +1688,14 @@ impl<'a> VisitMut<'a> for AccessRewriter<'a, '_> {
     fn visit_simple_assignment_target(&mut self, target: &mut SimpleAssignmentTarget<'a>) {
         match &*target {
             SimpleAssignmentTarget::ComputedMemberExpression(m) => {
-                if let Some(name) = self.tuple_scalar(&m.object, &m.expression) {
+                if let Some(name) = self.scalar_computed(m) {
                     *target =
                         self.ast.simple_assignment_target_assignment_target_identifier(SPAN, name);
                     return;
                 }
             }
             SimpleAssignmentTarget::StaticMemberExpression(m) => {
-                if let Some(name) = self.object_scalar(&m.object, m.property.name.as_str()) {
+                if let Some(name) = self.scalar_static(m) {
                     *target =
                         self.ast.simple_assignment_target_assignment_target_identifier(SPAN, name);
                     return;
