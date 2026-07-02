@@ -12,7 +12,10 @@
     "resolveJsonModule": true,
     "noEmit": true,
     "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": false
+    "verbatimModuleSyntax": false,
+    "paths": {
+      "@compilecat/wasm": ["../rust/crates/compilecat_wasm/pkg"]
+    }
   },
   "include": ["src"]
 }

@@ -31,7 +31,7 @@ jobs:
         run: pnpm run build
 
       - name: Run tests
-        run: pnpm test -- --run
+        run: pnpm test    # cargo (test:rust) + vitest (test:js)
 
       - name: Build website
         run: pnpm --filter website run build

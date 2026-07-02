@@ -1,0 +1,19 @@
+{
+  "name": "@compilecat/core-linux-arm64-gnu",
+  "version": "0.0.4",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "compilecat.linux-arm64-gnu.node",
+  "files": [
+    "compilecat.linux-arm64-gnu.node"
+  ],
+  "description": "Rust/oxc core for compilecat, exposed as a napi addon. Build tool only — not published; its loader is folded into `compilecat` and its binaries ship as @compilecat/core-<triple> platform packages.",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}

@@ -1,0 +1,7 @@
+# Locks the codebase's compact style so `cargo fmt --check` is stable across
+# rustfmt versions (the tree previously drifted with no config).
+# `use_small_heuristics = "Max"` keeps struct literals, call chains, `let-else`,
+# and short `if/else` on one line up to `max_width`, matching how the code is
+# written.
+max_width = 100
+use_small_heuristics = "Max"

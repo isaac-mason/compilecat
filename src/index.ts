@@ -1,6 +1,3 @@
-export { compilecat, type Options } from './plugin';
-export { compilecat as default } from './plugin';
+// compilecat — an optimizing compiler (Rust/oxc) exposed as a bundler plugin.
 
-export { transform, type TransformOptions, type TransformResult } from './compiler/pipeline';
-export { inlineFunctions, type InlineResult } from './compiler/inline-functions';
-export { simplifyAll, simplifyFunction, type SimplifyStats } from './compiler/simplifier';
+export { compilecat, compilecat as default, type Options, type FilterPattern } from './plugin';

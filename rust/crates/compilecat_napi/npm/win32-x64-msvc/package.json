@@ -1,0 +1,16 @@
+{
+  "name": "@compilecat/core-win32-x64-msvc",
+  "version": "0.0.4",
+  "cpu": [
+    "x64"
+  ],
+  "main": "compilecat.win32-x64-msvc.node",
+  "files": [
+    "compilecat.win32-x64-msvc.node"
+  ],
+  "description": "Rust/oxc core for compilecat, exposed as a napi addon. Build tool only — not published; its loader is folded into `compilecat` and its binaries ship as @compilecat/core-<triple> platform packages.",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ]
+}

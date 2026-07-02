@@ -7,17 +7,18 @@ const external = [
 	'node:fs',
 	'node:crypto',
 	'node:path',
+	'node:module',
 	'tty',
 	'util',
 	'os',
-	'@babel/generator',
-	'@babel/parser',
-	'@babel/traverse',
-	'@babel/types',
 	'rollup',
+	// wasm core: the published `@compilecat/wasm` binary package (an optional dep
+	// of `compilecat`); never bundled into the wrapper. In-repo dev resolves it
+	// via the website's vite alias to the local wasm-pack `pkg/`.
+	'@compilecat/wasm',
 ];
 
-const entries = ['index', 'vite', 'rollup', 'rolldown'];
+const entries = ['index', 'vite', 'rollup', 'rolldown', 'plugin', 'wasm'];
 
 export default entries.map((entry) => ({
 	input: `./src/${entry}.ts`,

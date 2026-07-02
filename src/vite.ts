@@ -1,23 +1,16 @@
-// Vite adapter. Returns two plugin instances gated by Vite's `apply`:
-//
-//   - per-file transform during `vite dev` (apply: 'serve')
-//   - whole-program renderChunk during `vite build` (apply: 'build')
-//
-// Mutually exclusive — exactly one fires per Vite command, so the same code
-// never goes through both passes.
+// Vite adapter. compilecat has a single per-file `transform` pass (valid in both
+// `vite dev` and `vite build`), so the adapter is just the plugin — no
+// serve/build split needed.
 
 import type { Plugin } from 'vite';
 
-import { type PerFileOptions, compilecat, compilecatPerFile } from './plugin';
+import { compilecat, type Options } from './plugin';
 
-export type Options = PerFileOptions;
+export type { Options };
 
-export function compilecatVite(options: Options): Plugin[] {
-    return [
-        { ...compilecatPerFile(options), apply: 'serve' },
-        { ...compilecat(options), apply: 'build' },
-    ] as Plugin[];
+export function compilecatVite(options: Options): Plugin {
+    return compilecat(options) as Plugin;
 }
 
-export { compilecatPerFile, compilecat };
+export { compilecat };
 export default compilecatVite;

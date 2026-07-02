@@ -1,3 +1,7 @@
 node_modules
-example/dist
 llm
+
+# Built output (compilecat dist, website/dist, example/dist) — not committed.
+# Shipped to npm by `pnpm release` via the package.json `files` field; local dev
+# consumes it on-disk through the link override.
+dist/

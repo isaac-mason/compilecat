@@ -1,0 +1,23 @@
+{
+  "name": "@compilecat/core-wasm32-wasi",
+  "version": "0.0.4",
+  "main": "compilecat.wasi.cjs",
+  "files": [
+    "compilecat.wasm32-wasi.wasm",
+    "compilecat.wasi.cjs",
+    "compilecat.wasi-browser.js",
+    "wasi-worker.mjs",
+    "wasi-worker-browser.mjs"
+  ],
+  "description": "WebAssembly (WASI) build of compilecat's Rust/oxc core — the universal fallback the loader uses on platforms without a native binary. No os/cpu filter, so it installs everywhere.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "browser": "compilecat.wasi-browser.js",
+  "dependencies": {
+    "@napi-rs/wasm-runtime": "^1.1.5",
+    "@emnapi/core": "1.11.1",
+    "@emnapi/runtime": "1.11.1"
+  }
+}
