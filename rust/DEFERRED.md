@@ -95,6 +95,22 @@ correct. Each is pinned by an `intentional_*` cargo test (or a `preserves_*` /
   flag). Pinned: `dead_code::intentional_keeps_member_access_statement`.
 - **Object/typed SROA in nested blocks** is a NEW *superset* (Babel has no object
   SROA at all) — not a divergence to "fix", a capability OLD lacked.
+- **Module-scratch localization** is a NEW capability with no Babel analogue:
+  LLVM-GlobalOpt-style global-localization *fused into SROA* (`sroa.rs`). A
+  single-owner module-level scratch buffer
+  (`const _s = /*@__PURE__*/ [0,0,0]`) used as per-call temporary storage inside
+  one `@optimize` function is scalarized into per-call locals and the module const
+  deleted. Gated by a CFG must-reaching-defs analysis (killed-on-entry), a symbol
+  gate, and a re-entrancy guard, so it never fires when the buffer's state could be
+  observed across calls. Fused so the buffer is never materialized as a per-call
+  allocation. Pinned by `sroa::tests` + `tst/real-world.test.ts`.
+- **Function purity analysis + `@pure`** is a NEW capability (port of Closure's
+  `PureFunctionIdentifier`, `analysis/purity.rs`). A reverse call-graph fixpoint
+  proves side-effect-free functions; `stamp_pure_calls` (`passes/mod.rs:74`) marks
+  their calls `pure` before inline, so surviving pure calls can be dropped /
+  reordered / substituted and codegen emits `/*@__PURE__*/` for the bundler.
+  `@pure` and `/*@__PURE__*/` are developer-assertion overrides layered on top.
+  Soundness pinned by the effect-trace fuzzer + `purity::tests`.
 
 ---
 
@@ -136,27 +152,26 @@ stripDirectiveComments · generate`.
   compiler-generated residue (`span.start==0` marker). sroa-tuple → `return 5`;
   user code untouched; 4/4 whole-program green. Original notes kept below for
   the deferred generalizations:
-- [~] **CFG/dataflow trio — re-scoped as "readability cleanup", DONE for the
-  straight-line/literal common case (above). Remaining generalizations deferred:
-  Purpose is to clean up the residue *our own* passes create (sroa expands
-  arrays into `v_0`/`v_1` scalars + reassignments; BLOCK-mode inline adds temps),
-  so the **intermediate TS output stays clean and readable** (an explicit goal,
-  independent of the downstream bundler). NOT minification, NOT Babel-parity.
-  Rule: clean compiler-generated residue, leave the user's `let`/`const` +
-  structure intact. Scope insight: that residue is mostly **straight-line**, so a
-  simple straight-line reaching-defs/liveness likely suffices — build that first,
-  generalize to branches only if real pass output needs it. Gate = **semantic
-  equivalence + clean output**, not byte-parity with Babel.
-  - [ ] `flow-sensitive-inline-variables.ts` (674) — needs reaching-defs
-  - [ ] `live-variables-analysis.ts` (290)
-  - [ ] `dead-assignments-elimination.ts` (489)
-  - supporting infra (port into a new `analysis/` module): `control-flow-graph.ts`
-    → `analysis/cfg.rs`, `data-flow-analysis.ts` → `analysis/data_flow.rs`,
-    `local-variable-table.ts` → `analysis/local_var_table.rs`; plus
-    `must-be-reaching-variable-def.ts`, `maybe-reaching-variable-use.ts`.
-  - **Decision: port compilecat's own per-node CFG, NOT `oxc_cfg`** (basic-block,
-    impedance mismatch; parity needs the exact GEN/KILL/JOIN). See WORKLOG.
-  - Flips the last whole-program red (`sroa-tuple`) green.
+- [x] **CFG/dataflow trio — DONE (full branch-aware framework, not just the
+  straight-line case).** The original re-scope shipped straight-line readability
+  cleanup via `cleanup_residue.rs`; the full per-node CFG + dataflow tier is now
+  ported and wired into the fixpoint (`passes/mod.rs:129-133`). Purpose is still to
+  clean up the residue *our own* passes create (sroa expands arrays into
+  `v_0`/`v_1` scalars + reassignments; BLOCK-mode inline adds temps), keeping the
+  **intermediate TS output clean and readable**. Gate = **semantic equivalence +
+  clean output**, not byte-parity with Babel.
+  - [x] `flow-sensitive-inline-variables` → `passes/flow_inline.rs` (reaching-defs)
+  - [x] `live-variables-analysis` → `analysis/live_vars.rs`
+  - [x] `dead-assignments-elimination` → `passes/dead_assignments.rs`
+  - [x] supporting infra (in the `analysis/` module): `control-flow-graph` →
+    `analysis/cfg.rs`, `data-flow-analysis` → `analysis/data_flow.rs`,
+    `local-variable-table` → `analysis/local_var_table.rs`;
+    `must-be-reaching-variable-def` + `maybe-reaching-variable-use` →
+    `analysis/reaching.rs`.
+  - **Decision (kept): compilecat's own per-node CFG, NOT `oxc_cfg`** (basic-block,
+    impedance mismatch; parity needs the exact GEN/KILL/JOIN). CFG nodes are keyed
+    by `Address`/`NodeId`, never `Span` (generated nodes share `SPAN(0,0)`). See WORKLOG.
+  - Flipped the last whole-program red (`sroa-tuple`) green.
 - [~] **Cross-file / PerFile mode ✓** — `cross_file.rs` + `compileFileCross` +
   `src/native-plugin.ts` (transform-hook, resolve+read donors, `addWatchFile`).
   Cross-module `@inline` inlining works end-to-end (real rollup build).
@@ -219,6 +234,10 @@ These block real exported/aggregate code and are small — surfaced by running t
   → `undefined` via oxc `ChainExpression`, non-nullish base left intact).
   *object/array literal operands* remains deferred (OLD never folded these either
   — its own header lists them under "Not covered").
+- [x] **fold — type-gated numeric-identity folds ✓** (`fold.rs`): `x+0`, `x*1`,
+  `x-0`, `x/1` etc. collapse **only** when compilecat's type inference proves the
+  operand is a `number` (a `numeric` symbol set threaded into the fold), never on
+  a possibly-string/bigint operand where the identity wouldn't hold. Cargo-tested.
 - [ ] **strip-directives** — mixed-comment rewriting (`/* @inline foo */` →
   `/* foo */`); only marker-only comments are removed today (oxc spans are
   immutable, can't repoint at new text).

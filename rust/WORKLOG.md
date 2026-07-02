@@ -94,15 +94,18 @@ per-pass sub-features) — keep it in sync as deferrals are cleared.
   SROA still fires through it. 6 unit tests (collision, param clash, nested
   shadow, closure capture, control-flow kept).
 
-- **CFG/dataflow framework port — in progress** (2026-06-16, toward full Babel
-  parity). Bottom-up: `analysis/tri.rs` (3-valued logic), `analysis/cfg.rs`
+- **CFG/dataflow framework port — DONE** (2026-06-16 → 2026-06-24, full Babel
+  parity tier). Bottom-up: `analysis/tri.rs` (3-valued logic), `analysis/cfg.rs`
   (per-AST-node CFG over the existing `DiGraph`), `analysis/data_flow.rs` (generic
-  forward/backward worklist fixpoint) — **done, 21 tests** ported from OLD's
-  `cfg.test.ts` + `dataflow.test.ts`. Key oxc-specific decisions:
-  - **CFG nodes keyed by `Span`**, value = borrowed `AstKind<'a>`. The CFG is
-    short-lived (build → analyze → apply → drop before mutation), so borrows are
-    fine. `AstKind<'a>` is collected via `Visit::enter_node` (which yields the
-    *arena* lifetime, unlike `visit_xxx`'s short borrows — the crucial trick).
+  forward/backward worklist fixpoint) — ported from OLD's `cfg.test.ts` +
+  `dataflow.test.ts`. Key oxc-specific decisions:
+  - **CFG nodes keyed by node identity (`NodeId`/arena address), NEVER `Span`.**
+    Compiler-generated nodes all carry `SPAN(0,0)`, so span would collide across
+    every synthesized node (the same lesson inline-variables learned — see
+    "node_id keying" below). Value = borrowed `AstKind<'a>`; the CFG is short-lived
+    (build → analyze → apply → drop before mutation), so the borrow is fine.
+    `AstKind<'a>` is collected via `Visit::enter_node` (which yields the *arena*
+    lifetime, unlike `visit_xxx`'s short borrows — the crucial trick).
   - **Callers obtain the root `AstKind<'a>` by allocating the parsed `Program`
     into the arena** (`allocator.alloc(parse_program(..))`) so sub-node refs are
     `'a`; or, in the pipeline, from `semantic.nodes().kind(id)`.
@@ -111,9 +114,11 @@ per-pass sub-features) — keep it in sync as deferrals are cleared.
   - Nested functions are skipped by overriding `visit_function`/`_arrow` to only
     `walk_*` when `span == root_span` (skipping the walk skips `enter_node`, so
     nested-fn internals never become CFG nodes).
-  Remaining Phase-1: `local_var_table` (on `oxc_semantic` SymbolIds, not Babel
-  scope), `reaching` (must-def + maybe-use), `live_vars`. Then the two passes
-  (flow-sensitive-inline, dead-assignments) + `simplify()` wiring.
+  Phase-1 is complete: `analysis/local_var_table.rs` (on `oxc_semantic` SymbolIds,
+  not Babel scope), `analysis/reaching.rs` (must-def + maybe-use), and
+  `analysis/live_vars.rs` all exist, and the two consumer passes
+  (`passes/flow_inline.rs`, `passes/dead_assignments.rs`) are wired into the
+  simplify fixpoint (`passes/mod.rs:129-133`, skipped when nothing is opted in).
 
 - **Per-construct opt-in gate — worklist #4, DONE incl. scope-level** (2026-06-16).
   OLD optimizes only opted-in (directive/inline-modified) functions; NEW used to
@@ -408,11 +413,11 @@ inline. Alias inline (path 3) deferred.
       `control-flow-analysis.ts` (665) + `data-flow-analysis.ts` (225) +
       `local-variable-table.ts` (200) + reaching def/use (679) + the 3 passes
       (1,453) + graph lib. ~⅓ of the whole compiler; most correctness-critical.
-- [ ] `analysis/cfg.rs`           ← `control-flow-analysis.ts` (the builder, 665).
-      Key Rust choice: key CFG nodes by AST-node **pointer address**
-      (`*const _ as usize`) to replicate JS object-identity for arena nodes.
-- [ ] `analysis/data_flow.rs`     ← `data-flow-analysis.ts` (lattice + fixpoint)
-- [ ] `analysis/local_var_table.rs` ← `local-variable-table.ts` (binding-slot space).
+- [x] `analysis/cfg.rs`           ← `control-flow-analysis.ts` (the builder, 665).
+      Key Rust choice: key CFG nodes by node identity (`NodeId`/arena address),
+      NOT `Span` — generated nodes share `SPAN(0,0)`, so span collides.
+- [x] `analysis/data_flow.rs`     ← `data-flow-analysis.ts` (lattice + fixpoint)
+- [x] `analysis/local_var_table.rs` ← `local-variable-table.ts` (binding-slot space).
       **oxc recipe (verified):** per function F (its `Function.scope_id`),
       enumerate `scoping.symbol_ids()`; a symbol is F-local iff walking
       `scope_parent_id` up from `symbol_scope_id(sym)`, the first scope with
@@ -424,12 +429,18 @@ inline. Alias inline (path 3) deferred.
       (slot counts, resolve, escape) before the CFG rides on it. Note: its
       interface is somewhat coupled to how the dataflow passes share `Semantic`
       (build once, reuse per function) — design alongside the first consumer.
-- [ ] passes: `live_variables`, `dead_assignments`, `flow_sensitive_inline`
+- [x] passes: `live_variables`, `dead_assignments`, `flow_sensitive_inline`
       (+ `must-be-reaching-variable-def`, `maybe-reaching-variable-use`).
 
 Build infra first, then the three passes. The analyze-then-mutate pattern from
 inline-variables applies (build CFG + run analysis over the function body,
 collect edits, apply via span-keyed VisitMut). Flips `sroa-tuple` green.
+
+**ALL DONE (2026-06-24).** The whole trio landed: `analysis/{cfg,data_flow,
+local_var_table,reaching,live_vars}.rs` + `passes/{flow_inline,dead_assignments}.rs`,
+wired into the simplify fixpoint (`passes/mod.rs:129-133`, gated — skipped when
+nothing is opted in so semantic isn't rebuilt for no-op work). Node keying went
+to `NodeId`/address, not pointer/`Span`, as the sub-item above records.
 
 ### (superseded) flow-sensitive simplify passes
 Only remaining whole-program red is `sroa-tuple`: after sroa + inline-variables
@@ -713,11 +724,16 @@ call-site `/* @inline */`, `@flatten`.
 
 ### Inlining gate — α-rename ✓ (gate #4)
 When an arg references a param name (`scale(v, k)` called inside `f(v, k)`), the
-param is renamed `p__<id>` in the cloned body + the prologue instead of bailing —
-so the `let p__id = arg` prologue reads the caller's binding soundly. `make_plan`
-collects arg identifier names, renames colliding params (sharing the inline's id
-suffix), and a `Renamer` VisitMut rewrites the cloned body. 7 inline unit tests.
-88 core / 294 main / 120 parity, clippy clean.
+param is renamed in the cloned body + the prologue instead of bailing — so the
+`let <fresh> = arg` prologue reads the caller's binding soundly. `make_plan`
+collects arg identifier names, renames colliding params, and a `Renamer` VisitMut
+rewrites the cloned body. 7 inline unit tests. 88 core / 294 main / 120 parity,
+clippy clean.
+- **(later, commit `f45877a`) fresh names are `$N` via `pick_fresh`**, not the
+  original `p__<id>` scheme. `pick_fresh` strips any existing `$N` suffix before
+  minting, so the renamer is idempotent (no `x$1$1…` growth) and shares the exact
+  suffix convention `block_flatten` already uses (`name$N`) — one fresh-name
+  vocabulary across inlining and flattening.
 
 **Inlining gate status:** #1 mutator ✓ · #2 BLOCK statement/init/assign ✓ ·
 #3 DIRECT→BLOCK fallback ✓ · #4 α-rename ✓ · #5 empty-body DIRECT ✓.
@@ -1110,3 +1126,78 @@ calls — that's the separate `allowLibraryInline` knob, off in this harness.)
 asserted parity from isolated unit tests without an end-to-end check. The crashcat
 diff is what caught it. Parity now actually covers the flatten/optimize cross-file
 path too.
+
+### Function purity analysis + `@pure` (2026-06-24)
+Ported Closure's `PureFunctionIdentifier` into `analysis/purity.rs` (grounded in
+`analysis/purity_design.md` + the cloned Closure source). Per function we compute a
+4-flag side-effect summary (`throws`, `mutates_global`, `mutates_this`,
+`mutates_arguments`; `mutates_global` subsumes the rest), then a **reverse
+call-graph fixpoint** propagates callee flags to callers until stable — a function
+with NO flags is pure.
+- **The crux that makes immutable-math pure:** mutating a *freshly-created local*
+  is NOT a side effect (`out[0] = …` where `out` is a local array literal), while
+  mutating a **parameter**'s property is `mutates_arguments` and mutating a
+  **free/outer** variable is `mutates_global`. This is exactly the distinction that
+  lets a vec3 op that writes its `out` param be treated correctly (arg-mutation,
+  observable only if the arg escapes) while a genuinely pure math fn folds away.
+- **Wiring:** `stamp_pure_calls(program)` runs BEFORE inline (`passes/mod.rs:74`) —
+  it marks `CallExpression.pure` on calls the analysis proves side-effect-free.
+  `is_side_effect_free` honors that flag, so the surviving pure calls (recursive /
+  un-inlined helpers that inline couldn't eliminate) can be dropped when unused,
+  reordered, or substituted, and codegen emits `/*@__PURE__*/` for the downstream
+  bundler.
+- **`@pure` is a developer-assertion override** layered on top of the analysis —
+  for the cases it can't see through (a helper bottoming out in an unresolved
+  external call you *know* is pure). `annotated_spans_with_exports(_, ["@pure"])`
+  unions the asserted names into the pure set. `strip_directives` removes the marker
+  last.
+- **Soundness gate:** an effect-trace fuzzer — generate functions with random
+  effect shapes, assert the analysis never calls an effectful function pure.
+
+### Type-gated numeric-identity folds (2026-06-24)
+`x + 0`, `x * 1`, `x - 0`, `x / 1`, `x | 0` etc. are only algebraic identities when
+`x` is a **number** — `"a" + 0` is `"a0"`, `x * 1` ToNumber-coerces, BigInt mixes
+throw. The fold pass now gates these rewrites on a `numeric: HashSet<String>` of
+operands compilecat can prove numeric (from the type layer / literal analysis), so
+the identity fires only where it's value-preserving and is a no-op on
+string/BigInt/unknown operands. Closure-aligned: never change observable value,
+never trade a coercion for a fold.
+
+### Module-scratch scalar replacement — GlobalOpt-localize fused into SROA (2026-06-24 → 2026-07-02)
+The headline crashcat feature. The house style is a module-level scratch buffer
+allocated once and reused as per-call temporary storage:
+`const _scratch = /*@__PURE__*/ vec3.create()`, written and read inside one hot
+`@optimize` function. compilecat now recognizes that `_scratch` is *really* a
+per-call temporary and **scalarizes it into per-call locals**
+(`let _scratch_0, _scratch_1, _scratch_2`), deleting the module const.
+- **Design call (user):** do NOT move `vec3.create()` into the function — that
+  would reintroduce a per-call allocation (a "self-prank"). Borrow LLVM GlobalOpt's
+  global-localization idea but **fuse it INTO SROA** so localize + scalarize is ONE
+  atomic decision: the buffer is never materialized as a local aggregate, only as
+  scalars. Closure does nothing here; LLVM's `GlobalOpt.cpp` preconditions were
+  ported as the grounding (cloned under `llm/llvm-project`).
+- **Why it's sound** — four independent gates, all CFG-based where flow matters:
+  1. **killed-on-entry** (must-reaching-definitions): every field READ must be
+     must-written on ALL paths first, so the buffer's cross-call carry-over is never
+     observed. Lattice = per-field bitmask, join = AND, entry = 0, flow = `in | writes`.
+  2. **symbol gate:** every identifier named `_scratch` in the owner must resolve to
+     the intended `SymbolId` (+ a capture check), replacing brittle scope heuristics.
+  3. **completeness net:** a per-CFG-node scratch-access COUNT must sum to the
+     whole-body `count_all_accesses` — makes the node dispatcher's catch-all sound
+     by construction (an unclassified access can't be silently dropped).
+  4. **re-entrancy guard** (CFG may-reachability): if an impure call is reachable
+     *from* a write AND reaches a read, the buffer could be observed mid-update →
+     bail.
+- **Coverage:** single-owner buffers used directly, via a local alias
+  (`const s = _scratch`), across loop bodies, across both branches of an `if`, and
+  through a `switch` where every case writes all fields (real crashcat `getSupport`/
+  `computeClosestPointToSimplex` shapes). Dynamic-indexed buffers (`_rot[c1]`, `c1`
+  variable) correctly BAIL.
+- **Accepted limitation:** effectful getter / `valueOf` / `Proxy` re-entrancy is NOT
+  guarded (matches Closure's `assumeGettersArePure`).
+- **Validation:** an effect-trace fuzzer over ~20 shapes (read-before-write, partial
+  read, second-reader, escape, alias-trailing-effect, block-shadow, loop-read-before-
+  write, switch-fallthrough, nested-partial, for-header-read, …) with a two-call
+  oracle; a differential real-world harness on faithful crashcat kernels; and an
+  end-to-end crashcat build where its full 747-test physics suite passes IDENTICALLY
+  optimized vs unoptimized.

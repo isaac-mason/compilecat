@@ -44,7 +44,10 @@ That split decides what's worth it.
   `ResolvedType` variants it would have introduced are the same ones type-narrowed
   DCE consumes, so that slice subsumes the groundwork.
 - **Escape analysis** — already used for SROA; generalizes to allocation removal
-  wherever the type bounds the shape.
+  wherever the type bounds the shape. ✅ **Extended** to *module-scratch
+  localization*: a module-level scratch buffer used as per-call storage in one
+  `@optimize` function is localized-and-scalarized (LLVM GlobalOpt idea fused into
+  SROA), proven safe by a CFG killed-on-entry must-reaching-defs analysis.
 
 ## Does NOT map — out of scope by construction (we emit JS)
 

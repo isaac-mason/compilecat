@@ -15,7 +15,7 @@ automatically — no build step or toolchain required.
 
 > ⚠️ This is highly experimental! It's not clear yet if this tool is even a good idea! Browse to your heart's content but expect no stability right now.
 
-A JavaScript/TypeScript compiler plugin for hot-path optimizations, driven by opt-in annotations. It does function inlining, scalar-replacement of aggregates (SROA), and loop unrolling.
+A JavaScript/TypeScript compiler plugin for hot-path optimizations, driven by opt-in annotations. It does function inlining, scalar-replacement of aggregates (SROA), loop unrolling, and a Closure-style simplify tier (constant folding, purity-driven pure-call elimination, dead-store removal).
 
 Built on a Rust/oxc core. Ships as a rollup-family `transform` plugin: it
 optimizes each source file *before* bundling, keeping TypeScript. It is
@@ -122,6 +122,16 @@ Escape analysis bails silently if the array leaks, whether by being passed to a 
 
 Can also be placed on an enclosing function to opt in every qualifying declaration inside it.
 
+SROA also scalarizes **object/record locals** (`const v = { x, y, z }` with static
+`.x`/`.y`/`.z` accesses) and **typed-tuple locals** (`const v: Vec3 = mk()`), and
+performs **module-scratch localization**: a module-level scratch buffer reused as
+per-call temporary storage — the crashcat/mathcat house style
+`const _scratch = /*@__PURE__*/ [0, 0, 0]` written and read inside one `@optimize`
+function — is proven safe (single-owner, killed-on-entry, non-re-entrant via a CFG
+must-reaching-definitions analysis) and scalarized into per-call locals, with the
+module const deleted. This borrows LLVM GlobalOpt's global-localization idea, fused
+into SROA so the buffer is never materialized as a per-call allocation.
+
 ### `@unroll`: unroll a loop with a static trip count
 
 ```ts
@@ -152,29 +162,56 @@ function step(out: Vec3, v: Vec3, dt: number) {
 }
 ```
 
+### `@pure`: assert a function is side-effect-free
+
+compilecat runs a Closure-style purity analysis (a port of `PureFunctionIdentifier`)
+that proves most immutable-math helpers pure on its own — a call to a pure
+function can be dropped when its result is unused, reordered, or de-duplicated,
+and it's emitted with a `/*@__PURE__*/` marker for the downstream bundler. `@pure`
+is a developer-assertion *override* for the cases the analysis can't see through
+(e.g. a helper that bottoms out in an unresolved external call you know is pure):
+
+```ts
+/* @pure */
+function lerp(a: number, b: number, t: number): number {
+    return externalMathHelper(a, b, t);
+}
+```
+
+Use it sparingly — asserting purity on a function that actually has side effects
+will let those effects be optimized away.
+
 ## Pipeline
 
 Each chunk that contains a compilecat directive runs through:
 
 ```
 parse
-  → strip-typescript        (drop TS-only syntax so downstream passes see plain JS)
+  → normalize               (MakeDeclaredNamesUnique)
+  → stamp-pure-calls        (purity analysis marks side-effect-free calls; emits /*@__PURE__*/)
   → inline-functions        (DIRECT + BLOCK inlining, FunctionArgumentInjector)
+  → block-flatten           (lift the scaffolding blocks inlining emits)
   → loop-unroller
-  → inline-variables (pre)  (collapse alias temps so SROA sees direct `name[i]` uses)
-  → scalar-replace-aggregates
-  → normalize               (MakeDeclaredNamesUnique, flips `isASTNormalized`)
-  → simplify (per-function fixpoint):
+  → scalar-replace-aggregates  (incl. module-scratch localization — see below)
+  → block-flatten           (lift the per-iteration blocks the unroller emits)
+  → simplify (per-function fixpoint, ×8):
       peephole-fold-constants
       minimize-exit-points
       peephole-minimize-conditions
+      inline-variables
+      cleanup-residue
       peephole-remove-dead-code
-      flow-sensitive-inline-variables
-      dead-assignments-elimination
-  → inline-variables (post)
-  → remove-unused-code
+      block-flatten          (lift bare blocks exposed during simplification)
+      flow-sensitive-inline-variables   (CFG-based)
+      dead-assignments-elimination      (CFG-based)
+  → remove-unused-code      (drop bindings/imports left unused after inlining)
+  → strip-directives        (remove the authored /* @* */ markers)
   → regenerate
 ```
+
+Everything is gated: only constructs carrying a directive (and their subtrees),
+plus the directive-free consumers an `@inline` was inlined into, are ever
+rewritten — the rest of the file is left byte-identical.
 
 Some of the optimization passes (Rust, under
 `rust/crates/compilecat_core/src/passes/`) are functional ports of corresponding

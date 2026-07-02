@@ -1,18 +1,25 @@
 //! Control-flow + dataflow analysis infrastructure, ported from compilecat's
 //! own framework (NOT `oxc_cfg` — see `rust/WORKLOG.md` for the decision).
 //!
-//! Build order:
-//!   - `graph`           — index-based directed graph (done)
-//!   - `cfg`             — per-statement-node CFG over the AST  (control-flow-analysis.ts)
+//! Substrate (bottom-up):
+//!   - `graph`           — index-based directed graph
+//!   - `cfg`             — per-AST-node CFG over the AST        (control-flow-analysis.ts)
 //!   - `data_flow`       — lattice + forward/backward fixpoint  (data-flow-analysis.ts)
 //!   - `local_var_table` — binding-slot index space            (local-variable-table.ts)
+//!   - `reaching`        — must-reaching-defs / maybe-reaching-uses
+//!   - `live_vars`       — backward liveness (GEN/KILL bitsets)
+//!   - `purity`          — Closure `PureFunctionIdentifier` port (side-effect summaries)
+//!   - `type_shape`      — inferred tuple/record shapes for type-directed SROA
+//!   - `tri`             — three-valued logic
 //!
-//! Consumers (the passes) then layer on: live-variables, dead-assignments,
-//! flow-sensitive-inline (+ reaching-defs / reaching-uses).
+//! Consumers wired into the simplify fixpoint (`passes/mod.rs`):
+//! flow-sensitive-inline-variables and dead-assignments-elimination (over
+//! reaching/live-vars); `sroa` uses `reaching`/`cfg` for module-scratch
+//! killed-on-entry; `stamp_pure_calls` uses `purity`.
 
-// CFG/dataflow framework (worklist phase 1). `#[allow(dead_code)]` stays until
-// the consumer passes (flow-sensitive-inline, dead-assignments) wire them in —
-// the framework lands first, bottom-up, then the passes.
+// `#[allow(dead_code)]` is belt-and-suspenders: the consumer passes are wired in,
+// but not every analysis helper is exercised on every build config, so the tier
+// keeps the allow rather than churning it per-helper.
 #[allow(dead_code)]
 pub mod cfg;
 #[allow(dead_code)]

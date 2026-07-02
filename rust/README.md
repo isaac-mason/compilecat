@@ -4,20 +4,23 @@ The fast core. Pure Rust, built on [oxc](https://github.com/oxc-project/oxc)
 (parser, AST, codegen, semantic). The TypeScript plugin in `../src` loads the
 compiled napi addon and calls into it; all AST work happens here.
 
-This is a **scaffold** — the parse → codegen loop is real and tested, but every
-optimization pass is a no-op stub. Porting the passes from `../src/compiler/*.ts`
-is the remaining work.
+The full optimizer lives here — the passes are ported and tested (the parse →
+passes → codegen loop is the real pipeline, not a scaffold). It reached parity
+with the original Babel pipeline and has since grown a superset of passes
+(purity-driven pure-call elimination, module-scratch scalar replacement, a
+CFG/dataflow analysis tier). See `WORKLOG.md` / `ARCHITECTURE.md` for the "why".
 
 ## Layout
 
 ```
 rust/
-  Cargo.toml                       workspace (pinned oxc 0.114, napi 2.16)
+  Cargo.toml                       workspace (pinned oxc 0.135, napi 3)
   crates/
     compilecat_core/               pure Rust, no napi — the optimizer
       src/lib.rs                   transform(): parse → passes → codegen
       src/options.rs               Mode, TransformOptions, Stats, output
-      src/passes/mod.rs            pass stubs, 1:1 with src/compiler/*.ts
+      src/passes/                  the optimization passes (one module each)
+      src/analysis/                CFG / dataflow / purity / type-shape infra
       examples/transform.rs        run on a file from disk
     compilecat_napi/               cdylib → the .node addon
       src/lib.rs                   Compiler { compileFile, compileChunk }
@@ -71,24 +74,22 @@ integration (`plugin.test.ts`, `cross-file.test.ts`). They normalize away
 formatting via the shared oxc identity printer (`format()` / `Compiler.format`),
 so only *semantic* differences fail.
 
-## Porting the passes
+## Passes & analysis
 
-Port in pipeline order, snapshot-testing each against the existing `tst/`
-fixtures before moving on. The mapping:
+The passes run in pipeline order out of `passes/mod.rs::run_all_gated`
+(normalize → stamp-pure-calls → inline → block-flatten → unroll → SROA →
+block-flatten → simplify fixpoint → remove-unused → strip-directives). Each pass
+is one module under `src/passes/`; the simplify fixpoint runs fold,
+minimize-conditions/exit-points, inline-variables, cleanup-residue, dead-code,
+block-flatten, and the two CFG-based passes (flow-sensitive-inline-variables,
+dead-assignments-elimination) to convergence.
 
-| TS pass (`src/compiler/`)            | Rust (`compilecat_core::passes`) | Needs |
-|--------------------------------------|----------------------------------|-------|
-| `normalize.ts`                       | `normalize`                      | `VisitMut`, scopes |
-| `inline-functions.ts` (+ `resolve`)  | `inline_functions`               | `VisitMut`, semantic |
-| `loop-unroller.ts`                   | `unroll_loops`                   | `VisitMut` |
-| `scalar-replace-aggregates.ts`       | `scalar_replace_aggregates`      | semantic |
-| `simplifier.ts` + sub-passes         | `simplify`                       | `oxc_cfg` CFG + dataflow |
-| `inline-variables.ts`, `*flow*`      | (under `simplify`)               | `oxc_cfg`, lattices |
-
-`oxc_semantic` gives scopes/symbols/references; `oxc_semantic` with
-`SemanticBuilder::with_cfg(true)` gives `oxc_cfg::ControlFlowGraph` (basic-block
-CFG, petgraph). The dataflow-lattice passes (live-vars, reaching-defs,
-flow-sensitive inline) are hand-built on top of that CFG — the largest single
-chunk of the port. Add `oxc_ast_visit` (and `oxc_cfg`) to `core/Cargo.toml` when
-you start the first real pass.
+The control-flow / dataflow substrate lives under `src/analysis/` and is
+compilecat's **own** framework, *not* `oxc_cfg`: a per-AST-node CFG (`cfg.rs`)
+over an index-based `graph.rs`, a generic lattice worklist (`data_flow.rs`),
+`local_var_table.rs`, reaching-defs / reaching-uses (`reaching.rs`), live
+variables (`live_vars.rs`), and function purity (`purity.rs`). oxc_cfg is
+basic-block granularity; the passes need exact per-node GEN/KILL/JOIN, hence the
+custom tier (see `WORKLOG.md` for the decision). `oxc_semantic` supplies
+scopes/symbols/references throughout.
 ```

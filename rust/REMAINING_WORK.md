@@ -64,16 +64,36 @@ intent; over-unrolling emits dead loops). See P0.
 
 ## 3. Current state (confirm on fresh start)
 
-Run: `cd compilecat && pnpm build:native && pnpm vitest run --config vitest.parity.config.ts`
-Expect **187/187 parity (incl. three.js behavioral)** and `cargo test -p compilecat_core` **~364 green**.
+Run: `cd compilecat && pnpm build:native && pnpm test`
+Expect `cargo test -p compilecat_core` **434 passed** (1 ignored) and `vitest run`
+(`test:js`) **149 passed** across 7 files. (There is no longer a separate
+`test:parity` script — the parity/behavioral tests are part of `test:rust`.)
 
-**Landed & verified this session:**
+**Landed & verified since 2026-06-18:**
 - D3: α-rename / `MakeDeclaredNamesUnique` + `tryMergeBlock` (in `block_flatten.rs`).
 - E2 De Morgan: faithful `MinimizedCondition` cost-model port (`minimized_condition.rs`),
   applied at all condition slots. −23 structural, three.js green.
 - 2 miscompile fixes (+ regression tests): destructuring alias-inline (`inline_variables.rs`),
   task-#29 block-inline-in-init `undefined` (`flow_inline.rs` chained-decision deferral).
 - Additive `block_flatten` after unroll (`mod.rs`).
+- **Function purity analysis** (`analysis/purity.rs`, a `PureFunctionIdentifier` port)
+  + the **`@pure`** developer-assertion directive; `stamp_pure_calls` runs before
+  inline (`mod.rs:74`) so surviving pure calls get dropped/reordered/CSE'd and emit
+  `/*@__PURE__*/`. Sound per the effect-trace fuzzer.
+- **Type-gated numeric-identity folds** (`x+0`/`x*1`/etc. only on provably-numeric
+  operands — `fold.rs`).
+- **Module-scratch scalar replacement** — GlobalOpt-style global-localization fused
+  into SROA (`sroa.rs`): a single-owner module `const _s = /*@__PURE__*/ [0,0,0]`
+  used as per-call scratch is scalarized (killed-on-entry via CFG must-reaching-defs,
+  symbol gate, re-entrancy guard; handles branch/switch). Validated end-to-end on
+  crashcat (747 physics tests pass identically optimized vs unoptimized).
+- **α-rename inlined params with `$N`** via `pick_fresh` (replaced the old `p__<id>`).
+- **CFG/dataflow tier fully wired**: `analysis/{cfg,data_flow,graph,local_var_table,
+  reaching,live_vars}.rs` + `flow_inline.rs` (flow-sensitive var inlining) and
+  `dead_assignments.rs` (dead-store elimination) now run inside the simplify fixpoint
+  (`mod.rs:129-133`).
+- **Shipped `compilecat@0.0.4` to npm** (commit `2abec53`) — native per-platform
+  packages + wasm.
 
 ---
 
@@ -81,7 +101,12 @@ Expect **187/187 parity (incl. three.js behavioral)** and `cargo test -p compile
 
 ### P0 — Readability defects (the core of the bar)
 
-**R1 — Eliminate ALL unnecessary `{ }` blocks. [TOP PRIORITY]**
+**R1 — Eliminate ALL unnecessary `{ }` blocks. [PARTIALLY ADDRESSED — recheck vs HEAD]**
+- Status (unconfirmed against a fresh sweep): `block_flatten` now also runs *inside*
+  the simplify fixpoint (`mod.rs:118-125`) to lift bare blocks exposed during
+  simplification — not just the pre-unroll + one additive post run this item was
+  written against. Re-run the forced-`@optimize` sweep before assuming this is still
+  open; the remaining gap (if any) is narrower than described below.
 - Gap: native emits bare `{ }` blocks (block-inline scaffolding, per-iteration unroll
   blocks, nested bare blocks). Unnecessary blocks are a serious readability defect.
 - Closure design: **Normalize adds** structure for safe optimization; **`Denormalize.java`
@@ -105,7 +130,9 @@ Expect **187/187 parity (incl. three.js behavioral)** and `cargo test -p compile
 - Files: `unroll.rs` (bail conditions), `dead_code.rs` (dead-loop removal).
 - Verify: no dead/degenerate loops in output; no oversized expansion; three.js green.
 
-**R3 — Preserve named module constants (stop value-propagation).**
+**R3 — Preserve named module constants (stop value-propagation). [STATUS UNCONFIRMED — recheck vs HEAD]**
+- Note: written before the type-gated-fold and preserve-control-flow work landed;
+  verify whether module-const uses are still folded before treating this as open.
 - Gap: native emits `4294967295` for `EMPTY_SUB_SHAPE_ID`, `32` for `MAX_SUB_SHAPE_ID_BITS`
   — destroys authored intent. (The exported `const` decl is kept, but uses are folded.)
 - Approach: find the offending pass (likely `fold.rs` const-propagation, or
@@ -123,10 +150,17 @@ Expect **187/187 parity (incl. three.js behavioral)** and `cargo test -p compile
 
 ### P1 — Correctness on the real target
 
+> Re-baseline: `compilecat@0.0.4` has since **shipped to npm**, and a crashcat
+> end-to-end validation was completed once (local repo linked in; full physics
+> suite = 747 tests / 51 files pass IDENTICALLY optimized vs unoptimized; rolldown
+> production build clean). These are no longer *pre-first-release* blockers — V1/V2
+> are now standing regression checks to automate/re-run per release, not gates on a
+> first publish.
+
 **V1 — crashcat green on native build.** Link local compilecat into crashcat
 (`crashcat/package.json` installs it from github; need an fs link or local build+install),
 build via `crashcat/rolldown.config.mjs` (uses `compilecatNative`), run `pnpm test`
-+ `pnpm test-tree-shaking`.
++ `pnpm test-tree-shaking`. (Done once manually this cycle; wire into CI.)
 **V2 — behavioral + perf/size vs Babel build.** Build crashcat twice (native vs
 `crashcat/rolldown.compilecat-test.mjs` Babel); run physics/determinism; compare
 results + `dist` size.

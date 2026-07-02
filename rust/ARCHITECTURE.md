@@ -102,6 +102,15 @@ phase-2 read); the napi `Compiler` holds `RefCell<ModuleCache>` (napi needs no
    (the thing rolldown can't give us). Slice 1 ✅: **type-aware SROA** — `@sroa`
    fires on a typed fixed-tuple aggregate (`const v: Vec3 = mk()` →
    `let [v_0,v_1,v_2] = mk()`), via the type-shape oracle (`build_alias_arities`
-   /`type_arity`, local aliases + inline tuples). Slice 2: cross-module aliases
-   (resolve an imported `Vec3` via the ModuleCache). Slice 3: object-type SROA,
-   other type-directed passes.
+   /`type_arity`, local aliases + inline tuples). Slice 2 ✅: cross-module aliases
+   (resolve an imported `Vec3` via the ModuleCache). Slice 3 ✅: **object/record
+   SROA** (non-escaping `{x,y,z}` locals → named scalars).
+4. **Local optimizer superset (on this substrate, all neighborhood-scoped):**
+   - ✅ **Module-scratch scalar replacement** — an LLVM-GlobalOpt-style
+     localization of a module-level scratch buffer, fused into SROA and proven
+     safe by a CFG must-reaching-definitions (killed-on-entry) analysis.
+   - ✅ **Function purity + `@pure`** — a Closure `PureFunctionIdentifier` port
+     (`analysis/purity.rs`) stamps side-effect-free calls so the simplify tier can
+     drop/reorder/CSE them and codegen emits `/*@__PURE__*/`.
+   - ✅ **CFG/dataflow tier** (`analysis/{cfg,data_flow,reaching,live_vars}.rs`)
+     driving flow-sensitive-inline-variables + dead-assignments-elimination.
