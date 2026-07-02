@@ -1295,6 +1295,13 @@ struct NodeFx {
     reads: u32,
     /// This node evaluates a non-side-effect-free call/new (re-entrancy candidate).
     reentrant: bool,
+    /// Count of scratch member-accesses (read occurrences + write targets) this node
+    /// attributed. Summed and compared to the whole-body total as a COMPLETENESS net:
+    /// a scratch access in a CFG-node kind `node_fx` doesn't handle would be missed
+    /// (the `_ => {}` catch-all), so the sum would fall short of the total → bail.
+    /// Makes the per-kind dispatch sound by construction (retires the node-boundary
+    /// bug class the two CFG reviewers found).
+    access_count: u32,
 }
 
 /// Bit for field `suffix` under `shape` (tuple index / object field position).
@@ -1320,12 +1327,16 @@ fn full_mask(shape: &Shape) -> u32 {
     if n >= 32 { u32::MAX } else { (1u32 << n) - 1 }
 }
 
-fn reads_mask(e: &Expression, name: &str, shape: &Shape) -> Option<u32> {
+/// (read-field bitmask, read-occurrence count) for `e`, or None on an unmodellable
+/// scratch use.
+fn reads_mask(e: &Expression, name: &str, shape: &Shape) -> Option<(u32, u32)> {
+    let reads = collect_reads(e, name, shape)?;
+    let count = reads.len() as u32;
     let mut m = 0u32;
-    for r in collect_reads(e, name, shape)? {
-        m |= field_bit(&r, shape)?;
+    for r in &reads {
+        m |= field_bit(r, shape)?;
     }
-    Some(m)
+    Some((m, count))
 }
 
 /// Classify one expression: a clean `name[i] = RHS` contributes write `i` + RHS
@@ -1336,12 +1347,17 @@ fn classify_expr(e: &Expression, name: &str, shape: &Shape, fx: &mut NodeFx) -> 
         if a.operator == AssignmentOperator::Assign {
             if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
                 fx.writes |= field_bit(&suffix, shape)?;
-                fx.reads |= reads_mask(&a.right, name, shape)?;
+                fx.access_count += 1; // the write target `name[i]`
+                let (m, c) = reads_mask(&a.right, name, shape)?;
+                fx.reads |= m;
+                fx.access_count += c;
                 return Some(());
             }
         }
     }
-    fx.reads |= reads_mask(e, name, shape)?;
+    let (m, c) = reads_mask(e, name, shape)?;
+    fx.reads |= m;
+    fx.access_count += c;
     Some(())
 }
 
@@ -1354,7 +1370,9 @@ fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
     let mut fx = NodeFx::default();
     let read = |e: &Expression, fx: &mut NodeFx| -> Option<()> {
         fx.reentrant |= expr_has_reentrant_call(e);
-        fx.reads |= reads_mask(e, name, shape)?;
+        let (m, c) = reads_mask(e, name, shape)?;
+        fx.reads |= m;
+        fx.access_count += c;
         Some(())
     };
     match kind {
@@ -1425,12 +1443,17 @@ fn node_fx(kind: AstKind, name: &str, shape: &Shape) -> Option<NodeFx> {
             if a.operator == AssignmentOperator::Assign {
                 if let Some(suffix) = assign_target_suffix(&a.left, name, shape) {
                     fx.writes |= field_bit(&suffix, shape)?;
+                    fx.access_count += 1;
                 }
-                fx.reads |= reads_mask(&a.right, name, shape)?;
+                let (m, c) = reads_mask(&a.right, name, shape)?;
+                fx.reads |= m;
+                fx.access_count += c;
             } else if assign_target_suffix(&a.left, name, shape).is_some() {
                 return None; // compound assign to the scratch
             } else {
-                fx.reads |= reads_mask(&a.right, name, shape)?;
+                let (m, c) = reads_mask(&a.right, name, shape)?;
+                fx.reads |= m;
+                fx.access_count += c;
             }
         }
         // Bare-expression CFG nodes (for-headers, or any other position they occupy):
@@ -1500,6 +1523,42 @@ fn expr_has_reentrant_call(e: &Expression) -> bool {
     v.found
 }
 
+/// Total scratch member-accesses (`name[i]` / `name.f`, read OR write target) in the
+/// owner body, NOT descending into nested functions (which are not in this CFG). The
+/// oracle for the completeness net: equals the sum of per-node `access_count` iff
+/// `node_fx` attributed every access.
+fn count_all_accesses(fb: &FunctionBody, name: &str) -> u32 {
+    let mut c = AccessCounter { name, count: 0 };
+    for s in &fb.statements {
+        c.visit_statement(s);
+    }
+    c.count
+}
+
+struct AccessCounter<'s> {
+    name: &'s str,
+    count: u32,
+}
+
+impl<'a> Visit<'a> for AccessCounter<'_> {
+    fn visit_computed_member_expression(&mut self, m: &ComputedMemberExpression<'a>) {
+        if member_obj_is(&m.object, self.name) {
+            self.count += 1;
+        }
+        walk::walk_computed_member_expression(self, m);
+    }
+    fn visit_static_member_expression(&mut self, m: &StaticMemberExpression<'a>) {
+        if member_obj_is(&m.object, self.name) {
+            self.count += 1;
+        }
+        walk::walk_static_member_expression(self, m);
+    }
+    // Nested functions/arrows are not part of the owner's CFG (a scratch capture there
+    // was already rejected by the symbol gate) — don't count their accesses.
+    fn visit_function(&mut self, _f: &Function<'a>, _flags: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _a: &ArrowFunctionExpression<'a>) {}
+}
+
 /// The must-write dataflow: lattice = bitmask of fields written on ALL paths so far.
 struct ScratchKill<'x> {
     fx: &'x [NodeFx],
@@ -1548,6 +1607,16 @@ fn killed_on_entry(func_body: &FunctionBody, name: &str, shape: &Shape) -> bool 
             Some(f) => fx.push(f),
             None => return false,
         }
+    }
+
+    // COMPLETENESS NET: every scratch member-access in the body must have been
+    // attributed to some node. If `node_fx`'s per-kind dispatch silently skipped a
+    // CFG-node kind carrying a scratch access (the `_ => {}` catch-all), the sum
+    // falls short of the whole-body total → bail. This makes the dispatch sound by
+    // construction — a missed kind can only under-optimize, never miscompile.
+    let attributed: u32 = fx.iter().map(|f| f.access_count).sum();
+    if attributed != count_all_accesses(func_body, name) {
+        return false;
     }
 
     let Ok(states) = analyze(&cfg, &ScratchKill { fx: &fx, full }) else {
