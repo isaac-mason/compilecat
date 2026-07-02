@@ -34,7 +34,6 @@ export type CompileStats = {
 
 export type CompileResult = {
     code: string;
-    // biome-ignore lint/suspicious/noExplicitAny: bundler-defined sourcemap shape
     map: any;
     changed: boolean;
     stats: CompileStats;
