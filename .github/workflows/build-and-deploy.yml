@@ -27,11 +27,20 @@ jobs:
         with:
           run_install: true
 
-      - name: Build compilecat
-        run: pnpm run build
+      # The website demo imports `compilecat/wasm` and vite-aliases the
+      # wasm-pack output, so CI only needs the wasm build — never the napi
+      # native binary (built + published locally). Build wasm + the TS
+      # wrappers only; skip build:native / build:loader.
+      - name: Setup Rust (wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
 
-      - name: Run tests
-        run: pnpm test    # cargo (test:rust) + vitest (test:js)
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+
+      - name: Build compilecat (wasm only)
+        run: pnpm build:wasm && pnpm build:ts
 
       - name: Build website
         run: pnpm --filter website run build
