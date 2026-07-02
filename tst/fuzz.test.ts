@@ -584,6 +584,9 @@ class ScratchGen {
             'bothBranches',
             'switchWrite',
             'partialBranch',
+            'switchFallthrough',
+            'nestedPartial',
+            'forHeaderRead',
         ]);
         const body: string[] = [];
         // Occasional leading effect (before any write) — preserved through
@@ -673,6 +676,24 @@ class ScratchGen {
             // that path → must bail (a wrong scalarization diverges).
             const w = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
             body.push(`  if (p > q) { ${w} } else { ${s}[0] = ${this.e()}; }`, `  return ${readAll};`);
+        } else if (mode === 'switchFallthrough') {
+            // case 0 writes all then FALLS THROUGH to case 1 which reads; on the k=1
+            // entry path nothing is written → the read is uninit → must bail (a wrong
+            // scalarization returns NaN vs the create-default 0 for k=1).
+            const w = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            body.push(`  switch (p % 2) { case 0: { ${w} } case 1: return ${readAll}; }`, '  return 0;');
+        } else if (mode === 'nestedPartial') {
+            // Outer-if both arms would cover, but an INNER else writes only field 0 →
+            // partial on one path → must bail.
+            const wAll = idx.map((i) => `${s}[${i}] = ${this.e()};`).join(' ');
+            body.push(
+                `  if (p > q) { if (p > 0) { ${wAll} } else { ${s}[0] = ${this.e()}; } } else { ${wAll} }`,
+                `  return ${readAll};`,
+            );
+        } else if (mode === 'forHeaderRead') {
+            // A scratch read in the for-INIT (an unattributable bare-expression CFG
+            // node) → must bail; the completeness net / for-header guard catch it.
+            body.push('  let acc = 0;', `  for (acc = ${s}[0]; acc < 0; acc++) {}`, '  return acc;');
         } else if (mode === 'blockShadow') {
             // A block-scoped rebind of the scratch name (distinct variable). Must NOT
             // be hijacked by the name-based rewriter. Values differ so a hijack diverges.
