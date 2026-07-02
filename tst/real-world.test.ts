@@ -36,6 +36,7 @@ function prng(seed: number, range: number): () => number {
 }
 const v3 = (r: () => number): number[] => [r(), r(), r()];
 const q4 = (r: () => number): number[] => [r(), r(), r(), r()];
+const vn = (n: number) => (r: () => number): number[] => Array.from({ length: n }, r);
 
 type Kernel = {
     name: string;
@@ -85,6 +86,22 @@ const KERNELS: Kernel[] = [
         params: ['a', 'b', 'c'],
         callBody: 'const out = [0, 0, 0]; tangent(out, a, b, c); return out;',
         inputs: (r) => [v3(r), v3(r), v3(r)],
+    },
+    {
+        name: 'real-world: sleepTestPoints (3-way branch; vec3 scratch scalarizes, mat3 dynamic-index bails)',
+        fixture: 'sleep-test-points.ts',
+        params: ['com', 'aabb', 'quat'],
+        callBody:
+            'const o0=[0,0,0], o1=[0,0,0], o2=[0,0,0];' +
+            'sleepTestPoints(o0, o1, o2, com, aabb, quat); return [o0, o1, o2];',
+        inputs: (r) => [v3(r), vn(6)(r), q4(r)],
+    },
+    {
+        name: 'real-world: closestOnSimplex (switch-dispatch → scratch scalarizes)',
+        fixture: 'simplex-closest.ts',
+        params: ['size', 'y'],
+        callBody: 'const out = [0, 0, 0]; closestOnSimplex(out, size, y); return out;',
+        inputs: (r, i) => [1 + (i % 4), vn(12)(r)],
     },
 ];
 
@@ -149,6 +166,20 @@ describe('module-scratch scalar replacement — real crashcat patterns', () => {
         // the alias decl and the module const are deleted.
         expect(out).not.toContain('const _scratchAliased');
         expect(out).toMatch(/\bs_0\b/);
+    });
+
+    it('sleepTestPoints: literal-indexed vec3 scratch scalarizes, dynamic-indexed mat3 bails', () => {
+        const out = compiledFixture('sleep-test-points.ts');
+        expect(out).not.toContain('const _extents'); // literal-indexed → scalarized
+        expect(out).not.toContain('const _axis'); //    literal-indexed → scalarized
+        expect(out).toContain('const _rot'); //          `_rot[c1]` dynamic index → bails
+    });
+
+    it('closestOnSimplex: switch-dispatch scratch scalarizes (v3 CFG)', () => {
+        const out = compiledFixture('simplex-closest.ts');
+        // every case writes all fields → must-written at the post-switch read.
+        expect(out).not.toContain('const _closest');
+        expect(out).toMatch(/_closest_0/);
     });
 });
 
