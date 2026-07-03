@@ -284,6 +284,11 @@ body {
 .editor .cm-scroller {
   font-family: 'Roboto Mono', monospace;
   overflow: auto;
+  /* `scrollbar-gutter: stable` reserves the vertical scrollbar's space so its
+   * appearance never reflows the text; `overscroll-behavior: contain` stops a
+   * scroll that reaches the box edge from chaining to (and shifting) the page. */
+  scrollbar-gutter: stable;
+  overscroll-behavior: contain;
 }
 
 .editor .cm-gutters {

@@ -1,5 +1,5 @@
 import { javascript } from '@codemirror/lang-javascript';
-import CodeMirror from '@uiw/react-codemirror';
+import CodeMirror, { EditorView } from '@uiw/react-codemirror';
 import { type CompileStats, createCompiler, type Compiler } from 'compilecat/wasm';
 import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { bundle } from './bundle';
@@ -674,8 +674,12 @@ export function App() {
     const jsWithout = result?.jsWithout ?? '';
     const jsWith = result?.jsWith ?? '';
     const stats = result?.stats ?? null;
-    const tsExtensions = useMemo(() => [javascript({ jsx: false, typescript: true })], []);
-    const jsExtensions = useMemo(() => [javascript({ jsx: false, typescript: false })], []);
+    // `lineWrapping` kills the horizontal scroll: CodeMirror measures content
+    // width from the *rendered* (visible) lines only, so without wrapping the
+    // widest line changes as you scroll → the horizontal scrollbar toggles →
+    // the box jumps. Wrapping removes horizontal scroll entirely, so no shift.
+    const tsExtensions = useMemo(() => [javascript({ jsx: false, typescript: true }), EditorView.lineWrapping], []);
+    const jsExtensions = useMemo(() => [javascript({ jsx: false, typescript: false }), EditorView.lineWrapping], []);
 
     const scenario = SCENARIOS.find((s) => s.id === scenarioId) ?? SCENARIOS[0];
     const selectScenario = (s: Scenario) => {
