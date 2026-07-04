@@ -132,10 +132,27 @@ pub fn run<'a>(
             .filter(|st| flatten_spans.contains(st))
             .collect();
         for span in host_spans {
-            let (all_direct, all_block) = gather_all_callables(allocator, program);
             let single: HashSet<u32> = std::iter::once(span).collect();
-            count +=
-                flatten_into_hosts(allocator, program, &single, &all_direct, &all_block, uid);
+            // Transitive inlining, to a fixpoint: a helper `set` inlined into the
+            // host exposes fresh calls its body made (`copy`) — re-gather live
+            // candidates and re-flatten the same host until a round inlines nothing.
+            // This terminates by construction: `gather_all_callables` refuses every
+            // candidate on a recursion cycle, so the remaining call graph is a DAG,
+            // and each round strictly lowers the multiset of callee-heights among
+            // the host's remaining candidate calls. No depth cap / size limit —
+            // `@flatten` is a user directive, so we honor it fully (blowup is the
+            // author's trade-off, not ours to silently cap). Each round reuses the
+            // same eval-order/scope-safe hoisting as the first (loop bodies keep
+            // their inlined helpers in place, not lifted above loop-local bindings).
+            loop {
+                let (all_direct, all_block) = gather_all_callables(allocator, program);
+                let n =
+                    flatten_into_hosts(allocator, program, &single, &all_direct, &all_block, uid);
+                count += n;
+                if n == 0 {
+                    break;
+                }
+            }
         }
     }
 
@@ -226,11 +243,17 @@ pub(crate) fn gather_all_callables<'a>(
         if let Some(f) = top_level_function(stmt) {
             if let Some(id) = &f.id {
                 let n = id.name.to_string();
-                if let Some(c) = classify_direct(f, allocator) {
-                    direct.insert(n.clone(), c);
-                }
-                if let Some(c) = classify_block(f, allocator) {
-                    block.insert(n, c);
+                // Closure-aligned recursion refusal (`FunctionInjector` fnRecursionName):
+                // a function that references its own name is recursive and is NOT a
+                // candidate — inlining it only unrolls one level and re-emits the
+                // self-call, so refuse outright rather than lean on the depth cap.
+                if !f.body.as_ref().is_some_and(|b| body_references_name(&b.statements, &n)) {
+                    if let Some(c) = classify_direct(f, allocator) {
+                        direct.insert(n.clone(), c);
+                    }
+                    if let Some(c) = classify_block(f, allocator) {
+                        block.insert(n, c);
+                    }
                 }
             }
             continue;
@@ -241,25 +264,42 @@ pub(crate) fn gather_all_callables<'a>(
                 let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
                 let n = id.name.to_string();
                 match &d.init {
+                    // Same recursion refusal as the `function NAME` case above (a
+                    // `const f = () => f()` self-reference is recursive → not a candidate).
                     Some(Expression::ArrowFunctionExpression(a)) => {
-                        if let Some(c) = classify_direct_arrow(a, allocator) {
-                            direct.insert(n.clone(), c);
-                        }
-                        if let Some(c) = classify_block_arrow(a, allocator) {
-                            block.insert(n, c);
+                        if !body_references_name(&a.body.statements, &n) {
+                            if let Some(c) = classify_direct_arrow(a, allocator) {
+                                direct.insert(n.clone(), c);
+                            }
+                            if let Some(c) = classify_block_arrow(a, allocator) {
+                                block.insert(n, c);
+                            }
                         }
                     }
                     Some(Expression::FunctionExpression(f)) => {
-                        if let Some(c) = classify_direct(f, allocator) {
-                            direct.insert(n.clone(), c);
-                        }
-                        if let Some(c) = classify_block(f, allocator) {
-                            block.insert(n, c);
+                        if !f.body.as_ref().is_some_and(|b| body_references_name(&b.statements, &n)) {
+                            if let Some(c) = classify_direct(f, allocator) {
+                                direct.insert(n.clone(), c);
+                            }
+                            if let Some(c) = classify_block(f, allocator) {
+                                block.insert(n, c);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
+        }
+    }
+    // Mutual-recursion refusal: Closure refuses DIRECT recursion (done at
+    // collection above); we extend it to cycles (A→B→A) so the transitive-inline
+    // fixpoint provably terminates on the remaining DAG — no depth cap needed.
+    let names: HashSet<String> = direct.keys().chain(block.keys()).cloned().collect();
+    if !names.is_empty() {
+        let graph = candidate_call_graph(program, &names);
+        for cyclic in names_in_cycles(&graph) {
+            direct.remove(&cyclic);
+            block.remove(&cyclic);
         }
     }
     (direct, block)
@@ -1453,6 +1493,86 @@ fn expr_shadows_params(e: &Expression, params: &HashSet<&str>) -> bool {
 
 /// Any free read of `name` in `stmts` (conservative — ignores shadowing, so a
 /// false positive only causes a safe bail).
+/// Candidate call graph: for each candidate name, the set of *other candidate*
+/// names its body calls. Used to refuse mutually-recursive candidates so the
+/// transitive-inline fixpoint terminates on the remaining DAG.
+fn candidate_call_graph(program: &Program, names: &HashSet<String>) -> HashMap<String, HashSet<String>> {
+    struct CalleeCollector<'n> {
+        names: &'n HashSet<String>,
+        out: HashSet<String>,
+    }
+    impl<'a> Visit<'a> for CalleeCollector<'_> {
+        fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+            if let Some(k) = call_key(call) {
+                if self.names.contains(&k) {
+                    self.out.insert(k);
+                }
+            }
+            oxc_ast_visit::walk::walk_call_expression(self, call);
+        }
+    }
+    let collect = |name: &str, stmts: &[Statement]| -> Option<(String, HashSet<String>)> {
+        if !names.contains(name) {
+            return None;
+        }
+        let mut v = CalleeCollector { names, out: HashSet::new() };
+        for s in stmts {
+            v.visit_statement(s);
+        }
+        Some((name.to_string(), v.out))
+    };
+    let mut graph = HashMap::new();
+    for stmt in &program.body {
+        if let Some(f) = top_level_function(stmt) {
+            if let (Some(id), Some(b)) = (&f.id, f.body.as_ref()) {
+                if let Some((n, e)) = collect(&id.name, &b.statements) {
+                    graph.insert(n, e);
+                }
+            }
+        } else if let Some(vd) = var_decl_of(stmt) {
+            for d in &vd.declarations {
+                let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
+                let stmts = match &d.init {
+                    Some(Expression::ArrowFunctionExpression(a)) => Some(&a.body.statements),
+                    Some(Expression::FunctionExpression(f)) => f.body.as_ref().map(|b| &b.statements),
+                    _ => None,
+                };
+                if let Some(stmts) = stmts {
+                    if let Some((n, e)) = collect(&id.name, stmts) {
+                        graph.insert(n, e);
+                    }
+                }
+            }
+        }
+    }
+    graph
+}
+
+/// Names on a cycle in the candidate call graph (mutual/indirect recursion): a
+/// node is cyclic iff it can reach itself via ≥1 edge. These are refused as
+/// inline candidates so the transitive fixpoint can't diverge.
+fn names_in_cycles(graph: &HashMap<String, HashSet<String>>) -> HashSet<String> {
+    let mut cyclic = HashSet::new();
+    for start in graph.keys() {
+        let Some(succ0) = graph.get(start) else { continue };
+        let mut stack: Vec<&str> = succ0.iter().map(String::as_str).collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == start.as_str() {
+                cyclic.insert(start.clone());
+                break;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(succ) = graph.get(n) {
+                stack.extend(succ.iter().map(String::as_str));
+            }
+        }
+    }
+    cyclic
+}
+
 fn body_references_name(stmts: &[Statement], name: &str) -> bool {
     struct V<'n> {
         name: &'n str,
@@ -2357,26 +2477,77 @@ mod tests {
     }
 
     #[test]
+    fn flatten_transitively_inlines_exposed_calls() {
+        // The `set → copy` shape: `host` (@flatten) inlines `setit`, whose body
+        // calls `b`. `b` is EXPOSED by that inline; transitive inlining must then
+        // inline `b` too (bounded), not leave it as a residual call.
+        let out = inline(
+            "function b(o, a) { o[0] = a[0]; }\n\
+             function setit(o, a) { b(o, a); }\n\
+             /* @flatten */ export function host(o, a) { setit(o, a); }",
+        );
+        // Inspect the HOST body (the leftover `function b`/`setit` *defs* linger for
+        // remove-unused to drop; only the host's calls matter here).
+        let host = out.split("function host").nth(1).expect("host in output");
+        assert!(!host.contains("setit("), "direct call inlined:\n{out}");
+        assert!(!host.contains("b("), "exposed call transitively inlined:\n{out}");
+        assert!(host.contains("o[0] = a[0]"), "fully-inlined body:\n{out}");
+    }
+
+    #[test]
+    fn recursive_callee_is_refused_not_unrolled() {
+        // Closure-aligned: a self-recursive callee is not an inline candidate at all
+        // (refused at collection, like `FunctionInjector` fnRecursionName), so the
+        // call stays as a single direct call — NOT unrolled N levels by the depth cap.
+        let out = inline(
+            "function rec(n) { return n <= 0 ? 0 : rec(n - 1); }\n\
+             /* @flatten */ export function host(x) { return rec(x); }",
+        );
+        let host = out.split("function host").nth(1).expect("host in output");
+        assert!(host.contains("rec(x)"), "recursion refused → single direct call kept:\n{out}");
+        // Exactly one `rec(` call in the host (no unrolled copies).
+        assert_eq!(host.matches("rec(").count(), 1, "not unrolled:\n{out}");
+    }
+
+    #[test]
+    fn mutually_recursive_callees_are_refused() {
+        // A→B→A: neither references its OWN name, so the direct guard misses them;
+        // cycle detection refuses both, guaranteeing the transitive fixpoint
+        // terminates. The host's call to the cycle stays a residual call.
+        let out = inline(
+            "function a(n) { return b(n - 1); }\n\
+             function b(n) { return n <= 0 ? 0 : a(n - 1); }\n\
+             /* @flatten */ export function host(x) { return a(x); }",
+        );
+        let host = out.split("function host").nth(1).expect("host in output");
+        assert!(host.contains("a(x)"), "mutual-recursion cycle refused → residual call:\n{out}");
+    }
+
+    #[test]
     fn nested_call_in_loop_body_not_hoisted_out_of_scope() {
         // Regression: inlining `integrate` (an `@optimize` host's callee) into a
-        // loop body must keep the inlined body — and the helper calls it makes —
-        // INSIDE the loop, after the loop-local binding `e = arr[i]`. A bug in
-        // `hoist_expr_calls` descended into nested statement bodies and lifted
-        // statement-position calls to the host top, hoisting `e`'s uses above its
-        // `let` binding → invalid JS (`e` referenced out of scope).
+        // loop body must keep the inlined body INSIDE the loop, after the loop-local
+        // binding `e = arr[i]`. A bug in `hoist_expr_calls` descended into nested
+        // statement bodies and lifted statement-position calls to the host top,
+        // hoisting `e`'s uses above its `let` binding → invalid JS. With transitive
+        // inlining `limitV` (exposed by inlining `integrate`) is ALSO inlined into
+        // the loop body, so the scope-safety invariant covers the deeper content:
+        // every inlined `.vx`/`.px` use stays after the `arr[i]` binding, and none
+        // leaks above the `for`.
         let out = inline(
             "function limitV(e, m) { if (e.vx > m) e.vx = m; }\n\
              function integrate(e, m) { e.px = e.vx; limitV(e, m); }\n\
              /* @optimize */ export function step(arr) { for (let i = 0; i < arr.length; i++) { integrate(arr[i], 1.6); } }",
         );
         let step = out.split("function step").nth(1).expect("step in output");
+        assert!(!step.contains("limitV("), "limitV transitively inlined (no residual call):\n{out}");
         let bind = step.find("arr[i]").expect("loop binding present");
-        let call = step.find("limitV(").expect("helper call survives inside loop");
-        assert!(bind < call, "loop binding must precede the helper call (not hoisted out):\n{out}");
+        let use_ = step.find(".vx").expect("inlined helper body present in the loop");
+        assert!(bind < use_, "loop binding must precede the inlined body (not hoisted out):\n{out}");
         // Nothing referencing the loop-local var may appear before the `for`.
         let pre_for = &step[..step.find("for ").expect("for loop present")];
         assert!(
-            !pre_for.contains(".vx") && !pre_for.contains("limitV"),
+            !pre_for.contains(".vx") && !pre_for.contains(".px") && !pre_for.contains("limitV"),
             "no inlined/hoisted helper body before the loop:\n{out}"
         );
     }

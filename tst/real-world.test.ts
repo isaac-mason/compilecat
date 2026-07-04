@@ -103,7 +103,22 @@ const KERNELS: Kernel[] = [
         callBody: 'const out = [0, 0, 0]; closestOnSimplex(out, size, y); return out;',
         inputs: (r, i) => [1 + (i % 4), vn(12)(r)],
     },
+    {
+        name: 'real-world: dbvt castRay (transitive set→copy inline; multi-return rayDistanceToBox3)',
+        fixture: 'dbvt-cast-ray.ts',
+        params: ['origin', 'direction', 'length', 'boxes'],
+        callBody: 'return castRay(origin, direction, length, boxes);',
+        inputs: (r) => [v3(r), v3(r), 1 + Math.abs(r()), Array.from({ length: 5 }, () => aabb(r))],
+    },
 ];
+
+/** A valid AABB `[minX,minY,minZ,maxX,maxY,maxZ]` (max = min + a positive extent). */
+const aabb = (r: () => number): number[] => {
+    const x = r();
+    const y = r();
+    const z = r();
+    return [x, y, z, x + 0.5 + Math.abs(r()), y + 0.5 + Math.abs(r()), z + 0.5 + Math.abs(r())];
+};
 
 describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
     for (const k of KERNELS) {
@@ -180,6 +195,38 @@ describe('module-scratch scalar replacement — real crashcat patterns', () => {
         // every case writes all fields → must-written at the post-switch read.
         expect(out).not.toContain('const _closest');
         expect(out).toMatch(/_closest_0/);
+    });
+});
+
+// Transitive inlining (the `raycast3.set → vec3.copy` chain): `@optimize castRay`
+// inlines `setRay`, whose body calls `copy`; that call is only EXPOSED by the
+// inline, and transitive inlining resolves it to a fixpoint. Recursion cycles are
+// refused (so the fixpoint terminates); there is no depth/size cap.
+describe('transitive inlining — dbvt castRay', () => {
+    const castRay = (): string =>
+        compiler.compileChunk(
+            'dbvt-cast-ray.ts',
+            readFileSync(resolve(here, 'fixtures/real-world', 'dbvt-cast-ray.ts'), 'utf8'),
+            {},
+        ).code;
+
+    it('inlines the directly-called helpers (setRay, rayDistanceToBox3)', () => {
+        const out = castRay();
+        expect(out).not.toContain('setRay(');
+        expect(out).not.toContain('rayDistanceToBox3(');
+    });
+
+    it('transitively inlines copy — the call exposed by inlining setRay', () => {
+        const out = castRay();
+        // The `copy(...)` calls live inside setRay; only visible after it inlines.
+        // Pre-transitive-inlining this left residual `copy(` calls in castRay.
+        const body = out.slice(out.indexOf('function castRay'));
+        expect(body).not.toContain('copy(');
+    });
+
+    it('block-inlines the multi-return rayDistanceToBox3 (labelled, callee-named)', () => {
+        const out = castRay();
+        expect(out).toMatch(/_inline_rayDistanceToBox3_/);
     });
 });
 
