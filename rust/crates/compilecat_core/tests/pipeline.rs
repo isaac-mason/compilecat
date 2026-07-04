@@ -320,7 +320,7 @@ fn inline_gate_does_not_reach_uninvolved_functions() {
 fn same_file_inline_flattens_multi_return_consumer() {
     // A multi-return `@inline` uses the labeled-block machinery; its residue in a
     // directive-free consumer must also flatten (minimize-exit-points +
-    // block_flatten), leaving no `_compilecat_inline_label` scaffolding.
+    // block_flatten), leaving no `_inline_` label scaffolding.
     let out = transform(
         "/* @inline */ function sign(a) { if (a > 0) return 1; return -1; }\n\
          export function f(x) { let s = sign(x); return s * 10; }",
@@ -328,7 +328,7 @@ fn same_file_inline_flattens_multi_return_consumer() {
     );
     assert!(!out.code.contains("sign("), "donor inlined:\n{}", out.code);
     assert!(
-        !out.code.contains("_compilecat_inline_label"),
+        !out.code.contains("_inline_"),
         "labeled-block residue not flattened:\n{}",
         out.code
     );

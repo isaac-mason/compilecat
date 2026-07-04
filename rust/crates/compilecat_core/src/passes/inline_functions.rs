@@ -104,7 +104,7 @@ pub fn run<'a>(
     // inline-generated name across ALL phases (declaration inlining,
     // @optimize/@flatten, call-site) — and, via the caller, across the cross-file
     // donor-inline that precedes this. Each generated `_inl_arg_<n>` /
-    // `_compilecat_inline_label_<n>` / `_…__result_<n>` / `p__<n>` is unique by
+    // `_inline_<callee>_<n>` (block label) / `_…__result_<n>` / `p__<n>` is unique by
     // construction, preventing the illegal same-scope redeclaration that
     // `oxc_semantic` conflates (which defeats the block_flatten renamer and yields
     // self-referential consts or cross-slot substitutions). Replaces the old
@@ -777,6 +777,23 @@ struct BlockPlan<'a> {
     result_name: Option<String>,
     /// For `let x = f()` — emit `let x;` before the block.
     emit_let: Option<String>,
+    /// Simple name of the inlined callee (`None` for anonymous/computed callees) —
+    /// threaded into the block label so it reads back to its function.
+    callee_name: Option<String>,
+}
+
+/// Mint the inline block label: `_inline_<callee>_<id>`, so it reads back to the
+/// function it came from (`_inline_rayDistanceToBox3_5`) and all inline labels
+/// share a greppable `_inline_` prefix. Compact analogue of Closure's
+/// `JSCompiler_inline_label_<name>_<id>` (`FunctionToBlockMutator`). Anonymous
+/// callees fall back to `_inline_<id>`. The `id` is still load-bearing: it keeps
+/// two inlines of the same helper — and any nested same-callee inline — from
+/// colliding, and pairs the label with its `_<callee>__result_<id>` temp.
+fn inline_label(callee: Option<&str>, id: u32) -> String {
+    match callee {
+        Some(n) => format!("_inline_{n}_{id}"),
+        None => format!("_inline_{id}"),
+    }
 }
 
 impl<'a> BlockInliner<'a, '_> {
@@ -793,13 +810,14 @@ impl<'a> BlockInliner<'a, '_> {
         let Some(plan) = self.plan_for(&stmt, id) else { return Err(stmt) };
         self.next_id += 1;
         let needs_result = plan.result_name.is_some();
+        let label = inline_label(plan.callee_name.as_deref(), id);
         let out = mutate_for_block_inline(
             self.allocator,
             BlockMutateInput {
                 body_stmts: plan.body_stmts,
                 params: plan.params,
                 args: plan.args,
-                label: format!("_compilecat_inline_label_{id}"),
+                label,
                 result_name: plan.result_name.unwrap_or_default(),
                 needs_result,
             },
@@ -1058,13 +1076,14 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
             let Some(plan) = plan else { break 'hoist };
             self.next_id += 1;
 
+            let label = inline_label(plan.callee_name.as_deref(), id);
             let out = mutate_for_block_inline(
                 self.allocator,
                 BlockMutateInput {
                     body_stmts: plan.body_stmts,
                     params: plan.params,
                     args: plan.args,
-                    label: format!("_compilecat_inline_label_{id}"),
+                    label,
                     result_name: result.clone(),
                     needs_result: true,
                 },
@@ -1242,7 +1261,14 @@ fn build_block_plan<'a>(
         }
     }
 
-    Some(BlockPlan { params: temp_params, body_stmts, args: temp_args, result_name, emit_let })
+    Some(BlockPlan {
+        params: temp_params,
+        body_stmts,
+        args: temp_args,
+        result_name,
+        emit_let,
+        callee_name: callee_simple_name(call).map(str::to_string),
+    })
 }
 
 /// An arg cheap + side-effect-free enough to substitute directly (vs a temp):
@@ -2486,6 +2512,19 @@ mod tests {
         );
         assert!(out.contains("_classify__result_"), "callee-named result temp:\n{out}");
         assert!(!out.contains("_compilecat_result"), "no opaque name:\n{out}");
+    }
+
+    #[test]
+    fn block_label_references_callee_name() {
+        // A block-inlined multi-exit callee's label carries the callee name
+        // (`_inline_<callee>_<id>`) and shares its id with the result temp
+        // (`_<callee>__result_<id>`), so the label reads back to its origin rather
+        // than an opaque id-only form.
+        let out = inline(
+            "/* @inline */ function classify(s) { if (s > 0) return 1; return 0; }\nexport function host(s) { return classify(s) + 1; }",
+        );
+        assert!(out.contains("_inline_classify_"), "label references the callee:\n{out}");
+        assert!(out.contains("_classify__result_"), "result temp is callee-named:\n{out}");
     }
 
     #[test]

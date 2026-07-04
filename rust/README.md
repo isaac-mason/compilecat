@@ -21,7 +21,6 @@ rust/
       src/options.rs               Mode, TransformOptions, Stats, output
       src/passes/                  the optimization passes (one module each)
       src/analysis/                CFG / dataflow / purity / type-shape infra
-      examples/transform.rs        run on a file from disk
     compilecat_napi/               cdylib → the .node addon
       src/lib.rs                   Compiler { compileFile, compileChunk }
       package.json                 @napi-rs/cli build config
@@ -52,8 +51,11 @@ PATH and `rustup target add wasm32-unknown-unknown`.
 ```bash
 # core only (fast iteration + tests)
 pnpm test:rust                                                 # cargo test -p compilecat_core
-cd rust && cargo run -p compilecat_core --example transform -- ../tst/<fixture>.ts
+cd rust && cargo test -p compilecat_core <name>                # run a single test by name
 ```
+
+To transform a file end-to-end, go through a binding: the wasm/napi `Compiler`
+(`compileFile` / `compileChunk`) — e.g. the JS gates in `tst/*.test.ts`.
 
 Versions are pinned to a known-good set (see `Cargo.toml`); run `cargo update`
 to move forward once it compiles in your environment. A few API spots are
