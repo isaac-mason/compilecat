@@ -18,7 +18,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast::{AstBuilder, NONE};
-use oxc_ast_visit::{walk_mut, Visit, VisitMut};
+use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
 use oxc_span::SPAN;
 
 pub(crate) struct BlockMutateInput<'a> {
@@ -52,24 +52,27 @@ pub(crate) fn mutate_for_block_inline<'a>(
     let label: &'a str = allocator.alloc_str(&label);
     let result_name: &'a str = allocator.alloc_str(&result_name);
 
-    // Prologue: `let p = arg;` per param (always-temp v1).
+    // Prologue: bind each passed param to its arg. Emit `const` unless the param
+    // is REBOUND in the body (`p = …` / `p++` / destructured target) — a member
+    // or element write (`p[0] = …`, `p.x = …`) mutates the object the binding
+    // points at, not the binding, so it stays const-able. (The params that reach
+    // here are the eval-once temps + genuinely reassigned params; most are the
+    // former and become `const`, tidying the inlined output.)
     let mut prologue: Vec<Statement<'a>> = Vec::with_capacity(params.len());
     let mut args = args.into_iter();
     for p in &params {
         let arg = args.next().unwrap_or_else(|| void_expr(&ast));
         let name: &'a str = allocator.alloc_str(p);
+        let kind = if is_reassigned(&body_stmts, p) {
+            VariableDeclarationKind::Let
+        } else {
+            VariableDeclarationKind::Const
+        };
         let bid = ast.binding_pattern_binding_identifier(SPAN, name);
-        let declr = ast.variable_declarator(
-            SPAN,
-            VariableDeclarationKind::Let,
-            bid,
-            NONE,
-            Some(arg),
-            false,
-        );
+        let declr = ast.variable_declarator(SPAN, kind, bid, NONE, Some(arg), false);
         prologue.push(Statement::VariableDeclaration(ast.alloc(ast.variable_declaration(
             SPAN,
-            VariableDeclarationKind::Let,
+            kind,
             ast.vec1(declr),
             false,
         ))));
@@ -118,6 +121,57 @@ pub(crate) fn mutate_for_block_inline<'a>(
 
     let block = block_of(&ast, prologue, body_stmts);
     BlockMutateOutput { block, has_result_write }
+}
+
+/// Whether `name` is REBOUND anywhere in `stmts`: a whole-identifier assignment
+/// (`name = …`, `name += …`), an update (`name++`), a destructuring target
+/// (`[name] = …`), or a `for (name of …)` head — every write reaches the leaf
+/// `AssignmentTargetIdentifier`. A member/element write (`name[0] = …`, `name.x =
+/// …`) is NOT a rebind (it mutates the pointed-at object), so it doesn't count and
+/// the binding stays const-able.
+fn is_reassigned(stmts: &[Statement], name: &str) -> bool {
+    struct V<'n> {
+        name: &'n str,
+        found: bool,
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        // `p = …`, `p += …`, and destructuring leaves (`[p] = …`, `({x: p} = …)`),
+        // which recurse into this same node. A member/element target
+        // (`p.x`/`p[0]`) is `Static/ComputedMemberExpression`, not an identifier
+        // target — correctly ignored (it mutates the object, not the binding).
+        fn visit_assignment_target(&mut self, t: &AssignmentTarget<'a>) {
+            if let AssignmentTarget::AssignmentTargetIdentifier(id) = t {
+                if id.name == self.name {
+                    self.found = true;
+                }
+            }
+            walk::walk_assignment_target(self, t);
+        }
+        // Object-destructuring shorthand `({p} = …)` binds via a distinct node.
+        fn visit_assignment_target_property_identifier(
+            &mut self,
+            p: &AssignmentTargetPropertyIdentifier<'a>,
+        ) {
+            if p.binding.name == self.name {
+                self.found = true;
+            }
+            walk::walk_assignment_target_property_identifier(self, p);
+        }
+        // `p++` / `--p`.
+        fn visit_update_expression(&mut self, u: &UpdateExpression<'a>) {
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &u.argument {
+                if id.name == self.name {
+                    self.found = true;
+                }
+            }
+            walk::walk_update_expression(self, u);
+        }
+    }
+    let mut v = V { name, found: false };
+    for s in stmts {
+        v.visit_statement(s);
+    }
+    v.found
 }
 
 /// `{ ...prologue, ...stmts }`.
@@ -289,7 +343,7 @@ mod tests {
     #[test]
     fn trailing_return_falls_through_no_label() {
         let out = run("function f(a) { return a + 1; }", &["A"], true);
-        assert!(out.contains("let a = A"), "{out}");
+        assert!(out.contains("const a = A"), "read-only param → const:\n{out}");
         assert!(out.contains("_r = a + 1"), "{out}");
         assert!(!out.contains("break"), "no break for a sole trailing return:\n{out}");
         assert!(!out.contains("_l:"), "no label needed:\n{out}");
@@ -305,9 +359,24 @@ mod tests {
     }
 
     #[test]
+    fn reassigned_param_stays_let() {
+        // `a` is rebound (`a = a + 1`) → must keep `let` (const would be illegal).
+        let out = run("function f(a) { a = a + 1; return a; }", &["A"], true);
+        assert!(out.contains("let a = A"), "rebound param stays let:\n{out}");
+        assert!(!out.contains("const a = A"), "must not be const:\n{out}");
+    }
+
+    #[test]
+    fn member_write_param_is_const() {
+        // `o[0] = …` mutates the object, not the binding → stays const-able.
+        let out = run("function f(o) { o[0] = 1; return o; }", &["O"], true);
+        assert!(out.contains("const o = O"), "member-write param → const:\n{out}");
+    }
+
+    #[test]
     fn void_statement_position_no_result() {
         let out = run("function f(a) { g(a); }", &["A"], false);
-        assert!(out.contains("let a = A"), "{out}");
+        assert!(out.contains("const a = A"), "read-only param → const:\n{out}");
         assert!(out.contains("g(a)"), "{out}");
         assert!(!out.contains("_r"), "no result temp for needs_result=false:\n{out}");
         assert!(!out.contains("break"), "{out}");
