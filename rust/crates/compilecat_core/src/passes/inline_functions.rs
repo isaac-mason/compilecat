@@ -2524,6 +2524,68 @@ mod tests {
     }
 
     #[test]
+    fn transitive_inline_chain_of_three() {
+        // A→B→C: the fixpoint must iterate past one level — inline a, which exposes
+        // b, which exposes c. All three collapse into the host.
+        let out = inline(
+            "function c(x) { return x + 1; }\n\
+             function b(x) { return c(x) * 2; }\n\
+             function a(x) { return b(x) - 3; }\n\
+             /* @flatten */ export function host(x) { return a(x); }",
+        );
+        let host = out.split("function host").nth(1).expect("host");
+        for call in ["a(", "b(", "c("] {
+            assert!(!host.contains(call), "{call} inlined:\n{out}");
+        }
+        assert!(host.contains("+ 1") && host.contains("* 2") && host.contains("- 3"), "bodies:\n{out}");
+    }
+
+    #[test]
+    fn transitive_inline_past_old_depth_cap() {
+        // An 11-deep helper chain must FULLY inline — regression guard that deleting
+        // the old depth cap (8) lets the fixpoint run to completion, not stop short.
+        let mut src = String::new();
+        for i in 0..10 {
+            src.push_str(&format!("function h{i}(x) {{ return h{}(x) + {i}; }}\n", i + 1));
+        }
+        src.push_str("function h10(x) { return x; }\n");
+        src.push_str("/* @flatten */ export function host(x) { return h0(x); }");
+        let out = inline(&src);
+        let host = out.split("function host").nth(1).expect("host");
+        for i in 0..=10 {
+            assert!(!host.contains(&format!("h{i}(")), "h{i} fully inlined (past old cap):\n{out}");
+        }
+    }
+
+    #[test]
+    fn indirect_recursion_cycle_refused() {
+        // A 3-cycle A→B→C→A: cycle detection is by reachability, so an indirect
+        // cycle is refused just like the 2-cycle. Host's call stays.
+        let out = inline(
+            "function a(n) { return b(n); }\n\
+             function b(n) { return c(n); }\n\
+             function c(n) { return n <= 0 ? 0 : a(n - 1); }\n\
+             /* @flatten */ export function host(x) { return a(x); }",
+        );
+        let host = out.split("function host").nth(1).expect("host");
+        assert!(host.contains("a(x)"), "3-cycle refused → residual call:\n{out}");
+    }
+
+    #[test]
+    fn non_recursive_caller_of_cycle_still_inlines() {
+        // No over-refusal: `wrap` calls the recursive `rec` but isn't itself on a
+        // cycle → wrap still inlines; the exposed `rec` call (refused) stays.
+        let out = inline(
+            "function rec(n) { return n <= 0 ? 0 : rec(n - 1); }\n\
+             function wrap(n) { return rec(n) + 1; }\n\
+             /* @flatten */ export function host(x) { return wrap(x); }",
+        );
+        let host = out.split("function host").nth(1).expect("host");
+        assert!(!host.contains("wrap("), "non-recursive wrap inlined:\n{out}");
+        assert!(host.contains("rec("), "exposed recursive call refused → stays:\n{out}");
+    }
+
+    #[test]
     fn nested_call_in_loop_body_not_hoisted_out_of_scope() {
         // Regression: inlining `integrate` (an `@optimize` host's callee) into a
         // loop body must keep the inlined body INSIDE the loop, after the loop-local
