@@ -110,6 +110,25 @@ const KERNELS: Kernel[] = [
         callBody: 'return castRay(origin, direction, length, boxes);',
         inputs: (r) => [v3(r), v3(r), 1 + Math.abs(r()), Array.from({ length: 5 }, () => aabb(r))],
     },
+    {
+        name: 'real-world: quat slerp (dot-sign-flip branch + acos/sin trig + conditional-def temps)',
+        fixture: 'quat-slerp.ts',
+        params: ['a', 'b', 't'],
+        callBody: 'const out = [0, 0, 0, 0]; slerp(out, a, b, t); return out;',
+        inputs: (r) => [q4(r), q4(r), unit(r)],
+    },
+    {
+        name: 'real-world: rayCylinder (6-guard multiple-return cascade → labelled block on inline)',
+        fixture: 'ray-cylinder.ts',
+        params: ['direction', 'aPoints', 'bPoints', 'radius'],
+        callBody: 'return castRayVsCylinders(direction, aPoints, bPoints, radius);',
+        inputs: (r) => [
+            v3(r),
+            Array.from({ length: 5 }, () => v3(r)),
+            Array.from({ length: 5 }, () => v3(r)),
+            1 + Math.abs(r()),
+        ],
+    },
 ];
 
 /** A valid AABB `[minX,minY,minZ,maxX,maxY,maxZ]` (max = min + a positive extent). */
@@ -119,6 +138,9 @@ const aabb = (r: () => number): number[] => {
     const z = r();
     return [x, y, z, x + 0.5 + Math.abs(r()), y + 0.5 + Math.abs(r()), z + 0.5 + Math.abs(r())];
 };
+
+/** A scalar in [0, 1] from the [-range, range] PRNG (for interpolation `t`). */
+const unit = (r: () => number): number => (r() + 2) / 4;
 
 describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
     for (const k of KERNELS) {
@@ -227,6 +249,34 @@ describe('transitive inlining — dbvt castRay', () => {
     it('block-inlines the multi-return rayDistanceToBox3 (labelled, callee-named)', () => {
         const out = castRay();
         expect(out).toMatch(/_inline_rayDistanceToBox3_/);
+    });
+});
+
+describe('real-world: optimization pins — slerp / rayCylinder', () => {
+    const compiledFixture = (fixture: string): string =>
+        compiler.compileChunk(
+            fixture,
+            readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'),
+            {},
+        ).code;
+
+    it('slerp: control-flow shape is preserved (both ifs stay — no if→ternary)', () => {
+        const out = compiledFixture('quat-slerp.ts');
+        // Preserve-control-flow-shape: the sign-flip and the trig/linear branches
+        // stay as `if` statements; the value semantics are unchanged.
+        expect(out).toContain('if (');
+        expect((out.match(/if \(/g) || []).length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('rayCylinder: block-inlined, and its top-level guard cascade flattens (no label)', () => {
+        const out = compiledFixture('ray-cylinder.ts');
+        const body = out.slice(out.indexOf('function castRayVsCylinders'));
+        expect(body).not.toContain('rayCylinder('); // inlined, no residual call
+        expect(out).toMatch(/_rayCylinder__result_/); // block-inlined (result temp survives)
+        // The six TOP-LEVEL `return Infinity` guards flatten via minimize-exit-points
+        // into nested if/else fall-through, so all breaks vanish and no `_inline_`
+        // label survives — denser but flatter than castRay's nested-return case.
+        expect(out).not.toMatch(/_inline_rayCylinder_/);
     });
 });
 
