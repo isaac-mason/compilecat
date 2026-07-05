@@ -709,7 +709,6 @@ describe('fuzz: transitive-inline chains + directive combinations', () => {
 // only reproduce when killed-on-entry holds) are observable — a wrong scalarization
 // diverges. Names are drawn to sometimes collide with entry's own locals/params.
 class ScratchGen {
-    private id = 0;
     constructor(private r: Rng) {}
     // PURE numeric expr (no `eff`): an impure call between scratch writes correctly
     // trips the re-entrancy guard and bails, so putting `eff` here would mean the
@@ -724,8 +723,9 @@ class ScratchGen {
             () => 'Math.abs(q)',
         ])();
     }
-    /** { program, call } — `call` runs entry twice to expose cross-call buffer state. */
-    program(): { program: string; call: string } {
+    /** { program, exports, call } — `call` runs entry twice to expose cross-call
+     *  buffer state; `exports` names only the functions (scratch const stays private). */
+    program(): { program: string; exports: string; call: string } {
         const n = int(this.r, 2, 3);
         // Sometimes name the scratch so its scalars (`s_0`) collide with a local the
         // entry also declares — the collision class reviewer C found.
@@ -750,7 +750,10 @@ class ScratchGen {
             'blockShadow',
             'loopBody',
             'loopReadBeforeWrite',
-            'aliasClosure',
+            // 'aliasClosure' is EXCLUDED from the random gate: it reliably reproduces
+            // a real, still-open miscompile (the alias binding is dropped but a
+            // returned closure still reads it → ReferenceError). Pinned as an
+            // `it.fails` in "KNOWN BUGS" below; re-add here once the core is fixed.
             'bothBranches',
             'switchWrite',
             'partialBranch',
@@ -909,12 +912,12 @@ describe('fuzz: module-scratch scalar replacement (effect oracle, two-call)', ()
     it(`${ITERS} module-scratch programs preserve semantics across calls`, () => {
         for (let i = 0; i < ITERS; i++) {
             const seed = (BASE ^ 0x1b873593) + i * 2654435761;
-            const { program, call } = new ScratchGen(mulberry32(seed >>> 0)).program();
+            const { program, exports, call } = new ScratchGen(mulberry32(seed >>> 0)).program();
             let d: ReturnType<typeof scratchDiff>;
             try {
-                d = scratchDiff(program, call);
+                d = scratchDiff(program, exports, call);
             } catch (e) {
-                d = { want: 'n/a', got: `<compile threw: ${(e as Error).message}>` };
+                d = { want: 'n/a', got: `<compile threw: ${(e as Error).message}>`, compiled: '' };
             }
             if (d) {
                 throw new Error(
@@ -950,7 +953,7 @@ describe('nested-inline user-local collision (fixed)', () => {
         const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
         const want = evalProgram(src, 'entry(7, 3)');
         const got = evalProgram(out, 'entry(7, 3)');
-        expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(JSON.stringify(want.value));
+        expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(want.ok ? JSON.stringify(want.value) : '<threw>');
     });
 });
 
@@ -964,7 +967,7 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
             const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
             const want = evalProgram(src, call);
             const got = evalProgram(out, call);
-            expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(JSON.stringify(want.value));
+            expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(want.ok ? JSON.stringify(want.value) : '<threw>');
         });
     };
 
@@ -1279,5 +1282,24 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
     it.fails('`A && (q && 5)` drops the value (source 5, compiled 3)', () => {
         // compiles to `p && q`: source (q truthy → 5) = 5; compiled = 3.
         expectDiverges(`/* @optimize */ function entry(p, q) { return p && (q && 5); }`);
+    });
+
+    // BUG C — module-scratch alias dropped under a returned closure. The single-owner
+    // module-scratch scalar-replacement follows the alias `const va = v` and rewrites
+    // the DIRECT writes to `v[i] = …`, dropping the `const va = v` binding — but a
+    // RETURNED closure `() => va[0]` still references `va`, so the compiled output is
+    // `ReferenceError: va is not defined`. Source returns the value; compiled throws.
+    // Surfaced by the module-scratch fuzzer's `aliasClosure` mode once its previously
+    // broken plumbing (it never actually invoked `entry`) was fixed. Suspected pass:
+    // the module-scratch SROA alias-following (GlobalOpt-localize). NOTE: compiled
+    // with an explicit `export { entry }` — exporting the scratch const `v` (which
+    // `withExports` would do) forces a bail and hides the bug.
+    it.fails('module-scratch alias dropped but read by returned closure (ReferenceError)', () => {
+        const src = `const v = /*@__PURE__*/ [0];\n/* @optimize */ function entry(p) { const va = v; va[0] = p; return () => va[0]; }`;
+        const call = 'entry(5)()'; // source → 5; compiled throws (`va` undeclared)
+        const out = compiler.compileChunk('r.ts', `${src}\nexport { entry };`, {}).code;
+        const want = evalProgram(src, call);
+        const got = evalProgram(out, call);
+        expect(resultsEquiv(want, got)).toBe(true);
     });
 });
