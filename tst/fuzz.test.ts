@@ -67,17 +67,53 @@ function evalProgram(code: string, call: string): { ok: true; value: unknown } |
     }
 }
 
+type EvalRes = { ok: true; value: unknown } | { ok: false };
+
+// ── the equivalence oracle ───────────────────────────────────────────────────
+//
+// STRUCTURAL deep-equal built on `Object.is`, NOT `JSON.stringify`. This matters
+// once the fuzzers emit non-numeric values (see CoerceGen): JSON.stringify erases
+// exactly the distinctions a fold can get wrong — it maps `-0`→`0`, `NaN`→`null`,
+// `Infinity`→`null`, and drops `undefined`. `Object.is` keeps `-0 ≢ +0` (a real
+// fold hazard: `x + 0` normalizes `-0`) and `NaN ≡ NaN`, and we compare
+// strings/booleans/null/undefined/nested objects/arrays exactly.
+function deepEq(a: unknown, b: unknown, looseZero = false): boolean {
+    if (Object.is(a, b)) return true; // primitives incl. NaN≡NaN, -0≢+0
+    if (looseZero && a === 0 && b === 0) return true; // fold -0 and +0 together
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const ka = Object.keys(a as object);
+    const kb = Object.keys(b as object);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) {
+        if (!Object.hasOwn(b, k)) return false;
+        if (!deepEq((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], looseZero)) return false;
+    }
+    return true;
+}
+
+/** Oracle equivalence of two eval results. Throwing is an equivalence class: if
+ *  BOTH source and compiled throw it's EQUAL (no divergence); if exactly one
+ *  throws it's a real divergence. Otherwise the `[value, trace, __g]` tuples must
+ *  be structurally deep-equal. */
+function resultsEquiv(want: EvalRes, got: EvalRes, looseZero = false): boolean {
+    if (!want.ok || !got.ok) return want.ok === got.ok;
+    return deepEq(want.value, got.value, looseZero);
+}
+
 /** Compare source-eval vs compiled-eval. Returns null if equivalent, else why. */
 function diff(code: string): { call: string; compiled: string; want: unknown; got: unknown } | null {
     const call = 'entry(7, 3)';
     const want = evalProgram(code, call);
-    if (!want.ok) return null; // generated program threw — not a compiler concern
+    if (!want.ok) return null; // generated program threw (generation artifact) — skip
     const compiled = compiler.compileChunk('fuzz.ts', withExports(code), {}).code;
     const got = evalProgram(compiled, call);
-    const wv = JSON.stringify(want.value);
-    const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
-    if (wv === gv) return null;
-    return { call, compiled, want: want.value, got: got.ok ? got.value : '<threw>' };
+    // looseZero: the behavioral gates allowlist the known, still-open signed-zero
+    // fold bug (`x + 0`/`0 + x` discards -0 — pinned in "KNOWN BUGS" below), so a
+    // pure -0↔+0 difference is not reported here. Every other distinction (NaN,
+    // strings, undefined, structure) is exact. The dedicated pins assert the -0 bug.
+    if (resultsEquiv(want, got, /* looseZero */ true)) return null;
+    return { call, compiled, want: want.ok ? want.value : '<threw>', got: got.ok ? got.value : '<threw>' };
 }
 
 /** Cross-file differential: compile the consumer against the donor and compare
@@ -91,7 +127,7 @@ function crossDiff(
 ): { compiled: string; want: unknown; got: unknown } | null {
     const call = 'entry(7, 3)';
     const want = evalProgram(`${donor}\n${consumer}`, call);
-    if (!want.ok) return null;
+    if (!want.ok) return null; // generated program threw (generation artifact) — skip
     const compiled = compiler.compileFileCross(
         'entry.ts',
         withExports(consumer),
@@ -99,10 +135,8 @@ function crossDiff(
         {},
     ).code;
     const got = evalProgram(`${donor}\n${compiled}`, call);
-    const wv = JSON.stringify(want.value);
-    const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
-    if (wv === gv) return null;
-    return { compiled, want: want.value, got: got.ok ? got.value : '<threw>' };
+    if (resultsEquiv(want, got, /* looseZero: allowlist known -0 fold bug */ true)) return null;
+    return { compiled, want: want.ok ? want.value : '<threw>', got: got.ok ? got.value : '<threw>' };
 }
 
 // ── seeded PRNG (reproducible) ───────────────────────────────────────────────
@@ -431,12 +465,7 @@ function shrink(code: string): string {
                 // declaration — which would turn a real var into an undefined read
                 // (NaN, which still "diverges") and yield a misleading repro.
                 const cv = evalProgram(candidate, 'entry(7, 3)');
-                if (
-                    orig.ok &&
-                    cv.ok &&
-                    JSON.stringify(cv.value) === JSON.stringify(orig.value) &&
-                    diff(candidate)
-                ) {
+                if (orig.ok && cv.ok && deepEq(cv.value, orig.value) && diff(candidate)) {
                     best = candidate;
                     changed = true;
                     break;
@@ -869,9 +898,9 @@ function scratchDiff(
     const withExp = `${program}\nexport { ${exports} };`;
     const compiled = compiler.compileChunk('scratch.ts', withExp, {}).code;
     const got = evalProgram(compiled, call);
-    const wv = JSON.stringify(want.value);
-    const gv = got.ok ? JSON.stringify(got.value) : '<threw>';
-    return wv === gv ? null : { want: want.value, got: got.ok ? got.value : '<threw>', compiled };
+    return resultsEquiv(want, got, /* looseZero: allowlist known -0 fold bug */ true)
+        ? null
+        : { want: want.value, got: got.ok ? got.value : '<threw>', compiled };
 }
 
 describe('fuzz: module-scratch scalar replacement (effect oracle, two-call)', () => {
@@ -1038,5 +1067,217 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         const donor = `export function d0(a, b) { return (eff(2) > a ? (b - 9) : 5); }`;
         const consumer = `import { d0 } from "./donor";\n/* @optimize */ function entry(p, q) { return q - d0(Math.abs(99), eff(0)); }`;
         expect(crossDiff(donor, consumer, './donor')).toBe(null);
+    });
+});
+
+// ── value/coercion generator ─────────────────────────────────────────────────
+//
+// The main Gen/ChainGen/ScratchGen are deliberately all-NUMERIC (total, no NaN /
+// -0 / strings / undefined), which leaves the compiler's TYPE-GATED folds and its
+// coercion/short-circuit handling completely unfuzzed. CoerceGen closes that gap:
+// it flows SPICY scalars — strings, booleans, null, undefined, and the special
+// numbers NaN (`0/0`), ±Infinity (`1/0` / `-1/0`), and `-0` — through identity
+// folds (`x*1`, `1*x`, `x-0`), coercion (`s + n`, `n + s`), and the operators the
+// numeric fuzzer never emits: `&& || ?? % ** | & ^ << >> >>>`, unary `- ! ~ typeof
+// void +`, the sequence `,`, and comparisons. The spicy values enter via INFERENCE
+// (real literal-typed locals, never a lying `as number` cast), so it's the
+// compiler's own type inference under test, not a contract we handed it.
+//
+// The generator is structured to stay SOUND-BY-CONSTRUCTION over the compiler's
+// currently-correct subspace: `&&`/`||`/`??`/`?:` appear only as a SINGLE
+// top-level combinator over pure-arithmetic operands (never nested inside another
+// logical/ternary — the shape that trips the boolean-context leak pinned below),
+// and the additive-identity `x + 0` fold form (the -0 hazard, also pinned) is only
+// emitted under FUZZ_SPICY. So the gate is GREEN; set FUZZ_SPICY=1 to re-enable
+// the buggy shapes for an ad-hoc bug-hunting campaign.
+const CG_ARITH_BIN = ['+', '-', '*', '/', '%', '**', '|', '&', '^', '<<', '>>', '>>>', ',', '<', '>', '<=', '>=', '===', '!==', '==', '!='];
+const CG_LOGIC = ['&&', '||', '??'];
+const CG_UNARY = ['-', '!', '~', 'typeof ', 'void ', '+'];
+class CoerceGen {
+    private id = 0;
+    private spicyMode = !!process.env.FUZZ_SPICY;
+    constructor(private r: Rng) {}
+    private fresh(p = 'v'): string {
+        return `${p}${this.id++ % 6}`;
+    }
+    // Spicy scalar literals, introduced via inference (const/let → real literal
+    // type). Compound ones are parenthesized so `**` / `/` precedence is unambiguous.
+    private spicy(): string {
+        return pick(this.r, [
+            '"ab"', '"3"', '""', '"x"', '"0"', // strings (incl. numeric-looking + empty)
+            'true', 'false',
+            '0', '1', '2', '5', '9', '(-3)', '(-0)', // numbers incl. -0
+            '(0/0)', '(1/0)', '(-1/0)', // NaN, +Infinity, -Infinity
+            'null',
+        ]);
+    }
+    private leaf(s: string[]): string {
+        const o: (() => string)[] = [() => this.spicy(), () => 'p', () => 'q'];
+        if (s.length) o.push(() => pick(this.r, s));
+        return pick(this.r, o)();
+    }
+    // Pure arithmetic/coercion/bitwise/unary expression — NO `&&`/`||`/`??`/`?:`
+    // (those live only at `top`). Includes the SOUND identity folds `x*1`, `1*x`,
+    // `x-0` (these preserve -0/NaN, so they test the type gate without the -0 hazard).
+    private arith(s: string[], depth: number): string {
+        if (depth <= 0) return this.leaf(s);
+        const f: (() => string)[] = [
+            () => this.leaf(s),
+            () => `(${this.arith(s, depth - 1)} ${pick(this.r, CG_ARITH_BIN)} ${this.arith(s, depth - 1)})`,
+            () => `(${pick(this.r, CG_UNARY)}${this.arith(s, depth - 1)})`,
+            () => `eff(${this.arith(s, depth - 1)})`,
+            () => `(${this.arith(s, depth - 1)} * 1)`,
+            () => `(1 * ${this.arith(s, depth - 1)})`,
+            () => `(${this.arith(s, depth - 1)} - 0)`,
+        ];
+        if (this.spicyMode)
+            f.push(
+                // -0 hazard: `x + 0` / `0 + x` normalize -0 to +0 (pinned bug A).
+                () => `(${this.arith(s, depth - 1)} + 0)`,
+                () => `(0 + ${this.arith(s, depth - 1)})`,
+                // boolean-context leak: logical/ternary NESTED in an expr (pinned bug B).
+                () => `(${this.arith(s, depth - 1)} ${pick(this.r, CG_LOGIC)} ${this.arith(s, depth - 1)})`,
+                () => `(${this.arith(s, depth - 1)} ? ${this.arith(s, depth - 1)} : ${this.arith(s, depth - 1)})`,
+            );
+        return pick(this.r, f)();
+    }
+    // A top-level value: pure arith, or ONE logical/ternary combinator over arith
+    // operands (single level → never the nested boolean-context shape).
+    private top(s: string[]): string {
+        const k = int(this.r, 0, 4);
+        if (k <= 2) return this.arith(s, 3);
+        if (k === 3) return `(${this.arith(s, 2)} ${pick(this.r, CG_LOGIC)} ${this.arith(s, 2)})`;
+        return `(${this.arith(s, 2)} ? ${this.arith(s, 2)} : ${this.arith(s, 2)})`;
+    }
+    program(): string {
+        this.id = 0;
+        const s: string[] = [];
+        const stmts: string[] = [];
+        if (chance(this.r, 0.5)) {
+            const u = this.fresh('u');
+            stmts.push(`let ${u};`); // an `undefined` local, by inference
+            s.push(u);
+        }
+        const k = int(this.r, 2, 5);
+        for (let i = 0; i < k; i++) {
+            const form = int(this.r, 0, 3);
+            if (form === 0) {
+                const v = this.fresh('c');
+                stmts.push(`const ${v} = ${this.spicy()};`); // inferred literal-typed local
+                s.push(v);
+            } else if (form === 1) {
+                const v = this.fresh('c');
+                stmts.push(`const ${v} = ${this.arith(s, 2)};`);
+                s.push(v);
+            } else if (form === 2) {
+                stmts.push(`eff(${this.arith(s, 2)});`); // bare effect (must not be dropped)
+            } else {
+                const v = this.fresh('w');
+                stmts.push(`let ${v} = ${this.spicy()}; ${v} = ${this.arith(s, 2)};`);
+                s.push(v);
+            }
+        }
+        stmts.push(`return [${this.top(s)}, ${this.top(s)}];`);
+        const opt = chance(this.r, 0.8) ? '/* @optimize */ ' : '';
+        return `${opt}function entry(p, q) {\n  ${stmts.join('\n  ')}\n}`;
+    }
+}
+
+/** Value/coercion differential. Same value+trace oracle as `diff`, but ALLOWLISTS
+ *  the known, still-open signed-zero fold bug (pinned below): a divergence that
+ *  disappears once -0 and +0 are unified is that bug, not a new regression. Any
+ *  remaining (structural) divergence is a genuine, un-pinned miscompile. */
+function coerceDiff(code: string): { call: string; compiled: string; want: unknown; got: unknown } | null {
+    const call = 'entry(7, 3)';
+    const want = evalProgram(code, call);
+    const compiled = compiler.compileChunk('fuzz.ts', withExports(code), {}).code;
+    const got = evalProgram(compiled, call);
+    if (resultsEquiv(want, got)) return null;
+    if (resultsEquiv(want, got, /* looseZero */ true)) return null; // allowlist -0 fold (bug A)
+    return { call, compiled, want: want.ok ? want.value : '<threw>', got: got.ok ? got.value : '<threw>' };
+}
+
+describe('fuzz: value/type diversity + coercion + operators', () => {
+    const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x7c3a9f11;
+    const ITERS = Number(process.env.FUZZ_ITERS ?? 0) || 400;
+    it(`${ITERS} spicy-scalar programs preserve semantics`, () => {
+        for (let i = 0; i < ITERS; i++) {
+            const seed = (BASE ^ 0x9e3779b9) + i * 2654435761;
+            const code = new CoerceGen(mulberry32(seed >>> 0)).program();
+            let d: ReturnType<typeof coerceDiff>;
+            try {
+                d = coerceDiff(code);
+            } catch (e) {
+                d = { call: 'entry(7, 3)', compiled: `<compile threw: ${(e as Error).message}>`, want: 'n/a', got: 'n/a' };
+            }
+            if (d) {
+                const minimal = (() => {
+                    try {
+                        return shrink(code);
+                    } catch {
+                        return code;
+                    }
+                })();
+                const md = coerceDiff(minimal) ?? d;
+                throw new Error(
+                    `COERCE MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
+                        `call: ${md.call}   want=${JSON.stringify(md.want)} got=${JSON.stringify(md.got)}\n\n` +
+                        `--- minimal source ---\n${minimal}\n\n` +
+                        `--- compiled ---\n${md.compiled}\n`,
+                );
+            }
+        }
+        expect(true).toBe(true);
+    });
+});
+
+// ── KNOWN BUGS (open) ─────────────────────────────────────────────────────────
+// Real source-vs-compiled miscompiles surfaced by CoerceGen (run with FUZZ_SPICY=1).
+// Each is a genuine value divergence — verified by hand — and stays pinned as an
+// `it.fails` until the core is fixed. `expectDiverges` asserts the compiled output
+// does NOT match source semantics (deepEq); under `it.fails` the failing assertion
+// is the expected state, so when the bug is FIXED the pin turns red and pings us.
+describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
+    const expectDiverges = (src: string, call = 'entry(7, 3)') => {
+        const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
+        const want = evalProgram(src, call);
+        const got = evalProgram(out, call);
+        // Passes (bug reproduced) ONLY while they diverge; throws once equal (fixed).
+        expect(resultsEquiv(want, got)).toBe(true);
+    };
+
+    // BUG A — signed zero. The additive-identity fold `x + 0` / `0 + x` → `x` is
+    // gated on the operand being a number, but `-0` IS a number and `-0 + 0 === +0`,
+    // so the fold discards the sign. `0 + (-q * 0)` (q=3): source keeps the `+ 0`
+    // → +0; compiled drops it → `-q * 0` → -0. Object.is(+0,-0) === false, so the
+    // value is observably wrong (e.g. `1 / result` → +Inf vs -Inf). Suspected pass:
+    // the numeric identity-fold peephole (arith fold / minimize). The sound folds
+    // `x * 1`, `1 * x`, `x - 0` (which DO preserve -0) are exercised by the green gate.
+    it.fails('`0 + x` additive-identity fold discards -0 (source +0, compiled -0)', () => {
+        expectDiverges(`/* @optimize */ function entry(p, q) { return 0 + (-q * 0); }`);
+    });
+    it.fails('`x + 0` additive-identity fold discards -0 (source +0, compiled -0)', () => {
+        expectDiverges(`/* @optimize */ function entry(p, q) { return (-q * 0) + 0; }`);
+    });
+
+    // BUG B — boolean-context leak. When a `||`/`&&`/`?:` sub-expression is an
+    // operand of an ENCLOSING logical operator, the minimizer folds it by TRUTHINESS
+    // only (`a || truthyConst` → `truthyConst`, `a && truthyConst` → `a`,
+    // `cond ? truthyConst : c` → `cond || c`) — valid in a boolean context, but here
+    // the enclosing logical expression's VALUE is returned, so the produced value is
+    // corrupted. One root cause (context propagated as boolean into the operand),
+    // shown via three surface forms. Suspected pass: the conditional/short-circuit
+    // minimizer (Closure-style PeepholeMinimizeConditions / fold-constants).
+    it.fails('`A || (p || 1)` drops p’s value (source 7, compiled 1)', () => {
+        // compiles to `q < 0 || 1`: source (q<0 → false, so p||1 → p) = 7; compiled = 1.
+        expectDiverges(`/* @optimize */ function entry(p, q) { return (q < 0) || (p || 1); }`);
+    });
+    it.fails('`A && (p ? 1 : q)` rewrites ternary to `p || q` (source 1, compiled 7)', () => {
+        // compiles to `p && (p || q)`: source (p truthy → 1) = 1; compiled (p||q) = 7.
+        expectDiverges(`/* @optimize */ function entry(p, q) { return p && (p ? 1 : q); }`);
+    });
+    it.fails('`A && (q && 5)` drops the value (source 5, compiled 3)', () => {
+        // compiles to `p && q`: source (q truthy → 5) = 5; compiled = 3.
+        expectDiverges(`/* @optimize */ function entry(p, q) { return p && (q && 5); }`);
     });
 });
