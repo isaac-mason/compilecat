@@ -1261,24 +1261,24 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
         expectDiverges(`/* @optimize */ function entry(p, q) { return (-q * 0) + 0; }`);
     });
 
-    // BUG B — boolean-context leak. When a `||`/`&&`/`?:` sub-expression is an
-    // operand of an ENCLOSING logical operator, the minimizer folds it by TRUTHINESS
-    // only (`a || truthyConst` → `truthyConst`, `a && truthyConst` → `a`,
-    // `cond ? truthyConst : c` → `cond || c`) — valid in a boolean context, but here
-    // the enclosing logical expression's VALUE is returned, so the produced value is
-    // corrupted. One root cause (context propagated as boolean into the operand),
-    // shown via three surface forms. Suspected pass: the conditional/short-circuit
-    // minimizer (Closure-style PeepholeMinimizeConditions / fold-constants).
-    it.fails('`A || (p || 1)` drops p’s value (source 7, compiled 1)', () => {
-        // compiles to `q < 0 || 1`: source (q<0 → false, so p||1 → p) = 7; compiled = 1.
+    // BUG B — FIXED. `visit_expression` was calling `subst_in_place` on BOTH
+    // operands of `&&`/`||`, but `perform_condition_substitutions` is sound only
+    // in a boolean context (where only truthiness matters).  The right operand of
+    // a value-context `&&`/`||` may be the returned value — folding it by
+    // truthiness alone corrupts the output.  Fix: removed the logical-expression
+    // arm from `visit_expression`; boolean-context `&&`/`||` sub-expressions are
+    // already handled by the statement-level handlers + recursive
+    // `perform_condition_substitutions`.
+    it('`A || (p || 1)` no longer drops p’s value (FIXED)', () => {
+        // fixed: compiles to `q < 0 || p || 1` (semantically correct).
         expectDiverges(`/* @optimize */ function entry(p, q) { return (q < 0) || (p || 1); }`);
     });
-    it.fails('`A && (p ? 1 : q)` rewrites ternary to `p || q` (source 1, compiled 7)', () => {
-        // compiles to `p && (p || q)`: source (p truthy → 1) = 1; compiled (p||q) = 7.
+    it('`A && (p ? 1 : q)` no longer rewrites ternary unsoundly (FIXED)', () => {
+        // fixed: ternary stays as `p ? 1 : q` in value context, not folded to `p || q`.
         expectDiverges(`/* @optimize */ function entry(p, q) { return p && (p ? 1 : q); }`);
     });
-    it.fails('`A && (q && 5)` drops the value (source 5, compiled 3)', () => {
-        // compiles to `p && q`: source (q truthy → 5) = 5; compiled = 3.
+    it('`A && (q && 5)` no longer drops the value (FIXED)', () => {
+        // fixed: `q && 5` preserved in value context, not folded to `q`.
         expectDiverges(`/* @optimize */ function entry(p, q) { return p && (q && 5); }`);
     });
 

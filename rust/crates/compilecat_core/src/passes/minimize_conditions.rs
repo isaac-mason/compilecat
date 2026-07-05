@@ -100,8 +100,23 @@ impl<'a> VisitMut<'a> for Minimizer<'a> {
     fn visit_expression(&mut self, expr: &mut Expression<'a>) {
         walk_mut::walk_expression(self, expr);
         if self.gate.active {
-            // A ternary test, and the operands of `!`/`&&`/`||`, are boolean
-            // contexts — run condition substitution on those slots first.
+            // A ternary test and the operand of `!` are boolean contexts — run
+            // condition substitution and cost-based minimization on those slots.
+            //
+            // NOTE: We do NOT call `subst_in_place` on the operands of `&&`/`||`
+            // here.  `perform_condition_substitutions` is sound ONLY in a genuine
+            // boolean context (one where only the truthiness of the result
+            // matters, not its value).  A `&&`/`||` expression in a value
+            // position (e.g. `return A && B`) has its VALUE returned — so
+            // simplifying `B` by truthiness alone corrupts the output.
+            //
+            // The statement-level handlers (if/while/for/do) call
+            // `subst_in_place` on the condition slot, and
+            // `perform_condition_substitutions` already recurses into nested
+            // `&&`/`||` children when it is called from a known boolean context.
+            // Duplicating that recursion here was the source of Bug B: the right
+            // operand of a value-context `&&`/`||` was being treated as boolean
+            // context, silently dropping the operand's value.
             match expr {
                 Expression::ConditionalExpression(c) => {
                     self.subst_in_place(&mut c.test);
@@ -112,12 +127,6 @@ impl<'a> VisitMut<'a> for Minimizer<'a> {
                 {
                     self.subst_in_place(&mut u.argument);
                     self.minimize_cond_slot(&mut u.argument);
-                }
-                Expression::LogicalExpression(l)
-                    if matches!(l.operator, LogicalOperator::And | LogicalOperator::Or) =>
-                {
-                    self.subst_in_place(&mut l.left);
-                    self.subst_in_place(&mut l.right);
                 }
                 _ => {}
             }
@@ -649,5 +658,43 @@ mod tests {
         // `if (x) foo();` is NOT folded to `x && foo();`.
         let out = mc("function f(x) { if (x) foo(); }").0;
         assert!(out.contains("if (x)") && !out.contains("x && foo"), "{out}");
+    }
+
+    // ── value-context &&/|| must NOT be simplified by boolean-only rules ──
+
+    #[test]
+    fn value_context_or_rhs_not_simplified() {
+        // `A || (p || 1)` in a return position: `p || 1` is NOT in boolean context
+        // — `p`'s VALUE matters (if p is truthy it is returned). Must not fold to
+        // `A || 1` (dropping `p`). The flattened form `q < 0 || p || 1` (same
+        // semantics, parentheses dropped) is acceptable.
+        let out = mc("function f(p, q) { return (q < 0) || (p || 1); }").0;
+        // `p` must still appear as an operand in the return value.
+        assert!(out.contains("p || 1"), "p must still be in result:\n{out}");
+    }
+
+    #[test]
+    fn value_context_and_rhs_const_not_folded() {
+        // `p && (q && 5)` in return: `q && 5` returns `q` (falsy) or `5` (truthy).
+        // Boolean-only fold `x && TRUE → x` (dropping the `5`) is wrong here.
+        let out = mc("function f(p, q) { return p && (q && 5); }").0;
+        assert!(out.contains("q && 5"), "q&&5 preserved:\n{out}");
+    }
+
+    #[test]
+    fn value_context_and_rhs_ternary_not_rewritten() {
+        // `p && (p ? 1 : q)`: the ternary is NOT in boolean context; `x ? truthy : y`
+        // → `x || y` is wrong here (changes the returned value from `1` to `p`).
+        let out = mc("function f(p, q) { return p && (p ? 1 : q); }").0;
+        assert!(out.contains("p ? 1 : q") || out.contains("p?1:q"), "ternary preserved:\n{out}");
+        assert!(!out.contains("p || q"), "must not rewrite to p||q:\n{out}");
+    }
+
+    #[test]
+    fn boolean_context_and_nested_ternary_still_simplified() {
+        // `if ((x ? true : y) && z)` — the ternary IS in boolean context (as test of
+        // `&&` which is test of `if`). `x ? true : y` → `x || y` must still fire.
+        let out = mc("function f(x, y, z) { if ((x ? true : y) && z) sink(); }").0;
+        assert!(out.contains("x || y") || out.contains("(x||y)"), "boolean-ctx ternary simplified:\n{out}");
     }
 }
