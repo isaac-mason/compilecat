@@ -750,10 +750,7 @@ class ScratchGen {
             'blockShadow',
             'loopBody',
             'loopReadBeforeWrite',
-            // 'aliasClosure' is EXCLUDED from the random gate: it reliably reproduces
-            // a real, still-open miscompile (the alias binding is dropped but a
-            // returned closure still reads it → ReferenceError). Pinned as an
-            // `it.fails` in "KNOWN BUGS" below; re-add here once the core is fixed.
+            'aliasClosure', // re-added: Bug C (guard #5 in try_alias) is now fixed
             'bothBranches',
             'switchWrite',
             'partialBranch',
@@ -1288,13 +1285,14 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
     // RETURNED closure `() => va[0]` still references `va`, so the compiled output is
     // `ReferenceError: va is not defined`. Source returns the value; compiled throws.
     // Surfaced by the module-scratch fuzzer's `aliasClosure` mode once its previously
-    // broken plumbing (it never actually invoked `entry`) was fixed. Suspected pass:
-    // the module-scratch SROA alias-following (GlobalOpt-localize). NOTE: compiled
-    // with an explicit `export { entry }` — exporting the scratch const `v` (which
-    // `withExports` would do) forces a bail and hides the bug.
-    it.fails('module-scratch alias dropped but read by returned closure (ReferenceError)', () => {
+    // broken plumbing (it never actually invoked `entry`) was fixed.
+    // FIXED: guard #5 in `try_alias` (inline_variables.rs) now bails when any read
+    // of the alias is in a nested function — the Applier gate would skip that read
+    // (arrow not opted-in) while still dropping the declarator (entry IS opted-in).
+    // `aliasClosure` is re-enabled in ScratchGen above.
+    it('module-scratch alias with returned closure no longer ReferenceErrors (FIXED)', () => {
         const src = `const v = /*@__PURE__*/ [0];\n/* @optimize */ function entry(p) { const va = v; va[0] = p; return () => va[0]; }`;
-        const call = 'entry(5)()'; // source → 5; compiled throws (`va` undeclared)
+        const call = 'entry(5)()'; // source → 5; compiled must also → 5
         const out = compiler.compileChunk('r.ts', `${src}\nexport { entry };`, {}).code;
         const want = evalProgram(src, call);
         const got = evalProgram(out, call);

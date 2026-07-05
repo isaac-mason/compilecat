@@ -280,9 +280,21 @@ impl<'a> VisitMut<'a> for Applier<'a> {
 
 // ── path 3: alias inline ─────────────────────────────────────────────────────
 
+/// Return the `NodeId` of the innermost `Function` or `ArrowFunctionExpression`
+/// that encloses `node`, or `None` if `node` is at module scope.
+fn enclosing_fn_id(nodes: &oxc_semantic::AstNodes, node: NodeId) -> Option<NodeId> {
+    for anc in nodes.ancestor_ids(node) {
+        match nodes.kind(anc) {
+            AstKind::Function(_) | AstKind::ArrowFunctionExpression(_) => return Some(anc),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// `const/let b = a` (where `a` is a bare identifier) used N>1 times, safe to
 /// rewrite every read of `b` to `a` and drop the declarator. SOUNDNESS is
-/// paramount; this bails on anything it cannot prove. Four guards:
+/// paramount; this bails on anything it cannot prove. Five guards:
 ///
 ///   1. RHS must be a **bare identifier** resolving to a real binding (param or
 ///      local) — NOT a member expression, not a global. A member init (e.g.
@@ -297,6 +309,13 @@ impl<'a> VisitMut<'a> for Applier<'a> {
 ///   4. At EVERY read site of `b`, the name `a` must resolve to the SAME
 ///      SymbolId as at the declaration. If an intervening nested scope shadows
 ///      `a`, rewriting `b → a` there would capture the wrong binding — BAIL.
+///   5. Every read site must be in the **same enclosing function** as the
+///      declaration. The `Applier` uses a per-function gate that resets at each
+///      function boundary; if any read is in a nested function that the gate
+///      skips, the read won't be rewritten — but `visit_statements` will still
+///      drop the declarator (gate active in the outer function). That leaves `b`
+///      referenced but undefined → ReferenceError. Bail on any cross-function
+///      read.
 fn try_alias(
     scoping: &oxc_semantic::Scoping,
     nodes: &oxc_semantic::AstNodes,
@@ -326,6 +345,18 @@ fn try_alias(
     }
 
     let aliased_name: &str = scoping.symbol_name(aliased_sym);
+
+    // Guard #5: all reads must be in the same function as the declaration.
+    // The `Applier` uses a gate that resets at each function boundary; if a
+    // read is in a nested (child) function that the gate skips, the read won't
+    // be substituted even though the declarator IS dropped (gate active in the
+    // outer function). That mismatch leaves `b` referenced but undefined.
+    let decl_fn = enclosing_fn_id(nodes, scoping.symbol_declaration(alias_sym));
+    for &read_id in reads {
+        if enclosing_fn_id(nodes, read_id) != decl_fn {
+            return false;
+        }
+    }
 
     // Guard #4: at every read site of the alias, `aliased_name` must resolve to
     // `aliased_sym` from that read's own scope (no intervening shadow). We
@@ -756,5 +787,28 @@ mod tests {
         );
         assert_eq!(n, 0, "alias kept under shadowing use site:\n{out}");
         assert!(out.contains("const x = y"), "{out}");
+    }
+
+    #[test]
+    fn guard5_keeps_alias_when_any_read_in_nested_closure() {
+        // Guard #5: alias `va = v` declared in `entry`; one read is inside a
+        // returned arrow closure `() => va[0]`. The Applier gate resets at the
+        // arrow boundary (not opted-in) so that read would NOT be substituted, but
+        // the declarator WOULD be dropped → ReferenceError. Must bail entirely.
+        let (out, n) = iv(
+            "const v = [0]; \
+             function entry(p) { const va = v; va[0] = p; return () => va[0]; }",
+        );
+        // `va` must NOT be dropped — it's still used by the closure.
+        assert!(out.contains("const va = v"), "alias decl kept:\n{out}");
+        assert_eq!(n, 0, "no inline when read escapes into nested fn:\n{out}");
+    }
+
+    #[test]
+    fn guard5_all_reads_in_same_fn_still_inlines() {
+        // Regression guard: when ALL reads are in the same function as the decl,
+        // guard #5 must NOT block the inline.
+        let (out, _) = iv("function f(y) { const x = y; use(x); use(x); }");
+        assert!(out.contains("use(y)") && !out.contains("const x"), "alias inline fires:\n{out}");
     }
 }
