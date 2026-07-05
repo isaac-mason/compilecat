@@ -1249,17 +1249,15 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
         expect(resultsEquiv(want, got)).toBe(true);
     };
 
-    // BUG A — signed zero. The additive-identity fold `x + 0` / `0 + x` → `x` is
-    // gated on the operand being a number, but `-0` IS a number and `-0 + 0 === +0`,
-    // so the fold discards the sign. `0 + (-q * 0)` (q=3): source keeps the `+ 0`
-    // → +0; compiled drops it → `-q * 0` → -0. Object.is(+0,-0) === false, so the
-    // value is observably wrong (e.g. `1 / result` → +Inf vs -Inf). Suspected pass:
-    // the numeric identity-fold peephole (arith fold / minimize). The sound folds
-    // `x * 1`, `1 * x`, `x - 0` (which DO preserve -0) are exercised by the green gate.
-    it.fails('`0 + x` additive-identity fold discards -0 (source +0, compiled -0)', () => {
+    // BUG A — FIXED. The additive-identity fold `x + 0` / `0 + x` → `x` was
+    // unsound: `-0 + 0 === +0`, so the fold discarded the sign. The fix: do NOT
+    // fold `x + 0` / `0 + x` at all. `x * 1`, `1 * x`, `x - 0` are still folded
+    // (they preserve -0 and NaN). The literal-literal fold for `(-n) * 0 = -0` is
+    // also guarded (no longer emits `0` in place of `-0`).
+    it('`0 + x` additive-identity fold no longer discards -0 (FIXED)', () => {
         expectDiverges(`/* @optimize */ function entry(p, q) { return 0 + (-q * 0); }`);
     });
-    it.fails('`x + 0` additive-identity fold discards -0 (source +0, compiled -0)', () => {
+    it('`x + 0` additive-identity fold no longer discards -0 (FIXED)', () => {
         expectDiverges(`/* @optimize */ function entry(p, q) { return (-q * 0) + 0; }`);
     });
 

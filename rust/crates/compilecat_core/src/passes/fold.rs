@@ -250,7 +250,12 @@ impl<'a> Folder<'a> {
         // Numeric arithmetic.
         if let (Some(l), Some(r)) = (lv, rv) {
             if let Some(folded) = eval_numeric_binary(op, l, r) {
-                if folded.is_finite() {
+                // Don't fold to -0: `self.num(-0.0)` can't represent it (the
+                // `< 0.0` branch doesn't fire for -0.0, so it codegen-emits
+                // `0`). E.g. `(-5) * 0 = -0` must stay as-is so `1/(result)`
+                // yields -Infinity, not +Infinity.
+                let is_neg_zero = folded == 0.0 && folded.is_sign_negative();
+                if folded.is_finite() && !is_neg_zero {
                     return Some(self.num(folded));
                 }
             }
@@ -280,20 +285,23 @@ impl<'a> Folder<'a> {
             }
         }
 
-        // Numeric identities (`x+0`, `x-0`, `x*1`, `x/1` → x). SOUND ONLY when the
-        // kept operand is a NUMBER: `"a"+0` is `"a0"`, `"a"*1` is `NaN` — dropping
-        // the op would corrupt a string/object. So gate on `produces_number` (the
-        // type-aware win over Closure, which can't fold these without a proven
-        // numeric type). Still requires the kept side pure (dropping the other side).
+        // Numeric identities (`x-0`, `x*1`, `x/1` → x). SOUND ONLY when the
+        // kept operand is a NUMBER: `"a"*1` is `NaN` — dropping the op would
+        // corrupt a string/object. So gate on `produces_number`. Still requires
+        // the kept side pure (dropping the other side).
+        //
+        // NOTE: `x+0` / `0+x` are deliberately NOT folded. `-0 + 0 === +0`, so
+        // the fold drops the sign of negative zero — an observable difference
+        // (`1 / (-0 + 0)` is `+Infinity`, `1 / -0` is `-Infinity`). LLVM only
+        // does this fold under `nsz` (no-signed-zero); Closure guards it — we
+        // simply skip it.
         let alloc = self.ast.allocator;
-        let keep_left = (rv == Some(0.0) && op == BinaryOperator::Addition
-            || rv == Some(0.0) && op == BinaryOperator::Subtraction
+        let keep_left = (rv == Some(0.0) && op == BinaryOperator::Subtraction
             || rv == Some(1.0) && op == BinaryOperator::Multiplication
             || rv == Some(1.0) && op == BinaryOperator::Division)
             && is_pure(&b.left)
             && self.produces_number(&b.left);
-        let keep_right = (lv == Some(0.0) && op == BinaryOperator::Addition
-            || lv == Some(1.0) && op == BinaryOperator::Multiplication)
+        let keep_right = (lv == Some(1.0) && op == BinaryOperator::Multiplication)
             && is_pure(&b.right)
             && self.produces_number(&b.right);
         if keep_left {
@@ -613,19 +621,33 @@ mod tests {
 
     #[test]
     fn numeric_identity_folds_only_when_provably_number() {
-        // Structurally-numeric operand (arithmetic result) → fold.
-        assert!(f("var y = (a - b) + 0;").0.contains("var y = a - b"));
+        // Structurally-numeric operand (arithmetic result) → fold for x-0 and x*1.
+        assert!(f("var y = (a - b) - 0;").0.contains("var y = a - b"));
         assert!(f("var y = (a * b) * 1;").0.contains("var y = a * b"));
-        // `: number` param → type-aware fold (the win over Closure).
-        assert_eq!(f("function g(x: number) { return x + 0; }").1, 1);
-        assert!(f("function g(x: number) { return x + 0; }").0.contains("return x"));
+        // `x + 0` is NOT folded: `-0 + 0 === +0` (sign is observable).
+        assert_eq!(f("var y = (a - b) + 0;").1, 0);
+        assert_eq!(f("function g(x: number) { return x + 0; }").1, 0);
+        assert_eq!(f("function g(x: number) { return 0 + x; }").1, 0);
+        // `: number` param → type-aware fold for x-0 and x*1.
+        assert!(f("function g(x: number) { return x - 0; }").0.contains("return x"));
         assert!(f("function g(x: number) { return x * 1; }").0.contains("return x"));
-        // Untyped / non-number operand → NOT folded (`\"a\"+0` is `\"a0\"`).
+        // Untyped / non-number operand → NOT folded (`"a"+0` is `"a0"`).
         assert_eq!(f("function g(x) { return x + 0; }").1, 0);
         assert_eq!(f("function g(x: string) { return x + 0; }").1, 0);
         assert_eq!(f("function g(x: number | undefined) { return x + 0; }").1, 0);
         // Bare unbound identifier → NOT folded.
         assert_eq!(f("var y = z + 0;").1, 0);
+    }
+
+    #[test]
+    fn neg_zero_literal_mul_not_folded() {
+        // `(-5) * 0 = -0` must NOT fold to `0` (sign is observable via `1/result`).
+        // The guard prevents `num(-0.0)` from silently emitting `0`.
+        assert_eq!(f("var y = (-5) * 0;").1, 0, "negative * 0 must not fold");
+        assert!(f("var y = (-5) * 0;").0.contains("-5 * 0"), "kept as-is: {}", f("var y = (-5) * 0;").0);
+        // Positive literal * 0 is +0 (no sign hazard) — still folds.
+        assert!(f("var y = 5 * 0;").0.contains("var y = 0"), "pos * 0 folds: {}", f("var y = 5 * 0;").0);
+        assert!(f("var y = 0 * 5;").0.contains("var y = 0"), "0 * pos folds: {}", f("var y = 0 * 5;").0);
     }
 
     #[test]
