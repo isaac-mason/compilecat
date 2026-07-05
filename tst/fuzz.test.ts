@@ -529,6 +529,144 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
     });
 });
 
+// ── transitive-inline-chain generator ────────────────────────────────────────
+// The main Gen above nests helper calls one level deep. This generator builds
+// DEEP call chains — a host that calls h0, where h0 calls h1, h1 calls h2, … (2–4
+// levels) — so `@optimize`/`@flatten` must inline TRANSITIVELY to a fixpoint (a
+// call only EXPOSED after an outer helper inlines). It also mixes the directives
+// real code uses (@inline / @flatten / @optimize on the host, @inline / plain on
+// each helper) and includes a self-RECURSIVE helper (the compiler must REFUSE to
+// inline it — the fixpoint terminates — while still computing the same result).
+// Every program is total (bounded recursion via a literal counter; no division),
+// so the same value+trace oracle (`diff`) that guards the main fuzzer applies: a
+// dropped/reordered `eff`, a wrong inline, or a non-terminating recursion-inline
+// all show up as a divergence, shrunk to a minimal repro.
+class ChainGen {
+    private uid = 0;
+    constructor(private r: Rng) {}
+    // Per-program-unique local name. (A SHARED name across helpers surfaces a
+    // known nested-inline collision bug — pinned separately as `it.fails` below —
+    // which would make this fuzzer flap; uniqueness keeps it exploring OTHER shapes.)
+    private local(): string {
+        return `t${this.uid++}`;
+    }
+    private lit(): string {
+        return String(int(this.r, 1, 9));
+    }
+    private op(): string {
+        return pick(this.r, ['+', '-', '*']);
+    }
+    // per-helper directive: @inline or plain (mixed so a chain interleaves both).
+    private hdir(): string {
+        return chance(this.r, 0.6) ? '/* @inline */ ' : '';
+    }
+    private hostDir(): string {
+        return pick(this.r, ['/* @optimize */ ', '/* @flatten */ ', '/* @optimize */ ', '']);
+    }
+
+    // A number-returning chain: h_i returns arithmetic involving h_{i+1}(…). Some
+    // levels are BLOCK bodies (branch + effect) so block-inlining is exercised too.
+    private returnChain(levels: number): string {
+        const hs: string[] = [];
+        for (let i = 0; i < levels; i++) {
+            const last = i === levels - 1;
+            const next = last
+                ? `(a ${this.op()} ${this.lit()})`
+                : `h${i + 1}(a ${this.op()} ${this.lit()}, b ${this.op()} ${this.lit()})`;
+            const t = this.local();
+            const body = chance(this.r, 0.4)
+                ? // BLOCK body with a mid-stream effect (must survive inlining).
+                  `{ const ${t} = eff(a ${this.op()} b); if (${t} > b) return ${t} ${this.op()} ${next}; return b ${this.op()} ${next}; }`
+                : // DIRECT body.
+                  `{ return (a ${this.op()} b) ${this.op()} ${next}; }`;
+            hs.push(`${this.hdir()}function h${i}(a, b) ${body}`);
+        }
+        // host sometimes calls the chain twice (two clones of the same expansion).
+        const call = chance(this.r, 0.4) ? `h0(p, q) ${this.op()} h0(q, p)` : `h0(p, q)`;
+        const entry = `${this.hostDir()}function entry(p, q) { return ${call}; }`;
+        return `${hs.join('\n')}\n${entry}`;
+    }
+
+    // An out-param chain: h_i(out, a, b) delegates to h_{i+1}(out, a, b) then folds
+    // more into out — the `set → copy` transitive-write shape from real kernels.
+    private outparamChain(levels: number): string {
+        const hs: string[] = [];
+        for (let i = 0; i < levels; i++) {
+            const last = i === levels - 1;
+            const body = last
+                ? `{ out[0] = a ${this.op()} b; out[1] = (a ${this.op()} ${this.lit()}); }`
+                : `{ h${i + 1}(out, a, b); out[0] = out[0] ${this.op()} (a ${this.op()} b); out[1] = out[1] ${this.op()} ${this.lit()}; }`;
+            hs.push(`${this.hdir()}function h${i}(out, a, b) ${body}`);
+        }
+        const entry = `${this.hostDir()}function entry(p, q) { const o = [0, 0]; h0(o, p, q); return o[0] ${this.op()} o[1]; }`;
+        return `${hs.join('\n')}\n${entry}`;
+    }
+
+    // A self-recursive helper reached THROUGH the inline chain: inlining h0 exposes
+    // the `rec(…)` call, which the compiler must REFUSE to inline (cycle) — while
+    // still evaluating correctly. Bounded by a LITERAL counter → always terminates.
+    private recursion(): string {
+        const n = int(this.r, 1, 3);
+        const rec = `function rec(a, n) { if (n <= 0) return a; return (a ${this.op()} ${this.lit()}) + rec(a ${this.op()} ${this.lit()}, n - 1); }`;
+        const h0 = `${this.hdir()}function h0(a, b) { return rec(a ${this.op()} b, ${n}); }`;
+        const entry = `${this.hostDir()}function entry(p, q) { return h0(p, q) ${this.op()} ${this.lit()}; }`;
+        return `${rec}\n${h0}\n${entry}`;
+    }
+
+    program(): string {
+        const levels = int(this.r, 2, 4);
+        const shape = pick(this.r, ['return', 'return', 'outparam', 'recursion'] as const);
+        if (shape === 'return') return this.returnChain(levels);
+        if (shape === 'outparam') return this.outparamChain(levels);
+        return this.recursion();
+    }
+}
+
+describe('fuzz: transitive-inline chains + directive combinations', () => {
+    const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x2f9a17b3;
+    const ITERS = Number(process.env.FUZZ_ITERS ?? 0) || 300;
+    it(`${ITERS} deep inline-chain programs preserve semantics`, () => {
+        for (let i = 0; i < ITERS; i++) {
+            const seed = (BASE ^ 0xa5a5a5a5) + i * 2654435761;
+            const code = new ChainGen(mulberry32(seed >>> 0)).program();
+            let d: ReturnType<typeof diff>;
+            try {
+                d = diff(code);
+            } catch (e) {
+                d = {
+                    call: 'entry(7, 3)',
+                    compiled: `<compile threw: ${(e as Error).message}>`,
+                    want: 'n/a',
+                    got: 'n/a',
+                };
+            }
+            if (d) {
+                const minimal = (() => {
+                    try {
+                        return shrink(code);
+                    } catch {
+                        return code;
+                    }
+                })();
+                const md = (() => {
+                    try {
+                        return diff(minimal) ?? d;
+                    } catch {
+                        return d;
+                    }
+                })();
+                throw new Error(
+                    `CHAIN MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
+                        `call: ${md.call}   want=${JSON.stringify(md.want)} got=${JSON.stringify(md.got)}\n\n` +
+                        `--- minimal source ---\n${minimal}\n\n` +
+                        `--- compiled ---\n${md.compiled}\n`,
+                );
+            }
+        }
+        expect(true).toBe(true);
+    });
+});
+
 // ── module-scratch generator ─────────────────────────────────────────────────
 // Exercises the single-owner module-scratch scalar-replacement (SROA GlobalOpt-
 // localize). Emits a module-level `const _s = /*@__PURE__*/ [0,…]` used as per-call
@@ -756,6 +894,36 @@ describe('fuzz: module-scratch scalar replacement (effect oracle, two-call)', ()
             }
         }
         expect(true).toBe(true);
+    });
+});
+
+// ⚠️ KNOWN-BUG PIN (open miscompile, tracked). The transitive-inline-chain fuzzer
+// above surfaced a real miscompile in NESTED inlining: when a block-bodied helper
+// is inlined into an EXPRESSION position, its own user-local (here `const t`) is
+// hoisted as a statement into a scope that ALREADY holds an OUTER inlined helper's
+// user-local of the same name — and it is NOT renamed. The inner decl then SHADOWS
+// the outer `t`, so the outer helper's later use of its own `t` reads the inner
+// value. Minimal repro below returns 212 in source but 424 compiled (the effect
+// TRACE is identical — it is a pure value corruption, not a dropped effect). The
+// generated-temp uniquifier (build_block_plan) handles cloned _result temps and
+// even renames a top-level colliding `t`→`t$1`, but MISSES this expression-position
+// nested case. This is a Rust-core fix (out of scope for this test-only change);
+// pinned with `it.fails` so it stays visible and flips to a hard failure the moment
+// the core is fixed (prompting this pin to be promoted to a passing assertion).
+describe('KNOWN BUG — nested-inline user-local collision (open)', () => {
+    const src =
+        `/* @inline */ function h0(a, b) { const t = eff(a - b); if (t > b) return t * h1(a + 8, b - 1); return b + h1(a + 8, b - 1); }\n` +
+        `function h1(a, b) { return (a + b) + h2(a - 2, b + 3); }\n` +
+        `function h2(a, b) { const t = eff(a - b); if (t > b) return t + h3(a - 2, b + 2); return b * h3(a - 2, b + 2); }\n` +
+        `function h3(a, b) { return (a + b) + (a - 1); }\n` +
+        `/* @optimize */ function entry(p, q) { return h0(p, q); }`;
+    it.fails('transitive block-inline into expr position corrupts outer `const t`', () => {
+        const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
+        const want = evalProgram(src, 'entry(7, 3)');
+        const got = evalProgram(out, 'entry(7, 3)');
+        // EXPECTED to differ today (212 vs 424); when the core is fixed this passes
+        // and `it.fails` turns RED, signalling: promote this to a normal `expect`.
+        expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(JSON.stringify(want.value));
     });
 });
 
