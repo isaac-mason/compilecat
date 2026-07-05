@@ -1231,18 +1231,17 @@ describe('fuzz: value/type diversity + coercion + operators', () => {
     });
 });
 
-// ── KNOWN BUGS (open) ─────────────────────────────────────────────────────────
-// Real source-vs-compiled miscompiles surfaced by CoerceGen (run with FUZZ_SPICY=1).
-// Each is a genuine value divergence — verified by hand — and stays pinned as an
-// `it.fails` until the core is fixed. `expectDiverges` asserts the compiled output
-// does NOT match source semantics (deepEq); under `it.fails` the failing assertion
-// is the expected state, so when the bug is FIXED the pin turns red and pings us.
-describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
-    const expectDiverges = (src: string, call = 'entry(7, 3)') => {
+// ── value/coercion miscompiles — FIXED (regression pins) ─────────────────────
+// Real source-vs-compiled miscompiles that CoerceGen (FUZZ_SPICY=1) surfaced and
+// that have since been fixed in the core. Each is kept as a permanent regression
+// pin: `expectEquiv` asserts the compiled output computes the SAME value as source
+// (deepEq via resultsEquiv) — it goes RED the moment one of these fixes regresses.
+describe('value/coercion miscompiles — fixed (regression pins)', () => {
+    const expectEquiv = (src: string, call = 'entry(7, 3)') => {
         const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
         const want = evalProgram(src, call);
         const got = evalProgram(out, call);
-        // Passes (bug reproduced) ONLY while they diverge; throws once equal (fixed).
+        // Compiled must compute the SAME value as source; RED if a fix regresses.
         expect(resultsEquiv(want, got)).toBe(true);
     };
 
@@ -1252,10 +1251,10 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
     // (they preserve -0 and NaN). The literal-literal fold for `(-n) * 0 = -0` is
     // also guarded (no longer emits `0` in place of `-0`).
     it('`0 + x` additive-identity fold no longer discards -0 (FIXED)', () => {
-        expectDiverges(`/* @optimize */ function entry(p, q) { return 0 + (-q * 0); }`);
+        expectEquiv(`/* @optimize */ function entry(p, q) { return 0 + (-q * 0); }`);
     });
     it('`x + 0` additive-identity fold no longer discards -0 (FIXED)', () => {
-        expectDiverges(`/* @optimize */ function entry(p, q) { return (-q * 0) + 0; }`);
+        expectEquiv(`/* @optimize */ function entry(p, q) { return (-q * 0) + 0; }`);
     });
 
     // BUG B — FIXED. `visit_expression` was calling `subst_in_place` on BOTH
@@ -1268,15 +1267,15 @@ describe('KNOWN BUGS — value/coercion fuzz (open)', () => {
     // `perform_condition_substitutions`.
     it('`A || (p || 1)` no longer drops p’s value (FIXED)', () => {
         // fixed: compiles to `q < 0 || p || 1` (semantically correct).
-        expectDiverges(`/* @optimize */ function entry(p, q) { return (q < 0) || (p || 1); }`);
+        expectEquiv(`/* @optimize */ function entry(p, q) { return (q < 0) || (p || 1); }`);
     });
     it('`A && (p ? 1 : q)` no longer rewrites ternary unsoundly (FIXED)', () => {
         // fixed: ternary stays as `p ? 1 : q` in value context, not folded to `p || q`.
-        expectDiverges(`/* @optimize */ function entry(p, q) { return p && (p ? 1 : q); }`);
+        expectEquiv(`/* @optimize */ function entry(p, q) { return p && (p ? 1 : q); }`);
     });
     it('`A && (q && 5)` no longer drops the value (FIXED)', () => {
         // fixed: `q && 5` preserved in value context, not folded to `q`.
-        expectDiverges(`/* @optimize */ function entry(p, q) { return p && (q && 5); }`);
+        expectEquiv(`/* @optimize */ function entry(p, q) { return p && (q && 5); }`);
     });
 
     // BUG C — module-scratch alias dropped under a returned closure. The single-owner
