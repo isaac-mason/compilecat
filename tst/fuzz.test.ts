@@ -1315,18 +1315,11 @@ describe('value/coercion miscompiles — fixed (regression pins)', () => {
 //      loop var with a literal in each iteration body (including inside closures). SAFE.
 //   6. Scratch-alias immediately-called closure — alias stays live. SAFE.
 //
-// EXCLUDED from the random gate (known miscompiles, pinned as it.fails below):
-//   — sroaArrayClosure / sroaObjectClosure: SROA creates read-only scalars whose
-//     sole use is inside a closure; inline_variables's single_use_safe() doesn't
-//     check the closure boundary, so it drops the declarator without applying the
-//     replacement (gate inactive in arrow body) → ReferenceError.
-//   — inlineHelperClosure: block-inline creates an alpha-renamed local (t$N) that
-//     is captured by a returned closure; inline_variables drops it the same way.
-//
-// Root cause (both categories): inline_variables.rs single_use_safe() does not
-// check whether the single read is inside a nested function (closure boundary).
-// The gate prevents the replacement from being applied inside the arrow function,
-// but the drop_decls set is populated independently and the declarator IS dropped.
+// Previously excluded shapes (sroaArrayClosure, sroaObjectClosure,
+// inlineHelperClosure) are now re-enabled in programSafe() after the fix to
+// inline_variables.rs single_use_safe() which adds a closure-boundary guard
+// mirroring try_alias guard #5. The pinned repros live in the
+// "closure capture miscompiles — fixed (regression pins)" describe block above.
 class ClosureGen {
     private id = 0;
     constructor(private r: Rng) {}
@@ -1355,7 +1348,9 @@ class ClosureGen {
         ])();
     }
 
-    // Generate a program for the SAFE random gate (excludes known-buggy shapes).
+    // Generate a program for the SAFE random gate (all shapes are safe after the
+    // single_use_safe() closure-boundary fix; the previously excluded shapes
+    // sroaArrayClosure, sroaObjectClosure, and inlineHelperClosure are re-enabled).
     programSafe(): string {
         const shape = pick(this.r, [
             'mutableSroa',
@@ -1366,6 +1361,9 @@ class ClosureGen {
             'closureInArray',
             'unrollClosure',
             'immediateAlias',
+            'sroaArrayClosure',
+            'sroaObjectClosure',
+            'inlineHelperClosure',
         ] as const);
         return this.gen(shape);
     }
@@ -1388,6 +1386,12 @@ class ClosureGen {
                 return this.unrollClosure();
             case 'immediateAlias':
                 return this.immediateAlias();
+            case 'sroaArrayClosure':
+                return this.sroaArrayClosure();
+            case 'sroaObjectClosure':
+                return this.sroaObjectClosure();
+            case 'inlineHelperClosure':
+                return this.inlineHelperClosure();
             default:
                 return this.iife();
         }
@@ -1517,6 +1521,51 @@ class ClosureGen {
             `}`
         );
     }
+
+    // 9. SROA array with a single-read-only scalar captured by a returned closure.
+    //    Previously buggy (CL-A): inline_variables dropped the SROA scalar while
+    //    the arrow still captured it. FIXED: single_use_safe() closure-boundary guard.
+    private sroaArrayClosure(): string {
+        const n = int(this.r, 2, 4);
+        const captureIdx = int(this.r, 0, n - 1);
+        const elems = Array.from({ length: n }, () => this.numExpr()).join(', ');
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const v = /* @sroa */ [${elems}];\n` +
+            `  const f = () => v[${captureIdx}];\n` +
+            `  return f() + eff(p);\n` +
+            `}`
+        );
+    }
+
+    // 10. SROA object with a single-read-only scalar captured by a returned closure.
+    //     Previously buggy (CL-B): same root cause as sroaArrayClosure. FIXED.
+    private sroaObjectClosure(): string {
+        const keys = ['x', 'y', 'z'].slice(0, int(this.r, 2, 3));
+        const captureKey = keys[int(this.r, 0, keys.length - 1)];
+        const props = keys.map((k) => `${k}: ${this.numExpr()}`).join(', ');
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const o = /* @sroa */ { ${props} };\n` +
+            `  const f = () => o.${captureKey};\n` +
+            `  return f() + eff(p);\n` +
+            `}`
+        );
+    }
+
+    // 11. @inline helper that returns a closure capturing a local. Block-inline
+    //     alpha-renames the local; inline_variables previously dropped it while the
+    //     closure still captured it (CL-C). FIXED: same closure-boundary guard.
+    private inlineHelperClosure(): string {
+        const expr = this.numExpr();
+        return (
+            `/* @inline */ function helper(a, b) { const t = ${expr}; return () => t; }\n` +
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const f = helper(p, q);\n` +
+            `  return f() + eff(p);\n` +
+            `}`
+        );
+    }
 }
 
 describe('fuzz: closure-capture across optimization passes', () => {
@@ -1567,13 +1616,16 @@ describe('fuzz: closure-capture across optimization passes', () => {
     });
 });
 
-// ── KNOWN BUGS — closure capture (open) ──────────────────────────────────────
+// ── closure capture miscompiles — FIXED (regression pins) ────────────────────
 //
-// Real miscompiles found by the ClosureGen fuzzer and targeted probes. Each is
-// pinned as it.fails: when the bug is FIXED in the core, change it.fails → it
-// and re-enable the shape in ClosureGen.programSafe().
+// Real miscompiles found by the ClosureGen fuzzer and targeted probes. Each was
+// a genuine ReferenceError at runtime caused by inline_variables.rs dropping a
+// declarator whose sole read was inside a nested closure (arrow / function
+// boundary). FIXED in inline_variables.rs single_use_safe(): the function now
+// checks that the single read's enclosing function id matches the definition's
+// enclosing function id; if they differ it bails (mirrors try_alias guard #5).
 //
-// ROOT CAUSE (all three): inline_variables.rs single_use_safe() does not check
+// ROOT CAUSE (all three): inline_variables.rs single_use_safe() did not check
 // whether the single read is inside a nested closure (arrow / function boundary).
 // The Applier's gate resets at arrow function boundaries (gate.enter_fn →
 // active=false for non-directive arrows), so the replacement is NOT applied there.
@@ -1581,38 +1633,39 @@ describe('fuzz: closure-capture across optimization passes', () => {
 // the gate IS active in the outer @optimize function. Result: the closure reads
 // a binding whose declaration was silently removed → ReferenceError.
 //
-// The bug is triggered by two upstream passes that create read-only bindings
+// The bug was triggered by two upstream passes that create read-only bindings
 // whose sole use is inside a closure:
 //   A) SROA: scalarizes `const v=[p,q,5]` → `let v_0=p; let v_1=q; let v_2=5`.
 //      SROA's AccessRewriter descends into arrow bodies and rewrites `v[1]→v_1`.
 //      `v_1` is not in exported_names (only `v` was), so inline_variables
-//      considers it — and (wrongly) inlines it, dropping `let v_1=q` while
-//      `()=>v_1` still reads it.
+//      considered it — and wrongly inlined it, dropping `let v_1=q` while
+//      `()=>v_1` still read it.
 //   B) inline_functions: block-inline alpha-renames a helper's local `t` to `t$0`.
 //      If the helper returned `()=>t`, the inlined closure reads `t$0`. Since `t$0`
-//      is not in exported_names, inline_variables wrongly inlines it the same way.
-describe('KNOWN BUGS — closure capture (open)', () => {
-    // Helper: assert source and compiled DIVERGE (it.fails means we EXPECT failure
-    // of the inner expect(resultsEquiv(...)).toBe(true)).
-    const expectMiscompile = (src: string, call = 'entry(7, 3)') => {
+//      is not in exported_names, inline_variables wrongly inlined it the same way.
+//
+// The shapes sroaArrayClosure, sroaObjectClosure, and inlineHelperClosure are
+// re-enabled in ClosureGen.programSafe() now that the bug is fixed.
+describe('closure capture miscompiles — fixed (regression pins)', () => {
+    // Helper: assert compiled output computes the SAME value as source.
+    // Goes RED the moment one of these fixes regresses.
+    const expectEquiv = (src: string, call = 'entry(7, 3)') => {
         const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
         const want = evalProgram(src, call);
         const got = evalProgram(out, call);
-        // This SHOULD be true once the bug is fixed — it.fails will then go red.
+        // Compiled must compute the SAME value as source; RED if a fix regresses.
         expect(resultsEquiv(want, got)).toBe(true);
     };
 
-    // BUG CL-A — SROA array + closure.
+    // BUG CL-A — FIXED. SROA array + closure.
     // SROA scalarizes `[p, q, 5]` to `v_0=p, v_1=q, v_2=5`. The AccessRewriter
     // rewrites `v[1]` inside the arrow body to `v_1`. inline_variables then
-    // inlines `v_1=q` (single use, pure, single_use_safe returns true — it doesn't
-    // check the closure boundary), drops `let v_1=q`, but the arrow `()=>v_1`
-    // is never rewritten (gate inactive). Compiled output throws:
-    //   ReferenceError: v_1 is not defined
-    // Source `entry(7,3)` → `[3,[],0]`; compiled throws.
-    // Suspected pass: inline_variables.rs (single_use_safe lacks closure-boundary check).
-    it.fails('CL-A: SROA array scalar inlined away, closure reads undefined v_1', () => {
-        expectMiscompile(
+    // would have inlined `v_1=q` (single use, pure) dropping `let v_1=q`, but
+    // the arrow `()=>v_1` was never rewritten (gate inactive) → ReferenceError.
+    // FIX: single_use_safe() now checks enclosing_fn_id; bails when read is in
+    // a nested closure (enclosing fn differs from the def).
+    it('CL-A: SROA array scalar no longer inlined away when closure captures it (FIXED)', () => {
+        expectEquiv(
             `/* @optimize */ function entry(p, q) {\n` +
                 `  const v = /* @sroa */ [p, q, 5];\n` +
                 `  const f = () => v[1];\n` +
@@ -1621,15 +1674,14 @@ describe('KNOWN BUGS — closure capture (open)', () => {
         );
     });
 
-    // BUG CL-B — SROA object + closure.
+    // BUG CL-B — FIXED. SROA object + closure.
     // Same root cause as CL-A but with an object shape. SROA scalarizes
     // `{x:p, y:q}` to `o_x=p, o_y=q`. AccessRewriter rewrites `o.y` inside the
-    // arrow to `o_y`. inline_variables drops `let o_y=q` without substituting
-    // inside the arrow.
-    // Source `entry(7,3)` → `[3,[],0]`; compiled throws `o_y is not defined`.
-    // Suspected pass: inline_variables.rs (same root cause as CL-A).
-    it.fails('CL-B: SROA object scalar inlined away, closure reads undefined o_y', () => {
-        expectMiscompile(
+    // arrow to `o_y`. inline_variables dropped `let o_y=q` without substituting
+    // inside the arrow → ReferenceError (`o_y is not defined`).
+    // FIX: same single_use_safe() closure-boundary guard as CL-A.
+    it('CL-B: SROA object scalar no longer inlined away when closure captures it (FIXED)', () => {
+        expectEquiv(
             `/* @optimize */ function entry(p, q) {\n` +
                 `  const o = /* @sroa */ { x: p, y: q };\n` +
                 `  const f = () => o.y;\n` +
@@ -1638,16 +1690,14 @@ describe('KNOWN BUGS — closure capture (open)', () => {
         );
     });
 
-    // BUG CL-C — @inline helper returning a closure, inlined local read inside.
+    // BUG CL-C — FIXED. @inline helper returning a closure, inlined local read.
     // Block-inline of `helper` into `entry` alpha-renames `t` to `t$0`. The
     // closure `()=>t` in the helper body becomes `()=>t$0` after inlining.
-    // `t$0=p+q` is not in exported_names; inline_variables drops it (same
-    // single_use_safe gap). Compiled output throws:
-    //   ReferenceError: t$0 is not defined
-    // Source `entry(7,3)` → `[10,[],0]`; compiled throws.
-    // Suspected pass: inline_variables.rs (same root cause as CL-A/CL-B).
-    it.fails('CL-C: block-inline alpha-renamed local inlined away, closure reads undefined t$0', () => {
-        expectMiscompile(
+    // `t$0=p+q` was dropped by inline_variables (same single_use_safe gap) while
+    // the closure still referenced it → ReferenceError (`t$0 is not defined`).
+    // FIX: same single_use_safe() closure-boundary guard as CL-A/CL-B.
+    it('CL-C: block-inline alpha-renamed local no longer inlined away when closure captures it (FIXED)', () => {
+        expectEquiv(
             `/* @inline */ function helper(a, b) { const t = a + b; return () => t; }\n` +
                 `/* @optimize */ function entry(p, q) {\n` +
                 `  const f = helper(p, q);\n` +

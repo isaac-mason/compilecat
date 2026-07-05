@@ -487,6 +487,25 @@ fn single_use_safe(
     if !is_primitive_literal(init) && use_in_loop_out_of_def(nodes, def, use_) {
         return false;
     }
+    // Guard: when the def is inside a function, the single read must be in the
+    // SAME enclosing function. The Applier uses a gate that resets at each
+    // function/arrow boundary (inactive inside non-directive arrows). If the
+    // read is in a nested closure while the def is in the outer active function,
+    // the substitution won't be applied inside the closure — but drop_decls is
+    // populated from the outer (active) context and the declarator IS dropped,
+    // leaving the closure referencing a binding that no longer exists →
+    // ReferenceError at runtime. Mirrors `try_alias` guard #5.
+    //
+    // The guard fires ONLY when the def is inside a function (not at module
+    // scope). If the def is at module scope (`enclosing_fn_id = None`) the
+    // gated Applier's `visit_statements` has `gate.active = false` there and
+    // will never drop the module-level declarator; in the ungated case the gate
+    // is always active so both the replacement and the drop happen together →
+    // safe regardless.
+    let def_fn = enclosing_fn_id(nodes, def);
+    if def_fn.is_some() && enclosing_fn_id(nodes, use_) != def_fn {
+        return false;
+    }
     true
 }
 
@@ -596,6 +615,11 @@ mod tests {
 
     #[test]
     fn inlines_into_a_plain_nested_function() {
+        // Module-scope const with sole read in a nested function: the guard only
+        // fires when the def is inside a function (not module scope). At module
+        // scope the gated Applier's visit_statements has gate.active=false and
+        // won't drop the declarator; in ungated mode everything is active → safe.
+        // So this case still inlines correctly.
         let (out, _) = iv("const x = 1; function f() { return x; }");
         assert!(out.contains("return 1") && !out.contains("const x"), "{out}");
     }
@@ -810,5 +834,34 @@ mod tests {
         // guard #5 must NOT block the inline.
         let (out, _) = iv("function f(y) { const x = y; use(x); use(x); }");
         assert!(out.contains("use(y)") && !out.contains("const x"), "alias inline fires:\n{out}");
+    }
+
+    // ── single_use_safe closure-boundary guard ───────────────────────────────
+
+    #[test]
+    fn single_use_safe_keeps_decl_when_sole_read_in_nested_arrow() {
+        // Guard: `const v = expr` (single use, pure) whose only read is inside
+        // an arrow function `() => v`. The Applier gate resets at the arrow
+        // boundary so the substitution would NOT fire there, but drop_decls
+        // would still remove the declarator → ReferenceError. Must bail.
+        let (out, n) = iv("function f(p) { const v = p + 1; return () => v; }");
+        assert!(out.contains("const v = p + 1"), "decl kept when sole read in arrow:\n{out}");
+        assert_eq!(n, 0, "no inline when read is in a nested closure:\n{out}");
+    }
+
+    #[test]
+    fn single_use_safe_keeps_decl_when_sole_read_in_nested_function() {
+        // Same as above but with a regular function expression rather than an arrow.
+        let (out, n) = iv("function outer(p) { const v = p * 2; return function inner() { return v; }; }");
+        assert!(out.contains("const v = p * 2"), "decl kept when sole read in function:\n{out}");
+        assert_eq!(n, 0, "no inline when read is in a nested function:\n{out}");
+    }
+
+    #[test]
+    fn single_use_safe_still_inlines_when_read_in_same_fn() {
+        // Non-regression: sole read in the SAME function — guard must NOT block.
+        let (out, n) = iv("function f(p) { const v = p + 1; return v; }");
+        assert!(out.contains("return p + 1") && !out.contains("const v"), "inlined same-fn:\n{out}");
+        assert!(n > 0, "expected at least one inline:\n{out}");
     }
 }
