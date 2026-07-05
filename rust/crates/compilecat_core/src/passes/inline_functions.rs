@@ -185,6 +185,7 @@ pub fn run<'a>(
                 count: 0,
                 next_id: *uid,
                 trigger: Some(inline_spans.clone()),
+                merged_scope: (*local_names).clone(),
                 local_names: local_names.clone(),
             };
             bi.visit_program(program);
@@ -374,6 +375,7 @@ pub(crate) fn flatten_into_hosts<'a>(
                 count: 0,
                 next_id: *uid,
                 trigger: None,
+                merged_scope: (*local_names).clone(),
                 local_names: local_names.clone(),
             };
             bi.visit_function_body(body);
@@ -553,6 +555,7 @@ pub(crate) fn inline_with<'a>(
             count: 0,
             next_id: *uid,
             trigger: None,
+            merged_scope: (*local_names).clone(),
             local_names: local_names.clone(),
         };
         bi.visit_program(program);
@@ -771,6 +774,16 @@ struct BlockInliner<'a, 'c> {
     /// Consumer non-module binding names — a candidate whose free vars collide
     /// with one would be captured after splicing, so it's bailed.
     local_names: Rc<HashSet<String>>,
+    /// Live merged-scope binding-name accumulator — the `seed` handed to
+    /// `uniquify_scope` for each expansion. Starts as a copy of the host's own
+    /// bindings (`local_names`) and grows with every prior inline's flatten-up
+    /// locals, so a later inline's colliding top-level local is renamed against
+    /// them (the post-flatten conflation set) rather than left bare (an
+    /// under-rename = miscompile). A conservative SUPERSET is safe (over-rename is
+    /// harmless); this is one flat set across the whole host pass, so disjoint
+    /// child-scope inlines are seeded against each other too — sound, since
+    /// minimize-exit-points may later merge them into one scope.
+    merged_scope: HashSet<String>,
 }
 
 impl<'a> VisitMut<'a> for BlockInliner<'a, '_> {
@@ -884,6 +897,10 @@ impl<'a> BlockInliner<'a, '_> {
             ))));
         }
         result.push(out.block);
+        // Record this expansion's flatten-up bindings (emit-let temp + prologue
+        // temps + body locals) so later inlines in the merged host scope seed
+        // against them — the post-flatten conflation set (under-rename = miscompile).
+        self.merged_scope.extend(collect_body_locals(&result));
         Ok(result)
     }
 
@@ -937,7 +954,16 @@ impl<'a> BlockInliner<'a, '_> {
         if !triggered(&self.trigger, call) {
             return None;
         }
-        build_block_plan(self.allocator, call, cand, result_name, emit_let, &self.local_names, id)
+        build_block_plan(
+            self.allocator,
+            call,
+            cand,
+            result_name,
+            emit_let,
+            &self.local_names,
+            &self.merged_scope,
+            id,
+        )
     }
 
     /// Inline BLOCK candidate calls nested in `stmt`'s expressions, returning the
@@ -950,6 +976,10 @@ impl<'a> BlockInliner<'a, '_> {
             next_id: self.next_id,
             trigger: self.trigger.clone(),
             local_names: self.local_names.clone(),
+            // Hand the live accumulator to the hoister and take it back afterwards,
+            // so sibling calls in one statement seed each other AND their new
+            // locals carry forward to later statements in this pass.
+            merged_scope: std::mem::take(&mut self.merged_scope),
             hoists: Vec::new(),
             no_hoist: false,
             passed_effect: false,
@@ -962,6 +992,7 @@ impl<'a> BlockInliner<'a, '_> {
         // above the loop, out of `e`'s scope).
         h.hoist_in_statement(stmt);
         self.next_id = h.next_id;
+        self.merged_scope = h.merged_scope;
         h.hoists
     }
 }
@@ -975,6 +1006,11 @@ struct ExprHoister<'a, 'c> {
     next_id: u32,
     trigger: Option<HashSet<u32>>,
     local_names: Rc<HashSet<String>>,
+    /// Merged-scope accumulator threaded in from the owning `BlockInliner` (see
+    /// its `merged_scope`) so sibling expr-position inlines in ONE statement —
+    /// e.g. `return h0(p, q) + h0(q, p)` (two clones of the same expansion) — seed
+    /// against each other, keeping their duplicated locals distinct.
+    merged_scope: HashSet<String>,
     hoists: Vec<Statement<'a>>,
     /// Set inside a conditionally-evaluated sub-expression (a `?:` branch, or the
     /// short-circuit RHS of `&&`/`||`/`??`). A BLOCK inline hoists the call's body
@@ -1107,6 +1143,7 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
                             Some(result.clone()),
                             None,
                             &self.local_names,
+                            &self.merged_scope,
                             id,
                         )
                     })
@@ -1146,6 +1183,11 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
                 ast.vec1(declr),
                 false,
             ))));
+            // Record this expansion's flatten-up bindings (result temp + prologue
+            // temps + body locals) into the accumulator so the NEXT inline in the
+            // merged scope seeds against them (no bare same-name conflation).
+            self.merged_scope.insert(result.clone());
+            self.merged_scope.extend(collect_body_locals(std::slice::from_ref(&out.block)));
             self.hoists.push(out.block);
             *expr = ast.expression_identifier(oxc_span::SPAN, rn);
         }
@@ -1197,6 +1239,7 @@ fn build_block_plan<'a>(
     result_name: Option<String>,
     emit_let: Option<String>,
     local_names: &HashSet<String>,
+    seed: &HashSet<String>,
     id: u32,
 ) -> Option<BlockPlan<'a>> {
     if call.arguments.iter().any(Argument::is_spread) {
@@ -1240,36 +1283,36 @@ fn build_block_plan<'a>(
         renames.insert(p.clone(), fresh.clone());
         *p = fresh;
     }
-    // Re-uniquify EVERY binding the candidate body declares at its own (flattened)
-    // scope level — generated temps a PRIOR sub-inline baked in (`a__0`/
-    // `_h0__result_0`) AND the callee's own user locals (`const t`). Cloning the
-    // body into N call sites duplicates those fixed names; once minimize-exit /
-    // block_flatten unwrap the inline label-blocks into one scope the duplicates
-    // conflate (oxc models same-name same-scope bindings as ONE symbol) and
-    // value-corrupt each other — exactly the param case above. Two DISTINCT helpers
-    // each declaring `const t`, both transitively inlined into one host, was a real
-    // miscompile (212 vs 424): each got the SAME raw `t`, and the symbol-keyed
-    // passes that run before block_flatten re-uniquifies conflated them. Suffixing
-    // with this expansion's unique `id` keeps two expansions' locals distinct
-    // (`t$5` vs `t$7`); within ONE expansion the same suffix is harmless — a single
-    // body can only re-declare a name in a DISJOINT scope (if/else branch, a loop,
-    // a sibling/nested block — two same-scope `const t` is a source syntax error),
-    // and a uniform α-rename preserves lexical resolution across disjoint scopes
-    // (block_flatten is scope-accurate and re-splits any that later share a scope).
-    // `$` matches the block_flatten suffix convention; skip names already renamed
-    // (params/temps handled above).
+    // Re-uniquify the callee body's own locals against the host's live merged-scope
+    // bindings via the SHARED scope-aware renamer (`block_flatten::uniquify_scope`)
+    // — the same walk block_flatten runs. Cloning the body into N call sites
+    // duplicates its fixed local names; once minimize-exit-points / block_flatten
+    // unwrap the inline label-blocks into ONE scope the duplicates would conflate
+    // (oxc models same-name same-scope bindings as ONE symbol) and value-corrupt
+    // each other — the class that produced a real miscompile (212 vs 424): two
+    // DISTINCT helpers each declaring `const t`, both transitively inlined into one
+    // host, each got the SAME raw `t` and the symbol-keyed passes that run before
+    // block_flatten re-uniquifies conflated them.
     //
-    // Soundness guard: `Renamer` renames by NAME and is NOT scope-aware, so a body
-    // local we rename must not share a name with a FREE reference (a read of an
-    // outer/module binding of that name) — renaming the free read too would capture
-    // it. That needs a body that both declares `t` in a nested scope AND reads a
-    // module-level `t`; bail then (sound: falls back to a real call).
+    // Instead of the old preemptive FLAT rename (α-renaming EVERY body local to
+    // `name$<id>` — which over-renamed every disjoint-scope shadow and, under the
+    // transitive-inline fixpoint, STACKED suffixes `t$3$59`), we hand the cloned
+    // body to `uniquify_scope` with `seed` = the host's CURRENT merged-scope
+    // binding names (host locals PLUS every prior inline's flatten-up locals — see
+    // the caller's `seed`/accumulator). A top-level local that genuinely collides
+    // in the merged scope gets exactly ONE clean suffix (`pick_fresh` strips any
+    // existing `$N` first, so no stacking); a local that doesn't collide — the
+    // common disjoint-scope shadow — stays BARE. Under-rename would MISCOMPILE
+    // (bare same-name conflation) so `seed` must reflect all prior bindings sharing
+    // the merged scope; over-rename is harmless, so `seed` is a safe superset.
+    //
+    // Soundness guard (kept): a body local we rename must not share a name with a
+    // FREE reference (a read of an outer/module binding of that name) — that needs
+    // a body that both declares `t` in a nested scope AND reads a module-level `t`;
+    // bail then (sound: falls back to a real call).
     let body_locals = collect_body_locals(&cand.body);
     if body_locals.iter().any(|n| cand.free.contains(n)) {
         return None;
-    }
-    for name in body_locals {
-        renames.entry(name.clone()).or_insert_with(|| format!("{name}${id}"));
     }
     // Reusing an existing var as the result temp is unsafe if the body has a free
     // read of that name — bail (only relevant for init/assign shapes).
@@ -1290,12 +1333,24 @@ fn build_block_plan<'a>(
     }
     let mut body_stmts: Vec<Statement<'a>> =
         cand.body.iter().map(|s| s.clone_in(allocator)).collect();
+    // α-rename the params (references only; params have no body binding) to the
+    // per-expansion `p__<id>` picked above.
     if !renames.is_empty() {
         let mut r = Renamer { allocator, map: &renames };
         for s in body_stmts.iter_mut() {
             r.visit_statement(s);
         }
     }
+    // Scope-aware uniquification of the body's OWN locals against `seed` — the
+    // shared renamer (no separate, strictly-worse flat copy). Runs on the pristine
+    // (param-renamed, pre-arg-substitution) body so the walk sees the real lexical
+    // structure; `p__<id>` params are distinct from any body local so the two
+    // rename steps never interact. `merge_labeled = true`: an inline-scaffold
+    // labeled block from a PRIOR sub-inline (`_inline_<fn>_<id>: { … }`) is
+    // unwrapped into the merged scope by minimize-exit-points, so its top-level
+    // bindings must uniquify as merging (else two clones' `a__0`/`const t` conflate
+    // after unwrap — the 212-vs-424 class).
+    crate::passes::block_flatten::uniquify_scope_with(allocator, &mut body_stmts, seed, true);
 
     // #1 — substitute simple (identifier/literal) args directly for params that
     // aren't reassigned in the body, instead of emitting a `let p = arg` alias
