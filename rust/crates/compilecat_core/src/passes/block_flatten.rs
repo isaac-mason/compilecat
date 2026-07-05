@@ -93,21 +93,85 @@ impl<'a> Flattener<'a> {
         list: &mut oxc_allocator::Vec<'a, Statement<'a>>,
         scope_seed: HashSet<String>,
     ) {
-        // Function-wide avoid set for minting fresh names: every identifier that
-        // appears anywhere in this subtree, so a `name$N` can never collide with —
-        // or accidentally capture — an existing name, regardless of which scope it
-        // lives in. The per-scope `scope` set (below) drives the rename *decision*;
-        // `avoid` only constrains the *replacement* name.
-        let mut avoid = collect_all_names(list);
-        avoid.extend(scope_seed.iter().cloned());
-        let mut scope = scope_seed;
-        // Function body is a merging list (no enclosing scope to shadow): empty
-        // `seed`, so a `let x` redeclaring a param renames unconditionally.
-        let no_seed = HashSet::new();
-        self.rename_list(list, &mut scope, &no_seed, &mut avoid);
+        // Phase 1 (renameForFlatten): the shared scope-aware uniquifier. The
+        // function body is a MERGING list seeded with the params, so a `let x`
+        // redeclaring a param renames unconditionally. This is byte-for-byte the
+        // same walk block-inlining runs on a cloned callee body (see
+        // `uniquify_scope`).
+        uniquify_scope(self.allocator, list, &scope_seed);
+        // Phase 2 (tryMergeBlock): lift bare blocks now that names are unique.
         self.merge_list(list);
     }
+}
 
+/// Scope-aware unique-renaming of the lexical bindings in `stmts`, treating
+/// `stmts` as a statement list that MERGES into an enclosing scope whose current
+/// bindings are `seed`. Every top-level `let`/`const` whose base name is already
+/// live in the merged scope (`seed` plus earlier siblings here) is renamed to a
+/// fresh `name$N` via `pick_fresh` (which strips any existing `$N` suffix first,
+/// so re-running never stacks `x$1$1…`); a name that isn't yet live stays BARE.
+/// Child scopes (`if`/`for`/`while`/`switch`/`try`/nested bare blocks) recurse
+/// SEEDED from the parent, so a disjoint-scope shadow stays bare unless it
+/// genuinely collides there.
+///
+/// Shared infrastructure. `block_flatten` calls it for its rename half (phase 1);
+/// block-inlining calls it on a freshly-cloned callee body with `seed` = the
+/// host's live merged-scope bindings, so the callee's own locals stay bare when
+/// uncontested and pick up exactly one clean suffix on a real same-scope
+/// collision — the SAME model, no separate strictly-worse flat renamer.
+pub(crate) fn uniquify_scope<'a>(
+    allocator: &'a Allocator,
+    stmts: &mut [Statement<'a>],
+    seed: &HashSet<String>,
+) {
+    uniquify_scope_with(allocator, stmts, seed, false)
+}
+
+/// `uniquify_scope` with an explicit `merge_labeled` mode.
+///
+/// `merge_labeled = false` (block_flatten): a `LabeledStatement { block }` is a
+/// real lexical child scope — a binding inside it that shadows an enclosing name
+/// legally shadows and stays bare.
+///
+/// `merge_labeled = true` (block-inlining): the callee body's labeled blocks are
+/// the transient `_inline_<fn>_<id>: { … }` scaffolds that `minimize-exit-points`
+/// later UNWRAPS into the parent — so their top-level bindings actually MERGE into
+/// the merged scope, exactly like a bare block. Treating them as child scopes here
+/// would leave two unwrapped `a__0`/`const t` bare in one scope (the conflation
+/// class). So in this mode a labeled block is uniquified as a merging list. (Real
+/// control-flow bodies — `if`/`for`/`while`/`switch`/`try` — are NOT unwrapped and
+/// stay child scopes in both modes.) Over-merging a user labeled block that
+/// happens to survive is a harmless over-rename.
+pub(crate) fn uniquify_scope_with<'a>(
+    allocator: &'a Allocator,
+    stmts: &mut [Statement<'a>],
+    seed: &HashSet<String>,
+    merge_labeled: bool,
+) {
+    // Function-wide avoid set for minting fresh names: every identifier that
+    // appears anywhere in this subtree, plus the merged-scope `seed`, so a `name$N`
+    // can never collide with — or accidentally capture — an existing name,
+    // regardless of which scope it lives in. The per-scope `scope` set drives the
+    // rename *decision*; `avoid` only constrains the *replacement* name.
+    let mut avoid = collect_all_names(stmts);
+    avoid.extend(seed.iter().cloned());
+    let mut scope: HashSet<String> = seed.clone();
+    // The merged (top) list has no enclosing scope to shadow: empty `seed`, so any
+    // collision with a `scope` name renames unconditionally.
+    let no_seed = HashSet::new();
+    Uniquifier { allocator, merge_labeled }.rename_list(stmts, &mut scope, &no_seed, &mut avoid);
+}
+
+/// The scope-aware rename walk, decoupled from the block-merging it interleaves
+/// with in `block_flatten`. Only needs the allocator (to mint renamed `&'a str`s).
+struct Uniquifier<'a> {
+    allocator: &'a Allocator,
+    /// See `uniquify_scope_with`: whether a labeled block merges (inline) or is a
+    /// child scope (block_flatten).
+    merge_labeled: bool,
+}
+
+impl<'a> Uniquifier<'a> {
     // ---- phase 1: renameForFlatten (scope-aware lexical uniqueness) ----
 
     /// Uniquify every `let`/`const` declared *in this scope* against the names
@@ -120,8 +184,8 @@ impl<'a> Flattener<'a> {
     /// binding with a fresh name keeps it. `avoid` is the function-wide set used
     /// only to pick collision-free fresh names.
     fn rename_list(
-        &mut self,
-        list: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+        &self,
+        list: &mut [Statement<'a>],
         scope: &mut HashSet<String>,
         seed: &HashSet<String>,
         avoid: &mut HashSet<String>,
@@ -154,7 +218,7 @@ impl<'a> Flattener<'a> {
                 let pure_shadow =
                     collides && seed.contains(&name) && !declared_here.contains(&name);
                 let needs_rename =
-                    collides && (!pure_shadow || references_name_before(list, i, &name));
+                    collides && (!pure_shadow || references_name_before(&*list, i, &name));
                 if needs_rename {
                     let fresh = pick_fresh(&name, avoid);
                     avoid.insert(fresh.clone());
@@ -188,7 +252,7 @@ impl<'a> Flattener<'a> {
     }
 
     fn rename_child_scopes(
-        &mut self,
+        &self,
         stmt: &mut Statement<'a>,
         scope: &mut HashSet<String>,
         avoid: &mut HashSet<String>,
@@ -214,6 +278,19 @@ impl<'a> Flattener<'a> {
             Statement::ForOfStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
             Statement::WhileStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
             Statement::DoWhileStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
+            // Inline mode: an inline-scaffold `_inline_<fn>_<id>: { … }` labeled
+            // block is unwrapped into the parent by minimize-exit-points, so its
+            // top-level bindings MERGE (empty seed) — exactly like a bare block.
+            // Otherwise a labeled block is a real child scope (block_flatten).
+            Statement::LabeledStatement(s)
+                if self.merge_labeled
+                    && matches!(&s.body, Statement::BlockStatement(b) if !block_has_hoisted_decl(&b.body)) =>
+            {
+                if let Statement::BlockStatement(b) = &mut s.body {
+                    let no_seed = HashSet::new();
+                    self.rename_list(&mut b.body, scope, &no_seed, avoid);
+                }
+            }
             Statement::LabeledStatement(s) => self.rename_body_childscope(&mut s.body, scope, avoid),
             Statement::SwitchStatement(s) => {
                 // Each case gets its own scope: phase 2 keeps a case's top-level
@@ -257,8 +334,8 @@ impl<'a> Flattener<'a> {
     /// earlier enclosing-`x` references untouched. Non-shadowing child bindings
     /// don't collide, so they keep their names.
     fn rename_child_scope(
-        &mut self,
-        list: &mut oxc_allocator::Vec<'a, Statement<'a>>,
+        &self,
+        list: &mut [Statement<'a>],
         parent: &HashSet<String>,
         avoid: &mut HashSet<String>,
     ) {
@@ -271,7 +348,7 @@ impl<'a> Flattener<'a> {
     /// the parent scope through so shadowing bindings are renamed (see
     /// `rename_child_scope`).
     fn rename_body_childscope(
-        &mut self,
+        &self,
         stmt: &mut Statement<'a>,
         parent: &HashSet<String>,
         avoid: &mut HashSet<String>,
@@ -283,7 +360,9 @@ impl<'a> Flattener<'a> {
             self.rename_child_scopes(stmt, &mut scope, avoid);
         }
     }
+}
 
+impl<'a> Flattener<'a> {
     // ---- phase 2: tryMergeBlock (structural lift) ----
 
     /// Lift every bare block in `list` up into `list` (recursively). Names are
