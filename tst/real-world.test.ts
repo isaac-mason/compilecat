@@ -317,6 +317,132 @@ describe('real-world: optimization pins — slerp / rayCylinder', () => {
     });
 });
 
+// Corpus differential — the scalable path to "confident without a crashcat build".
+// Each entry is a faithful COPY of a mathcat/crashcat kernel + the arity of every
+// param; the harness wraps it in `@optimize`, compiles, and asserts compiled ≡
+// source over random inputs, auto-generating inputs from the declared arities.
+// Adding coverage is one table row — so this scales to the whole mathcat library.
+// (Random, possibly-degenerate inputs are fine: both variants compute the SAME
+// thing, so NaN/Infinity compare equal via toEqual.)
+type Arity = number | 'n'; // array length, or 'n' for a scalar
+
+interface CorpusFn {
+    module: string;
+    fn: string;
+    src: string; // faithful `function <fn>(...) {...}`
+    out: number; // out-param array arity; 0 ⇒ pure return value
+    args: Arity[]; // arities of the params AFTER `out`
+}
+
+const CORPUS: CorpusFn[] = [
+    {
+        module: 'vec3',
+        fn: 'add',
+        out: 3,
+        args: [3, 3],
+        src: 'function add(out, a, b) { out[0] = a[0] + b[0]; out[1] = a[1] + b[1]; out[2] = a[2] + b[2]; return out; }',
+    },
+    {
+        module: 'vec3',
+        fn: 'cross',
+        out: 3,
+        args: [3, 3],
+        src: `function cross(out, a, b) {
+            const ax = a[0]; const ay = a[1]; const az = a[2];
+            const bx = b[0]; const by = b[1]; const bz = b[2];
+            out[0] = ay * bz - az * by;
+            out[1] = az * bx - ax * bz;
+            out[2] = ax * by - ay * bx;
+            return out;
+        }`,
+    },
+    {
+        module: 'vec3',
+        fn: 'normalize',
+        out: 3,
+        args: [3],
+        src: `function normalize(out, a) {
+            const x = a[0]; const y = a[1]; const z = a[2];
+            let len = x * x + y * y + z * z;
+            if (len > 0) { len = 1 / Math.sqrt(len); }
+            out[0] = a[0] * len; out[1] = a[1] * len; out[2] = a[2] * len;
+            return out;
+        }`,
+    },
+    {
+        module: 'vec3',
+        fn: 'lerp',
+        out: 3,
+        args: [3, 3, 'n'],
+        src: `function lerp(out, a, b, t) {
+            const ax = a[0]; const ay = a[1]; const az = a[2];
+            out[0] = ax + t * (b[0] - ax);
+            out[1] = ay + t * (b[1] - ay);
+            out[2] = az + t * (b[2] - az);
+            return out;
+        }`,
+    },
+    {
+        module: 'vec3',
+        fn: 'scaleAndAdd',
+        out: 3,
+        args: [3, 3, 'n'],
+        src: `function scaleAndAdd(out, a, b, scale) {
+            out[0] = a[0] + b[0] * scale;
+            out[1] = a[1] + b[1] * scale;
+            out[2] = a[2] + b[2] * scale;
+            return out;
+        }`,
+    },
+    {
+        module: 'vec3',
+        fn: 'dot',
+        out: 0,
+        args: [3, 3],
+        src: 'function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }',
+    },
+    {
+        module: 'quat',
+        fn: 'multiply',
+        out: 4,
+        args: [4, 4],
+        src: `function multiply(out, a, b) {
+            const ax = a[0]; const ay = a[1]; const az = a[2]; const aw = a[3];
+            const bx = b[0]; const by = b[1]; const bz = b[2]; const bw = b[3];
+            out[0] = ax * bw + aw * bx + ay * bz - az * by;
+            out[1] = ay * bw + aw * by + az * bx - ax * bz;
+            out[2] = az * bw + aw * bz + ax * by - ay * bx;
+            out[3] = aw * bw - ax * bx - ay * by - az * bz;
+            return out;
+        }`,
+    },
+];
+
+describe('corpus differential — mathcat kernels compiled ≡ source (auto-swept)', () => {
+    for (const c of CORPUS) {
+        it(`${c.module}.${c.fn} (${c.out ? `out[${c.out}]` : 'return'}, args ${c.args.join(',')})`, () => {
+            const argNames = c.args.map((_, i) => `x${i}`);
+            const module = `/* @optimize */ export ${c.src}`;
+            const compiled = compiler.compileChunk(`${c.fn}.ts`, module, {}).code;
+            const callBody =
+                c.out > 0
+                    ? `const out = new Array(${c.out}).fill(0); ${c.fn}(out, ${argNames.join(', ')}); return out;`
+                    : `return ${c.fn}(${argNames.join(', ')});`;
+            const make = (code: string) =>
+                // biome-ignore lint/security/noGlobalEval: evaluating compiled code under test
+                new Function(...argNames, `${toJs(code)}\n${callBody}`);
+            const src = make(module);
+            const opt = make(compiled);
+
+            const r = prng(0xc0ffee, 2);
+            for (let i = 0; i < 2000; i++) {
+                const inputs = c.args.map((a) => (a === 'n' ? r() : Array.from({ length: a }, r)));
+                expect(opt(...inputs), `${c.module}.${c.fn} #${i}`).toEqual(src(...inputs));
+            }
+        });
+    }
+});
+
 describe('optimality gaps — CSE / GVN (UNMEASURED trade-off; tracked, not yet decided)', () => {
     const optCount = (body: string, re: RegExp): number => {
         const out = compiler.compileChunk(
