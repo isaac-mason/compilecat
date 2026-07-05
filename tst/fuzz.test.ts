@@ -1298,3 +1298,361 @@ describe('value/coercion miscompiles — fixed (regression pins)', () => {
         expect(resultsEquiv(want, got)).toBe(true);
     });
 });
+
+// ── closure-capture generator ────────────────────────────────────────────────
+//
+// Programs whose observable result depends on a CLOSURE reading a binding that
+// an optimization pass might transform, rename, scalarize, drop, or hoist.
+// The closure MUST be invoked so the capture is observable. Six capture categories:
+//
+//   1. SROA'd aggregate (array/object) with a MUTABLE element — the scalar is
+//      written, so inline_variables sees it as reassigned and skips it. SAFE.
+//   2. Multi-use binding captured by a closure AND used directly — multi-use
+//      path in inline_variables requires a primitive literal for complex exprs. SAFE.
+//   3. IIFE captures — closure is immediately invoked, no dangling reference. SAFE.
+//   4. Closures stored in arrays/objects, then called. SAFE.
+//   5. @unroll loop variable captured in closure — the unroller substitutes the
+//      loop var with a literal in each iteration body (including inside closures). SAFE.
+//   6. Scratch-alias immediately-called closure — alias stays live. SAFE.
+//
+// EXCLUDED from the random gate (known miscompiles, pinned as it.fails below):
+//   — sroaArrayClosure / sroaObjectClosure: SROA creates read-only scalars whose
+//     sole use is inside a closure; inline_variables's single_use_safe() doesn't
+//     check the closure boundary, so it drops the declarator without applying the
+//     replacement (gate inactive in arrow body) → ReferenceError.
+//   — inlineHelperClosure: block-inline creates an alpha-renamed local (t$N) that
+//     is captured by a returned closure; inline_variables drops it the same way.
+//
+// Root cause (both categories): inline_variables.rs single_use_safe() does not
+// check whether the single read is inside a nested function (closure boundary).
+// The gate prevents the replacement from being applied inside the arrow function,
+// but the drop_decls set is populated independently and the declarator IS dropped.
+class ClosureGen {
+    private id = 0;
+    constructor(private r: Rng) {}
+
+    private fresh(p = 'cl'): string {
+        return `${p}${this.id++ % 5}`;
+    }
+
+    private lit(): string {
+        return String(int(this.r, 1, 9));
+    }
+
+    private op(): string {
+        return pick(this.r, ['+', '-', '*']);
+    }
+
+    // A simple numeric expression (may include eff() for effect coverage).
+    private numExpr(): string {
+        return pick(this.r, [
+            () => this.lit(),
+            () => 'p',
+            () => 'q',
+            () => `(p ${this.op()} ${this.lit()})`,
+            () => `(p ${this.op()} q)`,
+            () => `eff(${this.lit()})`,
+        ])();
+    }
+
+    // Generate a program for the SAFE random gate (excludes known-buggy shapes).
+    programSafe(): string {
+        const shape = pick(this.r, [
+            'mutableSroa',
+            'multiUseClosure',
+            'iife',
+            'nestedIife',
+            'closureInObject',
+            'closureInArray',
+            'unrollClosure',
+            'immediateAlias',
+        ] as const);
+        return this.gen(shape);
+    }
+
+    private gen(shape: string): string {
+        switch (shape) {
+            case 'mutableSroa':
+                return this.mutableSroa();
+            case 'multiUseClosure':
+                return this.multiUseClosure();
+            case 'iife':
+                return this.iife();
+            case 'nestedIife':
+                return this.nestedIife();
+            case 'closureInObject':
+                return this.closureInObject();
+            case 'closureInArray':
+                return this.closureInArray();
+            case 'unrollClosure':
+                return this.unrollClosure();
+            case 'immediateAlias':
+                return this.immediateAlias();
+            default:
+                return this.iife();
+        }
+    }
+
+    // 1. SROA'd array with a MUTABLE element captured by a closure. The scalar
+    //    `v[captureIdx]` is written (v[writeIdx] = val; with writeIdx===captureIdx),
+    //    so inline_variables sees it as reassigned and won't inline it. SAFE.
+    private mutableSroa(): string {
+        const n = int(this.r, 2, 3);
+        const idx = int(this.r, 0, n - 1);
+        const sroa = chance(this.r, 0.7) ? '/* @sroa */ ' : '';
+        const elems = Array.from({ length: n }, () => this.lit()).join(', ');
+        const val = this.numExpr();
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const v = ${sroa}[${elems}];\n` +
+            `  v[${idx}] = ${val};\n` +
+            `  const f = () => v[${idx}];\n` +
+            `  return f() + eff(q);\n` +
+            `}`
+        );
+    }
+
+    // 2. Binding used BOTH directly and inside a closure — multi-use prevents the
+    //    single-use inlining path; multi-use path requires a primitive literal for
+    //    a complex expression. SAFE.
+    private multiUseClosure(): string {
+        const v = this.fresh('mu');
+        const expr = `(p ${this.op()} q)`;
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const ${v} = ${expr};\n` +
+            `  const f = () => ${v};\n` +
+            `  return eff(${v}) + f();\n` +
+            `}`
+        );
+    }
+
+    // 3. IIFE: closure captures a value that it immediately returns — no dangling
+    //    reference possible. SAFE.
+    private iife(): string {
+        const inner = pick(this.r, ['p', 'q', `(p ${this.op()} q)`]);
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  return (() => ${inner} + eff(q))();\n` +
+            `}`
+        );
+    }
+
+    // 4. Nested IIFEs — outer captures a binding, inner captures it through the
+    //    outer. Both are immediately invoked. SAFE.
+    private nestedIife(): string {
+        const v = this.fresh('ni');
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const ${v} = p ${this.op()} q;\n` +
+            `  return (() => (() => ${v} + eff(q))())();\n` +
+            `}`
+        );
+    }
+
+    // 5. Closure stored in an object property, then called. Binding also used
+    //    directly (multi-use → not inline-able for complex exprs). SAFE.
+    private closureInObject(): string {
+        const v = this.fresh('co');
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const ${v} = p ${this.op()} q;\n` +
+            `  const obj = { get: () => ${v}, direct: ${v} };\n` +
+            `  return obj.get() + eff(obj.direct);\n` +
+            `}`
+        );
+    }
+
+    // 6. Multiple closures in an array, each capturing a BLOCK-SCOPED binding
+    //    (block const per push, so each closure gets its own distinct binding,
+    //    values are compile-time literals). SAFE.
+    private closureInArray(): string {
+        const n = int(this.r, 2, 4);
+        const vals = Array.from({ length: n }, () => this.lit());
+        const pushes = vals.map((v, i) => `  { const ci${i} = ${v}; fns.push(() => ci${i} + eff(0)); }`);
+        const reads = Array.from({ length: n }, (_, i) => `fns[${i}]()`).join(' + ');
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const fns: Array<() => number> = [];\n` +
+            `${pushes.join('\n')}\n` +
+            `  return ${reads} + eff(p);\n` +
+            `}`
+        );
+    }
+
+    // 7. @unroll loop: the unroller substitutes the loop var with a literal in
+    //    each iteration body (including inside the pushed arrow function), so each
+    //    closure captures a constant value — not the live `i` variable. SAFE.
+    private unrollClosure(): string {
+        const n = int(this.r, 2, 4);
+        const readIdx = int(this.r, 0, n - 1);
+        const extra = pick(this.r, ['p', 'q', '(p + q)']);
+        return (
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const fns: Array<() => number> = [];\n` +
+            `  /* @unroll */ for (let i = 0; i < ${n}; i++) {\n` +
+            `    fns.push(() => i);\n` +
+            `  }\n` +
+            `  return fns[${readIdx}]() + eff(${extra});\n` +
+            `}`
+        );
+    }
+
+    // 8. Module-scratch alias captured in an IMMEDIATELY-CALLED closure — the
+    //    alias stays live (closure is not returned or stored). SAFE (Bug C's guard
+    //    #5 only fires when the closure ESCAPES with the alias live inside it).
+    private immediateAlias(): string {
+        const n = int(this.r, 2, 3);
+        const writes = Array.from(
+            { length: n },
+            (_, i) => `  sa[${i}] = ${this.numExpr()};`,
+        ).join('\n');
+        const reads = Array.from({ length: n }, (_, i) => `sa[${i}]`).join(' + ');
+        return (
+            `const _scl = /*@__PURE__*/ [${Array.from({ length: n }, () => '0').join(', ')}];\n` +
+            `/* @optimize */ function entry(p, q) {\n` +
+            `  const sa = _scl;\n` +
+            `${writes}\n` +
+            `  return (() => ${reads})() + eff(p);\n` +
+            `}`
+        );
+    }
+}
+
+describe('fuzz: closure-capture across optimization passes', () => {
+    const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x3c1a7f9e;
+    const ITERS = Number(process.env.FUZZ_ITERS ?? 0) || 300;
+    // The random gate runs ONLY the SAFE shapes (see ClosureGen comment above).
+    // Known-buggy shapes are excluded here and pinned as it.fails below so the
+    // gate stays green while still providing closure-capture coverage.
+    it(`${ITERS} closure-capture programs preserve semantics (safe shapes)`, () => {
+        for (let i = 0; i < ITERS; i++) {
+            const seed = (BASE ^ 0x6b8f4a2d) + i * 2654435761;
+            const code = new ClosureGen(mulberry32(seed >>> 0)).programSafe();
+            let d: ReturnType<typeof diff>;
+            try {
+                d = diff(code);
+            } catch (e) {
+                d = {
+                    call: 'entry(7, 3)',
+                    compiled: `<compile threw: ${(e as Error).message}>`,
+                    want: 'n/a',
+                    got: 'n/a',
+                };
+            }
+            if (d) {
+                const minimal = (() => {
+                    try {
+                        return shrink(code);
+                    } catch {
+                        return code;
+                    }
+                })();
+                const md = (() => {
+                    try {
+                        return diff(minimal) ?? d;
+                    } catch {
+                        return d;
+                    }
+                })();
+                throw new Error(
+                    `CLOSURE MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
+                        `call: ${md.call}   want=${JSON.stringify(md.want)} got=${JSON.stringify(md.got)}\n\n` +
+                        `--- minimal source ---\n${minimal}\n\n` +
+                        `--- compiled ---\n${md.compiled}\n`,
+                );
+            }
+        }
+        expect(true).toBe(true);
+    });
+});
+
+// ── KNOWN BUGS — closure capture (open) ──────────────────────────────────────
+//
+// Real miscompiles found by the ClosureGen fuzzer and targeted probes. Each is
+// pinned as it.fails: when the bug is FIXED in the core, change it.fails → it
+// and re-enable the shape in ClosureGen.programSafe().
+//
+// ROOT CAUSE (all three): inline_variables.rs single_use_safe() does not check
+// whether the single read is inside a nested closure (arrow / function boundary).
+// The Applier's gate resets at arrow function boundaries (gate.enter_fn →
+// active=false for non-directive arrows), so the replacement is NOT applied there.
+// But drop_decls is populated independently and the declarator IS dropped when
+// the gate IS active in the outer @optimize function. Result: the closure reads
+// a binding whose declaration was silently removed → ReferenceError.
+//
+// The bug is triggered by two upstream passes that create read-only bindings
+// whose sole use is inside a closure:
+//   A) SROA: scalarizes `const v=[p,q,5]` → `let v_0=p; let v_1=q; let v_2=5`.
+//      SROA's AccessRewriter descends into arrow bodies and rewrites `v[1]→v_1`.
+//      `v_1` is not in exported_names (only `v` was), so inline_variables
+//      considers it — and (wrongly) inlines it, dropping `let v_1=q` while
+//      `()=>v_1` still reads it.
+//   B) inline_functions: block-inline alpha-renames a helper's local `t` to `t$0`.
+//      If the helper returned `()=>t`, the inlined closure reads `t$0`. Since `t$0`
+//      is not in exported_names, inline_variables wrongly inlines it the same way.
+describe('KNOWN BUGS — closure capture (open)', () => {
+    // Helper: assert source and compiled DIVERGE (it.fails means we EXPECT failure
+    // of the inner expect(resultsEquiv(...)).toBe(true)).
+    const expectMiscompile = (src: string, call = 'entry(7, 3)') => {
+        const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
+        const want = evalProgram(src, call);
+        const got = evalProgram(out, call);
+        // This SHOULD be true once the bug is fixed — it.fails will then go red.
+        expect(resultsEquiv(want, got)).toBe(true);
+    };
+
+    // BUG CL-A — SROA array + closure.
+    // SROA scalarizes `[p, q, 5]` to `v_0=p, v_1=q, v_2=5`. The AccessRewriter
+    // rewrites `v[1]` inside the arrow body to `v_1`. inline_variables then
+    // inlines `v_1=q` (single use, pure, single_use_safe returns true — it doesn't
+    // check the closure boundary), drops `let v_1=q`, but the arrow `()=>v_1`
+    // is never rewritten (gate inactive). Compiled output throws:
+    //   ReferenceError: v_1 is not defined
+    // Source `entry(7,3)` → `[3,[],0]`; compiled throws.
+    // Suspected pass: inline_variables.rs (single_use_safe lacks closure-boundary check).
+    it.fails('CL-A: SROA array scalar inlined away, closure reads undefined v_1', () => {
+        expectMiscompile(
+            `/* @optimize */ function entry(p, q) {\n` +
+                `  const v = /* @sroa */ [p, q, 5];\n` +
+                `  const f = () => v[1];\n` +
+                `  return f();\n` +
+                `}`,
+        );
+    });
+
+    // BUG CL-B — SROA object + closure.
+    // Same root cause as CL-A but with an object shape. SROA scalarizes
+    // `{x:p, y:q}` to `o_x=p, o_y=q`. AccessRewriter rewrites `o.y` inside the
+    // arrow to `o_y`. inline_variables drops `let o_y=q` without substituting
+    // inside the arrow.
+    // Source `entry(7,3)` → `[3,[],0]`; compiled throws `o_y is not defined`.
+    // Suspected pass: inline_variables.rs (same root cause as CL-A).
+    it.fails('CL-B: SROA object scalar inlined away, closure reads undefined o_y', () => {
+        expectMiscompile(
+            `/* @optimize */ function entry(p, q) {\n` +
+                `  const o = /* @sroa */ { x: p, y: q };\n` +
+                `  const f = () => o.y;\n` +
+                `  return f();\n` +
+                `}`,
+        );
+    });
+
+    // BUG CL-C — @inline helper returning a closure, inlined local read inside.
+    // Block-inline of `helper` into `entry` alpha-renames `t` to `t$0`. The
+    // closure `()=>t` in the helper body becomes `()=>t$0` after inlining.
+    // `t$0=p+q` is not in exported_names; inline_variables drops it (same
+    // single_use_safe gap). Compiled output throws:
+    //   ReferenceError: t$0 is not defined
+    // Source `entry(7,3)` → `[10,[],0]`; compiled throws.
+    // Suspected pass: inline_variables.rs (same root cause as CL-A/CL-B).
+    it.fails('CL-C: block-inline alpha-renamed local inlined away, closure reads undefined t$0', () => {
+        expectMiscompile(
+            `/* @inline */ function helper(a, b) { const t = a + b; return () => t; }\n` +
+                `/* @optimize */ function entry(p, q) {\n` +
+                `  const f = helper(p, q);\n` +
+                `  return f();\n` +
+                `}`,
+        );
+    });
+});
