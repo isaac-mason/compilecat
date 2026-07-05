@@ -2553,3 +2553,451 @@ export const MATHCAT_CORPUS = [
 }`,
     },
 ];
+
+// Composite kernels — the ENTRY function CALLS other mathcat functions, so that
+// `@optimize`/`@flatten` inlines them (transitively, to a fixpoint). Unlike the
+// leaf corpus above (which has no inlinable calls), these exercise the inliner on
+// real mathcat shapes. `deps` holds the verbatim helper declarations the entry
+// (and, recursively, each helper) transitively calls — un-annotated so @flatten
+// inlines them. Bodies are VERBATIM mathcat copies; where the caller uses an
+// import alias (e.g. `sub` for vec3.subtract, `dot` for vec4.dot, `round$1` for
+// common.round) the helper is DECLARED under that alias with the original body,
+// and module-const scratch (`create$1()` = vec3.create) is kept as the real
+// crashcat module-scratch pattern. The harness prepends `deps`, wraps the entry
+// in `@optimize export`, compiles, and asserts compiled ≡ source over random
+// inputs (auto-generated from the ENTRY's `out`/`args` arities).
+export const MATHCAT_COMPOSITES = [
+    // vec3.angle → vec3.dot (pure return helper inlined into the value)
+    {
+        module: 'vec3',
+        fn: 'angle',
+        out: 0,
+        args: [3, 3],
+        deps: `function dot(a, b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}`,
+        src: `function angle(a, b) {
+    const ax = a[0];
+    const ay = a[1];
+    const az = a[2];
+    const bx = b[0];
+    const by = b[1];
+    const bz = b[2];
+    const mag = Math.sqrt((ax * ax + ay * ay + az * az) * (bx * bx + by * by + bz * bz));
+    const cosine = mag && dot(a, b) / mag;
+    return Math.acos(Math.min(Math.max(cosine, -1), 1));
+}`,
+    },
+    // quat.getAngle → vec4.dot (4-component dot; imported by quat as `dot`)
+    {
+        module: 'quat',
+        fn: 'getAngle',
+        out: 0,
+        args: [4, 4],
+        deps: `function dot(a, b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+}`,
+        src: `function getAngle(a, b) {
+    const dotproduct = dot(a, b);
+    return Math.acos(2 * dotproduct * dotproduct - 1);
+}`,
+    },
+    // quat.pow → quat.ln, vec4.scale, quat.exp (out is aliased in/out across all 3)
+    {
+        module: 'quat',
+        fn: 'pow',
+        out: 4,
+        args: [4, 'n'],
+        deps: `function ln(out, a) {
+    const x = a[0];
+    const y = a[1];
+    const z = a[2];
+    const w = a[3];
+    const r = Math.sqrt(x * x + y * y + z * z);
+    const t = r > 0 ? Math.atan2(r, w) / r : 0;
+    out[0] = x * t;
+    out[1] = y * t;
+    out[2] = z * t;
+    out[3] = 0.5 * Math.log(x * x + y * y + z * z + w * w);
+    return out;
+}
+function scale(out, a, b) {
+    out[0] = a[0] * b;
+    out[1] = a[1] * b;
+    out[2] = a[2] * b;
+    out[3] = a[3] * b;
+    return out;
+}
+function exp(out, a) {
+    const x = a[0];
+    const y = a[1];
+    const z = a[2];
+    const w = a[3];
+    const r = Math.sqrt(x * x + y * y + z * z);
+    const et = Math.exp(w);
+    const s = r > 0 ? (et * Math.sin(r)) / r : 0;
+    out[0] = x * s;
+    out[1] = y * s;
+    out[2] = z * s;
+    out[3] = et * Math.cos(r);
+    return out;
+}`,
+        src: `function pow(out, a, b) {
+    ln(out, a);
+    scale(out, out, b);
+    exp(out, out);
+    return out;
+}`,
+    },
+    // mat4.getRotation → mat4.getScaling (out-param helper into a fresh scratch)
+    {
+        module: 'mat4',
+        fn: 'getRotation',
+        out: 4,
+        args: [16],
+        deps: `function getScaling(out, mat) {
+    const m11 = mat[0];
+    const m12 = mat[1];
+    const m13 = mat[2];
+    const m21 = mat[4];
+    const m22 = mat[5];
+    const m23 = mat[6];
+    const m31 = mat[8];
+    const m32 = mat[9];
+    const m33 = mat[10];
+    out[0] = Math.sqrt(m11 * m11 + m12 * m12 + m13 * m13);
+    out[1] = Math.sqrt(m21 * m21 + m22 * m22 + m23 * m23);
+    out[2] = Math.sqrt(m31 * m31 + m32 * m32 + m33 * m33);
+    return out;
+}`,
+        src: `function getRotation(out, mat) {
+    const scaling = [0, 0, 0];
+    getScaling(scaling, mat);
+    const is1 = 1 / scaling[0];
+    const is2 = 1 / scaling[1];
+    const is3 = 1 / scaling[2];
+    const sm11 = mat[0] * is1;
+    const sm12 = mat[1] * is2;
+    const sm13 = mat[2] * is3;
+    const sm21 = mat[4] * is1;
+    const sm22 = mat[5] * is2;
+    const sm23 = mat[6] * is3;
+    const sm31 = mat[8] * is1;
+    const sm32 = mat[9] * is2;
+    const sm33 = mat[10] * is3;
+    const trace = sm11 + sm22 + sm33;
+    let S = 0;
+    if (trace > 0) {
+        S = Math.sqrt(trace + 1.0) * 2;
+        out[3] = 0.25 * S;
+        out[0] = (sm23 - sm32) / S;
+        out[1] = (sm31 - sm13) / S;
+        out[2] = (sm12 - sm21) / S;
+    }
+    else if (sm11 > sm22 && sm11 > sm33) {
+        S = Math.sqrt(1.0 + sm11 - sm22 - sm33) * 2;
+        out[3] = (sm23 - sm32) / S;
+        out[0] = 0.25 * S;
+        out[1] = (sm12 + sm21) / S;
+        out[2] = (sm31 + sm13) / S;
+    }
+    else if (sm22 > sm33) {
+        S = Math.sqrt(1.0 + sm22 - sm11 - sm33) * 2;
+        out[3] = (sm31 - sm13) / S;
+        out[0] = (sm12 + sm21) / S;
+        out[1] = 0.25 * S;
+        out[2] = (sm23 + sm32) / S;
+    }
+    else {
+        S = Math.sqrt(1.0 + sm33 - sm11 - sm22) * 2;
+        out[3] = (sm12 - sm21) / S;
+        out[0] = (sm31 + sm13) / S;
+        out[1] = (sm23 + sm32) / S;
+        out[2] = 0.25 * S;
+    }
+    return out;
+}`,
+    },
+    // mat4.fromQuat2 → mat4.fromRotationTranslation (16-wide out; dual-quat in)
+    {
+        module: 'mat4',
+        fn: 'fromQuat2',
+        out: 16,
+        args: [8],
+        deps: `function fromRotationTranslation(out, q, v) {
+    // Quaternion math
+    const x = q[0];
+    const y = q[1];
+    const z = q[2];
+    const w = q[3];
+    const x2 = x + x;
+    const y2 = y + y;
+    const z2 = z + z;
+    const xx = x * x2;
+    const xy = x * y2;
+    const xz = x * z2;
+    const yy = y * y2;
+    const yz = y * z2;
+    const zz = z * z2;
+    const wx = w * x2;
+    const wy = w * y2;
+    const wz = w * z2;
+    out[0] = 1 - (yy + zz);
+    out[1] = xy + wz;
+    out[2] = xz - wy;
+    out[3] = 0;
+    out[4] = xy - wz;
+    out[5] = 1 - (xx + zz);
+    out[6] = yz + wx;
+    out[7] = 0;
+    out[8] = xz + wy;
+    out[9] = yz - wx;
+    out[10] = 1 - (xx + yy);
+    out[11] = 0;
+    out[12] = v[0];
+    out[13] = v[1];
+    out[14] = v[2];
+    out[15] = 1;
+    return out;
+}`,
+        src: `function fromQuat2(out, a) {
+    const translation = [0, 0, 0];
+    const bx = -a[0];
+    const by = -a[1];
+    const bz = -a[2];
+    const bw = a[3];
+    const ax = a[4];
+    const ay = a[5];
+    const az = a[6];
+    const aw = a[7];
+    const magnitude = bx * bx + by * by + bz * bz + bw * bw;
+    //Only scale if it makes sense
+    if (magnitude > 0) {
+        translation[0] = ((ax * bw + aw * bx + ay * bz - az * by) * 2) / magnitude;
+        translation[1] = ((ay * bw + aw * by + az * bx - ax * bz) * 2) / magnitude;
+        translation[2] = ((az * bw + aw * bz + ax * by - ay * bx) * 2) / magnitude;
+    }
+    else {
+        translation[0] = (ax * bw + aw * bx + ay * bz - az * by) * 2;
+        translation[1] = (ay * bw + aw * by + az * bx - ax * bz) * 2;
+        translation[2] = (az * bw + aw * bz + ax * by - ay * bx) * 2;
+    }
+    fromRotationTranslation(out, a, translation);
+    return out;
+}`,
+    },
+    // mat4.crossProductMatrix → mat4.set (16-arg return-position setter inlined)
+    {
+        module: 'mat4',
+        fn: 'crossProductMatrix',
+        out: 16,
+        args: [3],
+        deps: `function set(out, m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33) {
+    out[0] = m00;
+    out[1] = m01;
+    out[2] = m02;
+    out[3] = m03;
+    out[4] = m10;
+    out[5] = m11;
+    out[6] = m12;
+    out[7] = m13;
+    out[8] = m20;
+    out[9] = m21;
+    out[10] = m22;
+    out[11] = m23;
+    out[12] = m30;
+    out[13] = m31;
+    out[14] = m32;
+    out[15] = m33;
+    return out;
+}`,
+        src: `function crossProductMatrix(out, v) {
+    const x = v[0];
+    const y = v[1];
+    const z = v[2];
+    return set(out, 0, z, -y, 0, // column 0
+    -z, 0, x, 0, // column 1
+    y, -x, 0, 0, // column 2
+    0, 0, 0, 1 // column 3
+    );
+}`,
+    },
+    // box3.setFromCenterAndSize → vec3.scale/subtract/add through MODULE SCRATCH
+    // (`create$1()` = vec3.create). Exercises inline + module-scratch scalarize.
+    {
+        module: 'box3',
+        fn: 'setFromCenterAndSize',
+        out: 6,
+        args: [3, 3],
+        deps: `function create$1() {
+    return [0, 0, 0];
+}
+function scale$1(out, a, b) {
+    out[0] = a[0] * b;
+    out[1] = a[1] * b;
+    out[2] = a[2] * b;
+    return out;
+}
+function sub(out, a, b) {
+    out[0] = a[0] - b[0];
+    out[1] = a[1] - b[1];
+    out[2] = a[2] - b[2];
+    return out;
+}
+function add(out, a, b) {
+    out[0] = a[0] + b[0];
+    out[1] = a[1] + b[1];
+    out[2] = a[2] + b[2];
+    return out;
+}
+const _setFromCenterAndSize_halfSize = /*@__PURE__*/ create$1();
+const _setFromCenterAndSize_min = /*@__PURE__*/ create$1();
+const _setFromCenterAndSize_max = /*@__PURE__*/ create$1();`,
+        src: `function setFromCenterAndSize(out, center, size) {
+    const halfSize = scale$1(_setFromCenterAndSize_halfSize, size, 0.5);
+    sub(_setFromCenterAndSize_min, center, halfSize);
+    add(_setFromCenterAndSize_max, center, halfSize);
+    out[0] = _setFromCenterAndSize_min[0];
+    out[1] = _setFromCenterAndSize_min[1];
+    out[2] = _setFromCenterAndSize_min[2];
+    out[3] = _setFromCenterAndSize_max[0];
+    out[4] = _setFromCenterAndSize_max[1];
+    out[5] = _setFromCenterAndSize_max[2];
+    return out;
+}`,
+    },
+    // vec3.round → common.round (imported as `round$1`)
+    {
+        module: 'vec3',
+        fn: 'round',
+        out: 3,
+        args: [3],
+        deps: `function round$1(a) {
+    if (a >= 0)
+        return Math.round(a);
+    return a % 0.5 === 0 ? Math.floor(a) : Math.round(a);
+}`,
+        src: `function round(out, a) {
+    out[0] = round$1(a[0]);
+    out[1] = round$1(a[1]);
+    out[2] = round$1(a[2]);
+    return out;
+}`,
+    },
+    // vec4.round → common.round
+    {
+        module: 'vec4',
+        fn: 'round',
+        out: 4,
+        args: [4],
+        deps: `function round$1(a) {
+    if (a >= 0)
+        return Math.round(a);
+    return a % 0.5 === 0 ? Math.floor(a) : Math.round(a);
+}`,
+        src: `function round(out, a) {
+    out[0] = round$1(a[0]);
+    out[1] = round$1(a[1]);
+    out[2] = round$1(a[2]);
+    out[3] = round$1(a[3]);
+    return out;
+}`,
+    },
+    // vec2.round → common.round
+    {
+        module: 'vec2',
+        fn: 'round',
+        out: 2,
+        args: [2],
+        deps: `function round$1(a) {
+    if (a >= 0)
+        return Math.round(a);
+    return a % 0.5 === 0 ? Math.floor(a) : Math.round(a);
+}`,
+        src: `function round(out, a) {
+    out[0] = round$1(a[0]);
+    out[1] = round$1(a[1]);
+    return out;
+}`,
+    },
+    // spherical.lerp → common.lerp (as `lerp$1`) + spherical.wrapAngle
+    {
+        module: 'spherical',
+        fn: 'lerp',
+        out: 3,
+        args: [3, 3, 'n'],
+        deps: `function lerp$1(v0, v1, t) {
+    return v0 * (1 - t) + v1 * t;
+}
+function wrapAngle(a) {
+    const TAU = Math.PI * 2;
+    return a - TAU * Math.floor((a + Math.PI) / TAU);
+}`,
+        src: `function lerp(out, a, b, t) {
+    out[0] = lerp$1(a[0], b[0], t);
+    out[1] = a[1] + wrapAngle(b[1] - a[1]) * t;
+    out[2] = a[2] + wrapAngle(b[2] - a[2]) * t;
+    return out;
+}`,
+    },
+    // quat.fromMat4 → mat3.create (as `create$1`), mat3.fromMat4 (as `fromMat4$1`),
+    // quat.fromMat3 (dynamic-index branch). A 3-helper single-level inline chain.
+    {
+        module: 'quat',
+        fn: 'fromMat4',
+        out: 4,
+        args: [16],
+        deps: `function create$1() {
+    return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+}
+function fromMat4$1(out, a) {
+    out[0] = a[0];
+    out[1] = a[1];
+    out[2] = a[2];
+    out[3] = a[4];
+    out[4] = a[5];
+    out[5] = a[6];
+    out[6] = a[8];
+    out[7] = a[9];
+    out[8] = a[10];
+    return out;
+}
+function fromMat3(out, m) {
+    // Algorithm in Ken Shoemake's article in 1987 SIGGRAPH course notes
+    // article "Quaternion Calculus and Fast Animation".
+    const fTrace = m[0] + m[4] + m[8];
+    let fRoot;
+    if (fTrace > 0.0) {
+        // |w| > 1/2, may as well choose w > 1/2
+        fRoot = Math.sqrt(fTrace + 1.0); // 2w
+        out[3] = 0.5 * fRoot;
+        fRoot = 0.5 / fRoot; // 1/(4w)
+        out[0] = (m[5] - m[7]) * fRoot;
+        out[1] = (m[6] - m[2]) * fRoot;
+        out[2] = (m[1] - m[3]) * fRoot;
+    }
+    else {
+        // |w| <= 1/2
+        let i = 0;
+        if (m[4] > m[0])
+            i = 1;
+        if (m[8] > m[i * 3 + i])
+            i = 2;
+        const j = (i + 1) % 3;
+        const k = (i + 2) % 3;
+        fRoot = Math.sqrt(m[i * 3 + i] - m[j * 3 + j] - m[k * 3 + k] + 1.0);
+        out[i] = 0.5 * fRoot;
+        fRoot = 0.5 / fRoot;
+        out[3] = (m[j * 3 + k] - m[k * 3 + j]) * fRoot;
+        out[j] = (m[j * 3 + i] + m[i * 3 + j]) * fRoot;
+        out[k] = (m[k * 3 + i] + m[i * 3 + k]) * fRoot;
+    }
+    return out;
+}`,
+        src: `function fromMat4(out, m) {
+    const m3 = create$1();
+    fromMat4$1(m3, m);
+    return fromMat3(out, m3);
+}`,
+    },
+];

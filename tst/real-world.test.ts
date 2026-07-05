@@ -15,7 +15,7 @@ import { transformSync } from 'esbuild';
 import { describe, expect, it } from 'vitest';
 
 import { createCompiler } from '../src/compiler';
-import { MATHCAT_CORPUS } from './fixtures/corpus/mathcat';
+import { MATHCAT_COMPOSITES, MATHCAT_CORPUS } from './fixtures/corpus/mathcat';
 
 const compiler = createCompiler();
 const here = dirname(fileURLToPath(import.meta.url));
@@ -333,17 +333,23 @@ interface CorpusFn {
     src: string; // faithful `function <fn>(...) {...}`
     out: number; // out-param array arity; 0 ⇒ pure return value
     args: Arity[]; // arities of the params AFTER `out`
+    // Optional verbatim helper declarations to PREPEND (un-annotated so @flatten
+    // inlines them). When present, the entry `fn` CALLS these — so compiling it
+    // under `@optimize` exercises the (transitive) inliner on real mathcat shapes.
+    deps?: string;
 }
 
 // The corpus data lives in a dedicated file (auto-extracted verbatim from mathcat);
-// adding coverage is one row there. See tst/fixtures/corpus/mathcat.ts.
-const CORPUS: CorpusFn[] = MATHCAT_CORPUS as unknown as CorpusFn[];
+// adding coverage is one row there. See tst/fixtures/corpus/mathcat.ts. The leaf
+// corpus has no inlinable calls; the composites (a `deps` block of helper fns the
+// entry transitively calls) additionally exercise the inliner on real shapes.
+const CORPUS: CorpusFn[] = [...MATHCAT_CORPUS, ...MATHCAT_COMPOSITES] as unknown as CorpusFn[];
 
 describe('corpus differential — mathcat kernels compiled ≡ source (auto-swept)', () => {
     for (const c of CORPUS) {
-        it(`${c.module}.${c.fn} (${c.out ? `out[${c.out}]` : 'return'}, args ${c.args.join(',')})`, () => {
+        it(`${c.module}.${c.fn} (${c.out ? `out[${c.out}]` : 'return'}, args ${c.args.join(',')})${c.deps ? ' [composite]' : ''}`, () => {
             const argNames = c.args.map((_, i) => `x${i}`);
-            const module = `/* @optimize */ export ${c.src}`;
+            const module = `${c.deps ? `${c.deps}\n` : ''}/* @optimize */ export ${c.src}`;
             const compiled = compiler.compileChunk(`${c.fn}.ts`, module, {}).code;
             const callBody =
                 c.out > 0
@@ -362,6 +368,36 @@ describe('corpus differential — mathcat kernels compiled ≡ source (auto-swep
             }
         });
     }
+});
+
+// Composite pins: the corpus differential above proves the composites compile ≡
+// source; these assert the OPTIMIZATION actually happened — @optimize/@flatten
+// inlined every helper the entry calls, leaving no residual `helper(` in the
+// entry body. (A regression that silently stopped inlining would still pass the
+// differential but is a real optimality loss — pinned here so it's visible.)
+describe('composite inlining pins — helpers inline into the entry body', () => {
+    const compileComposite = (fn: string): string => {
+        const c = MATHCAT_COMPOSITES.find((x) => x.fn === fn);
+        if (!c) throw new Error(`no composite ${fn}`);
+        return compiler.compileChunk(`${fn}.ts`, `${c.deps}\n/* @optimize */ export ${c.src}`, {})
+            .code;
+    };
+    const entryBody = (out: string, fn: string): string => out.slice(out.indexOf(`function ${fn}`));
+
+    it('vec3.angle: the pure `dot` helper inlines into the return value', () => {
+        const body = entryBody(compileComposite('angle'), 'angle');
+        expect(body).not.toMatch(/\bdot\(/);
+    });
+
+    it('mat4.getRotation: the out-param `getScaling` helper inlines away', () => {
+        const body = entryBody(compileComposite('getRotation'), 'getRotation');
+        expect(body).not.toMatch(/\bgetScaling\(/);
+    });
+
+    it('mat4.crossProductMatrix: the 16-arg `set` helper inlines away', () => {
+        const body = entryBody(compileComposite('crossProductMatrix'), 'crossProductMatrix');
+        expect(body).not.toMatch(/\bset\(/);
+    });
 });
 
 describe('optimality gaps — CSE / GVN (UNMEASURED trade-off; tracked, not yet decided)', () => {
