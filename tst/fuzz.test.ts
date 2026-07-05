@@ -544,11 +544,14 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
 class ChainGen {
     private uid = 0;
     constructor(private r: Rng) {}
-    // Per-program-unique local name. (A SHARED name across helpers surfaces a
-    // known nested-inline collision bug — pinned separately as `it.fails` below —
-    // which would make this fuzzer flap; uniqueness keeps it exploring OTHER shapes.)
+    // Local name for a helper's block body. ~40% of the time draw from a small
+    // SHARED pool so DIFFERENT helpers collide on the same name — that's the shape
+    // that triggered the (now-fixed) nested-inline user-local collision miscompile
+    // (helpers each declaring `const t`, both transitively inlined into one host).
+    // Keeping it in the generator makes this fuzzer a permanent regression net for
+    // the α-rename fix; the remaining ~60% use unique names for shape variety.
     private local(): string {
-        return `t${this.uid++}`;
+        return chance(this.r, 0.4) ? pick(this.r, ['t', 'u', 'w', 's']) : `t${this.uid++}`;
     }
     private lit(): string {
         return String(int(this.r, 1, 9));
