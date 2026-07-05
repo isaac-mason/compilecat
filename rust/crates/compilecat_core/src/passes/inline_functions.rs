@@ -1162,12 +1162,13 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
     }
 }
 
-/// Generated-temp bindings a prior inline left in a candidate body — names
-/// containing `__` (param α-renames `p__N` and result temps `_x__result_N`),
-/// collected for re-uniquification on clone. Skips nested function/arrow scopes
-/// (their bindings don't lift into the host) and consumer code (which rarely uses
-/// `__`); a false positive only renames a binding consistently, never miscompiles.
-fn collect_generated_bindings(body: &[Statement]) -> HashSet<String> {
+/// All bindings a candidate body DECLARES at its own (flattened) scope level —
+/// both generated temps a prior inline baked in (`p__N`, `_x__result_N`) AND the
+/// callee's own user locals (`const t`), collected for re-uniquification on clone.
+/// Skips nested function/arrow scopes: their bindings have their own runtime scope
+/// and survive flattening, so they must NOT be renamed (renaming would still be a
+/// consistent binding+reference rewrite, but it's needless churn).
+fn collect_body_locals(body: &[Statement]) -> HashSet<String> {
     struct V {
         names: HashSet<String>,
     }
@@ -1175,9 +1176,7 @@ fn collect_generated_bindings(body: &[Statement]) -> HashSet<String> {
         fn visit_function(&mut self, _: &Function<'a>, _: oxc_semantic::ScopeFlags) {}
         fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
         fn visit_binding_identifier(&mut self, id: &BindingIdentifier<'a>) {
-            if id.name.contains("__") {
-                self.names.insert(id.name.to_string());
-            }
+            self.names.insert(id.name.to_string());
         }
     }
     let mut v = V { names: HashSet::new() };
@@ -1241,15 +1240,35 @@ fn build_block_plan<'a>(
         renames.insert(p.clone(), fresh.clone());
         *p = fresh;
     }
-    // Re-uniquify generated temps a PRIOR sub-inline baked into this candidate
-    // body (inlining @inline `h0` into `h1` leaves `a__0`/`b__0`/`_h0__result_0`
-    // in h1's body). Cloning the body into N call sites duplicates those fixed-id
-    // names; once minimize-exit unwraps the inline label-blocks into one scope the
-    // duplicates conflate (oxc models same-name same-scope bindings as ONE symbol)
-    // and corrupt symbol-keyed passes — exactly the param case above, one level
-    // deeper. Suffix each with this expansion's unique `id` (`$` matches the
-    // block_flatten suffix convention). Skips the params (already renamed).
-    for name in collect_generated_bindings(&cand.body) {
+    // Re-uniquify EVERY binding the candidate body declares at its own (flattened)
+    // scope level — generated temps a PRIOR sub-inline baked in (`a__0`/
+    // `_h0__result_0`) AND the callee's own user locals (`const t`). Cloning the
+    // body into N call sites duplicates those fixed names; once minimize-exit /
+    // block_flatten unwrap the inline label-blocks into one scope the duplicates
+    // conflate (oxc models same-name same-scope bindings as ONE symbol) and
+    // value-corrupt each other — exactly the param case above. Two DISTINCT helpers
+    // each declaring `const t`, both transitively inlined into one host, was a real
+    // miscompile (212 vs 424): each got the SAME raw `t`, and the symbol-keyed
+    // passes that run before block_flatten re-uniquifies conflated them. Suffixing
+    // with this expansion's unique `id` keeps two expansions' locals distinct
+    // (`t$5` vs `t$7`); within ONE expansion the same suffix is harmless — a single
+    // body can only re-declare a name in a DISJOINT scope (if/else branch, a loop,
+    // a sibling/nested block — two same-scope `const t` is a source syntax error),
+    // and a uniform α-rename preserves lexical resolution across disjoint scopes
+    // (block_flatten is scope-accurate and re-splits any that later share a scope).
+    // `$` matches the block_flatten suffix convention; skip names already renamed
+    // (params/temps handled above).
+    //
+    // Soundness guard: `Renamer` renames by NAME and is NOT scope-aware, so a body
+    // local we rename must not share a name with a FREE reference (a read of an
+    // outer/module binding of that name) — renaming the free read too would capture
+    // it. That needs a body that both declares `t` in a nested scope AND reads a
+    // module-level `t`; bail then (sound: falls back to a real call).
+    let body_locals = collect_body_locals(&cand.body);
+    if body_locals.iter().any(|n| cand.free.contains(n)) {
+        return None;
+    }
+    for name in body_locals {
         renames.entry(name.clone()).or_insert_with(|| format!("{name}${id}"));
     }
     // Reusing an existing var as the result temp is unsafe if the body has a free

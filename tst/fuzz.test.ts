@@ -897,32 +897,27 @@ describe('fuzz: module-scratch scalar replacement (effect oracle, two-call)', ()
     });
 });
 
-// ⚠️ KNOWN-BUG PIN (open miscompile, tracked). The transitive-inline-chain fuzzer
-// above surfaced a real miscompile in NESTED inlining: when a block-bodied helper
-// is inlined into an EXPRESSION position, its own user-local (here `const t`) is
-// hoisted as a statement into a scope that ALREADY holds an OUTER inlined helper's
-// user-local of the same name — and it is NOT renamed. The inner decl then SHADOWS
-// the outer `t`, so the outer helper's later use of its own `t` reads the inner
-// value. Minimal repro below returns 212 in source but 424 compiled (the effect
-// TRACE is identical — it is a pure value corruption, not a dropped effect). The
-// generated-temp uniquifier (build_block_plan) handles cloned _result temps and
-// even renames a top-level colliding `t`→`t$1`, but MISSES this expression-position
-// nested case. This is a Rust-core fix (out of scope for this test-only change);
-// pinned with `it.fails` so it stays visible and flips to a hard failure the moment
-// the core is fixed (prompting this pin to be promoted to a passing assertion).
-describe('KNOWN BUG — nested-inline user-local collision (open)', () => {
+// REGRESSION PIN (was a real miscompile, now FIXED). The transitive-inline-chain
+// fuzzer above surfaced a miscompile in NESTED inlining: when a block-bodied helper
+// is inlined and declares its own user-local (here `const t`), that local was NOT
+// α-renamed. Two different helpers (h0, h2) each declaring `const t`, both inlined
+// transitively into one host, produced two `const t` that — once block_flatten
+// unwrapped the inline label-blocks into one scope — conflated (oxc models
+// same-name same-scope bindings as ONE symbol) and value-corrupted each other.
+// Source returned 212, compiled returned 424 (the effect TRACE was identical — a
+// pure value corruption, not a dropped effect). build_block_plan now re-uniquifies
+// the callee body's user locals (`t$<id>`) alongside its generated temps.
+describe('nested-inline user-local collision (fixed)', () => {
     const src =
         `/* @inline */ function h0(a, b) { const t = eff(a - b); if (t > b) return t * h1(a + 8, b - 1); return b + h1(a + 8, b - 1); }\n` +
         `function h1(a, b) { return (a + b) + h2(a - 2, b + 3); }\n` +
         `function h2(a, b) { const t = eff(a - b); if (t > b) return t + h3(a - 2, b + 2); return b * h3(a - 2, b + 2); }\n` +
         `function h3(a, b) { return (a + b) + (a - 1); }\n` +
         `/* @optimize */ function entry(p, q) { return h0(p, q); }`;
-    it.fails('transitive block-inline into expr position corrupts outer `const t`', () => {
+    it('transitive block-inline into expr position preserves outer `const t`', () => {
         const out = compiler.compileChunk('r.ts', withExports(src), {}).code;
         const want = evalProgram(src, 'entry(7, 3)');
         const got = evalProgram(out, 'entry(7, 3)');
-        // EXPECTED to differ today (212 vs 424); when the core is fixed this passes
-        // and `it.fails` turns RED, signalling: promote this to a normal `expect`.
         expect(got.ok ? JSON.stringify(got.value) : '<threw>').toBe(JSON.stringify(want.value));
     });
 });
