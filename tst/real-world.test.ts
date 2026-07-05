@@ -129,6 +129,25 @@ const KERNELS: Kernel[] = [
             1 + Math.abs(r()),
         ],
     },
+    {
+        name: 'real-world: quat fromEuler (string-switch dispatch over shared trig temps)',
+        fixture: 'quat-from-euler.ts',
+        params: ['x', 'y', 'z', 'order'],
+        callBody: 'const out = [0, 0, 0, 0]; fromEuler(out, x, y, z, order); return out;',
+        inputs: (r, i) => [r(), r(), r(), ['xyz', 'yxz', 'zxy', 'zyx', 'yzx', 'xzy'][i % 6]],
+    },
+    {
+        name: 'real-world: getInverseInertiaForRotation (transitive 4-mat4 inline + mat4 scratch + mask)',
+        fixture: 'inverse-inertia.ts',
+        params: ['inertiaRotation', 'invInertiaDiagonal', 'allowedDegreesOfFreedom', 'bodyRotation'],
+        callBody:
+            'const out = new Array(16).fill(0);' +
+            'getInverseInertiaForRotation(out, inertiaRotation, invInertiaDiagonal, allowedDegreesOfFreedom, bodyRotation);' +
+            'return out;',
+        // `(i % 8) << 3` varies the rotation-DOF mask bits, hitting the 0b111
+        // skip-branch (i%8===7) and the masked branch otherwise.
+        inputs: (r, i) => [q4(r), v3(r), (i % 8) << 3, vn(16)(r)],
+    },
 ];
 
 /** A valid AABB `[minX,minY,minZ,maxX,maxY,maxZ]` (max = min + a positive extent). */
@@ -277,6 +296,24 @@ describe('real-world: optimization pins — slerp / rayCylinder', () => {
         // into nested if/else fall-through, so all breaks vanish and no `_inline_`
         // label survives — denser but flatter than castRay's nested-return case.
         expect(out).not.toMatch(/_inline_rayCylinder_/);
+    });
+
+    it('fromEuler: string switch is preserved (no switch→if-chain rewrite)', () => {
+        const out = compiledFixture('quat-from-euler.ts');
+        expect(out).toContain('switch ('); // control-flow shape preserved
+    });
+
+    it('getInverseInertiaForRotation: 4 mat4 helpers transitively inline + scratch scalarizes', () => {
+        const out = compiledFixture('inverse-inertia.ts');
+        const body = out.slice(out.indexOf('function getInverseInertiaForRotation'));
+        // (1) all four helpers are inlined (transitively) — no residual calls.
+        for (const call of ['m4fromQuat(', 'm4multiply3x3(', 'm4scale(', 'm4multiply3x3RightTransposed(']) {
+            expect(body).not.toContain(call);
+        }
+        // (2) the mat4[16] module scratches scalarize away (consts deleted).
+        expect(out).not.toContain('const _inertiaRotMat');
+        expect(out).not.toContain('const _rotation');
+        expect(out).not.toContain('const _scaled');
     });
 });
 
