@@ -1,6 +1,6 @@
 {
   "name": "@compilecat/core-win32-x64-msvc",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "cpu": [
     "x64"
   ],
