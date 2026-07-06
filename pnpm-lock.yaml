@@ -26,6 +26,9 @@ importers:
       '@compilecat/core-win32-x64-msvc':
         specifier: 0.0.6
         version: 0.0.6
+      '@compilecat/wasm':
+        specifier: 0.0.6
+        version: 0.0.6
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.2.0
@@ -323,6 +326,9 @@ packages:
     resolution: {integrity: sha512-ppe3z31DHQZc3AK01Tht5MEkhd0L9HM0RUUzBddDME53gDZ4wMCsiXoLWNhhvAAIBK8mw1MWPvyZ12G0YySlsQ==}
     cpu: [x64]
     os: [win32]
+
+  '@compilecat/wasm@0.0.6':
+    resolution: {integrity: sha512-SR+g7Ylb4KqgzOwxCA/rtAWDe+bAQ/WoojUIQVOKrI4nM6DfuD14KcyUzkVdOETMAVn04RcVSlU+jz2x2cM8MQ==}
 
   '@emnapi/core@1.11.0':
     resolution: {integrity: sha512-l9Oo58x0HOP5znGzVhYW9U3e5wVuA4LAZU2AGezTmkhO1CgQRFDhDg4nneHsu/t3WniXg9QrG2nIXL/ZS8ln8Q==}
@@ -2567,6 +2573,9 @@ snapshots:
     optional: true
 
   '@compilecat/core-win32-x64-msvc@0.0.6':
+    optional: true
+
+  '@compilecat/wasm@0.0.6':
     optional: true
 
   '@emnapi/core@1.11.0':
