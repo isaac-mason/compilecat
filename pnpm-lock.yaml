@@ -9,23 +9,23 @@ importers:
   .:
     optionalDependencies:
       '@compilecat/core-darwin-arm64':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
       '@compilecat/core-darwin-x64':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
       '@compilecat/core-linux-arm64-gnu':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
       '@compilecat/core-linux-x64-gnu':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
       '@compilecat/core-wasm32-wasi':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
       '@compilecat/core-win32-x64-msvc':
-        specifier: 0.0.5
-        version: 0.0.5
+        specifier: 0.0.6
+        version: 0.0.6
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.2.0
@@ -295,32 +295,32 @@ packages:
   '@codemirror/view@6.42.1':
     resolution: {integrity: sha512-ToN3oFc0nsxNUYVF5P0ztLgbC4UPPjPtA9aKYhkOKQaZASpOUo6ISXyQLP66ctVwlDc+j6Jv0uK5IFALkiXztg==}
 
-  '@compilecat/core-darwin-arm64@0.0.5':
-    resolution: {integrity: sha512-g7KM65SB2U/cbxvd2V2oRTb56RHZcLVOvOP+YzR1ZNoUjtl9mJU+wLb4aKkz6ztCJtYycl8zU86gf2p570T8UQ==}
+  '@compilecat/core-darwin-arm64@0.0.6':
+    resolution: {integrity: sha512-lBhNTDKaHISNx9Q46gNb7FMEHSF7+1bEHmclghhSZAP9dChWm6JJ5f1lFyzArrxkYBPoLLHBsFK1NgSTrJYeTQ==}
     cpu: [arm64]
     os: [darwin]
 
-  '@compilecat/core-darwin-x64@0.0.5':
-    resolution: {integrity: sha512-4wyPQZc2QEQO4UkE5NAPBe6fYSclPLOd7FgyM9Q8j0Sm/an6CxJ4PLZBGyEbH6WnXuBgYUOv5vki66CtJse+qw==}
+  '@compilecat/core-darwin-x64@0.0.6':
+    resolution: {integrity: sha512-ct3GQ9/k9nawvy/c3efRuZISM0WyM84e+Xmlf3OVyaYIp5+cwk5pkiHjm/IZ74OIJCWwRXWboliEmYF5LfXWFw==}
     cpu: [x64]
     os: [darwin]
 
-  '@compilecat/core-linux-arm64-gnu@0.0.5':
-    resolution: {integrity: sha512-S/uS8hUXzE3aD5hVvQsaOGqC8GC3Eeu3y5WjmEvudiYIsEKSfoerZbDC05HeIi/P1m+QcjqTjM5RXEO9pRlrWA==}
+  '@compilecat/core-linux-arm64-gnu@0.0.6':
+    resolution: {integrity: sha512-quMyi3K01Eb4yo1Yd8So9qMtSNLvB7tS7uEe1duIEPuTezz4nJx4Uv5j28UlkoVRRAfoe/BZDqvLxCeQ0lyYbQ==}
     cpu: [arm64]
     os: [linux]
 
-  '@compilecat/core-linux-x64-gnu@0.0.5':
-    resolution: {integrity: sha512-1nAPoPUE7IxanXo0rkMLUQS+qQkdTTJPNfHgdqIea/Sm4jE73MnlMxhrY6+DeEfzt4cy/uC62KNA1VgVX1OUmw==}
+  '@compilecat/core-linux-x64-gnu@0.0.6':
+    resolution: {integrity: sha512-IM5EcQOPa6UYFeX9PV+mrbFStYg8QSIOn9zS5QbuTk0LXc86Jpx5vX0NUfuucQgJTG9PRkyWMmc8ieku/wDjqQ==}
     cpu: [x64]
     os: [linux]
 
-  '@compilecat/core-wasm32-wasi@0.0.5':
-    resolution: {integrity: sha512-1VES64LNQnoyLYQZYBAlwSifQyRwdhBs3PSFFJUfUMExtZEz59ILtFM5zBjywy8y80D7gnxvjCqeSkT9G3pN9A==}
+  '@compilecat/core-wasm32-wasi@0.0.6':
+    resolution: {integrity: sha512-ZjJl/6Guz5SkiIhg959KZd1SUG5v33qS2HYqiFiCkyZqbuUvBGXpGUXs1az88wXv/zwLOuoBo0/K25HuEWCy4w==}
     engines: {node: '>=14.0.0'}
 
-  '@compilecat/core-win32-x64-msvc@0.0.5':
-    resolution: {integrity: sha512-qUB2jAEEqiDvM/BOy11zRicfp9zKujrJoiwpGjc+oeclFjsS4JYNGeCnKOiLhPxlXmY8MyetMIzl+73h3OBE1w==}
+  '@compilecat/core-win32-x64-msvc@0.0.6':
+    resolution: {integrity: sha512-ppe3z31DHQZc3AK01Tht5MEkhd0L9HM0RUUzBddDME53gDZ4wMCsiXoLWNhhvAAIBK8mw1MWPvyZ12G0YySlsQ==}
     cpu: [x64]
     os: [win32]
 
@@ -2547,26 +2547,26 @@ snapshots:
       style-mod: 4.1.3
       w3c-keyname: 2.2.8
 
-  '@compilecat/core-darwin-arm64@0.0.5':
+  '@compilecat/core-darwin-arm64@0.0.6':
     optional: true
 
-  '@compilecat/core-darwin-x64@0.0.5':
+  '@compilecat/core-darwin-x64@0.0.6':
     optional: true
 
-  '@compilecat/core-linux-arm64-gnu@0.0.5':
+  '@compilecat/core-linux-arm64-gnu@0.0.6':
     optional: true
 
-  '@compilecat/core-linux-x64-gnu@0.0.5':
+  '@compilecat/core-linux-x64-gnu@0.0.6':
     optional: true
 
-  '@compilecat/core-wasm32-wasi@0.0.5':
+  '@compilecat/core-wasm32-wasi@0.0.6':
     dependencies:
       '@emnapi/core': 1.11.1
       '@emnapi/runtime': 1.11.1
       '@napi-rs/wasm-runtime': 1.1.5(@emnapi/core@1.11.1)(@emnapi/runtime@1.11.1)
     optional: true
 
-  '@compilecat/core-win32-x64-msvc@0.0.5':
+  '@compilecat/core-win32-x64-msvc@0.0.6':
     optional: true
 
   '@emnapi/core@1.11.0':
