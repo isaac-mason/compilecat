@@ -1228,6 +1228,28 @@ fn collect_body_locals(body: &[Statement]) -> HashSet<String> {
     v.names
 }
 
+/// Every identifier NAME referenced anywhere in a call's arguments (descending
+/// into nested functions/arrows — conservative). A callee param whose name appears
+/// here is SELF-CAPTURED by the eval-once `let p = arg` prologue and MUST be
+/// α-renamed; a param no arg mentions stays bare (see `build_block_plan`'s (A)).
+fn collect_arg_ref_names(args: &[Argument]) -> HashSet<String> {
+    struct V {
+        names: HashSet<String>,
+    }
+    impl<'a> Visit<'a> for V {
+        fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+            self.names.insert(id.name.to_string());
+        }
+    }
+    let mut v = V { names: HashSet::new() };
+    for a in args {
+        if let Some(e) = a.as_expression() {
+            v.visit_expression(e);
+        }
+    }
+    v.names
+}
+
 /// Build the splice plan for a BLOCK candidate call: arg clones (padded with
 /// `undefined`), α-rename of params an arg references, the cloned (renamed) body,
 /// and the chosen result name. Shared by statement-shape inlining and the
@@ -1262,26 +1284,34 @@ fn build_block_plan<'a>(
             return None;
         }
     }
-    // α-rename EVERY param to a per-expansion-unique `p__<id>` (the same `id` that
-    // suffixes the result-temp/label). Two reasons, both correctness:
-    //   1. Two inlines of the SAME helper would otherwise both bind the raw param
-    //      name (`let b = …`). Once minimize-exit-points unwraps the inline
-    //      label-blocks into the parent scope, those become duplicate same-scope
-    //      `let b`s, which `oxc_semantic` conflates into ONE symbol — corrupting
-    //      every symbol-keyed pass (inline-variables substituted one call's value
-    //      into both). The `id` suffix makes each expansion's bindings distinct.
-    //   2. It subsumes the old TDZ guard: when an arg references the param name
-    //      (`h(b)` into param `b` → `let b = b`), `let b__id = b` reads the
-    //      consumer's `b`, no self-capture.
-    // Single-use temps still fold away in inline-variables; the suffix only
-    // survives on genuinely multi-use params (rare), consistent with the
-    // result-temp/label naming already in the output.
+    // (A) SELF-CAPTURE — α-rename ONLY the params an arg references. The eval-once
+    // prologue `let p1 = arg1; let p2 = arg2; …` is evaluated in order, so once
+    // `let p` is bound any arg that mentions `p` would read the just-declared param
+    // binding instead of the caller's `p` (`h(b)` into param `b` → `let b = b`).
+    // Renaming such a param to a per-expansion-unique `p__<id>` (the same `id` that
+    // suffixes the result-temp/label) keeps the arg RHS reading the caller's value.
+    // Conservative: any arg referencing the NAME `p` — even inside a nested arrow —
+    // forces the rename (`collect_arg_ref_names` walks every arg). The rename only
+    // touches the param's DECLARATION + its BODY uses; the arg RHS expressions are
+    // NOT rewritten (they belong to the caller's scope — see the split below).
+    //
+    // Params NO arg references stay BARE. Two other jobs the old blanket rename did
+    // are now handled downstream so an uncontested `out` stays `out` (not `out__N`):
+    //   * collision between two inlines of one helper (both binding `let out`, which
+    //     `oxc_semantic` would conflate into ONE symbol after minimize-exit-points
+    //     unwraps the label-blocks into one scope) is caught by the (B) seed-collision
+    //     pass below — exactly the decision the shared scope renamer makes for body
+    //     locals;
+    //   * eval-once / reassignment safety is the prologue's job regardless of name.
+    let arg_refs = collect_arg_ref_names(&call.arguments);
     let mut params = cand.params.clone();
     let mut renames: HashMap<String, String> = HashMap::new();
     for p in params.iter_mut() {
-        let fresh = format!("{p}__{id}");
-        renames.insert(p.clone(), fresh.clone());
-        *p = fresh;
+        if arg_refs.contains(p) {
+            let fresh = format!("{p}__{id}");
+            renames.insert(p.clone(), fresh.clone());
+            *p = fresh;
+        }
     }
     // Re-uniquify the callee body's own locals against the host's live merged-scope
     // bindings via the SHARED scope-aware renamer (`block_flatten::uniquify_scope`)
@@ -1333,8 +1363,9 @@ fn build_block_plan<'a>(
     }
     let mut body_stmts: Vec<Statement<'a>> =
         cand.body.iter().map(|s| s.clone_in(allocator)).collect();
-    // α-rename the params (references only; params have no body binding) to the
-    // per-expansion `p__<id>` picked above.
+    // α-rename the self-capture params (references only; params have no body
+    // binding) to the per-expansion `p__<id>` picked above. Empty (skipped) when
+    // no arg references a param name — those params stay bare.
     if !renames.is_empty() {
         let mut r = Renamer { allocator, map: &renames };
         for s in body_stmts.iter_mut() {
@@ -1366,6 +1397,35 @@ fn build_block_plan<'a>(
         } else {
             temp_params.push(p);
             temp_args.push(arg);
+        }
+    }
+    // (B) COLLISION — a BARE prologue param (one no arg referenced) that clashes
+    // with the host's live merged scope (`seed` = host locals + every prior inline's
+    // flatten-up bindings) must be α-renamed. This is the same decision the shared
+    // scope renamer makes for body locals, and the guard that keeps two inlines of
+    // one helper from conflating their `let out` once minimize-exit-points unwraps
+    // both label-blocks into the host scope (the 212-vs-424 class). A self-capture
+    // param is already a unique `p__<id>` and never appears in `seed`, so the
+    // `seed.contains` test skips it; substituted params create no binding, so only
+    // `temp_params` can collide. `pick_fresh` is idempotent (strips any `$N` before
+    // minting) and avoids the whole subtree + seed + arg names, so the fresh binding
+    // captures nothing (no arg mentions a bare param's name — that would be (A)).
+    if temp_params.iter().any(|p| seed.contains(p)) {
+        let mut avoid = crate::passes::block_flatten::collect_all_names(&body_stmts);
+        avoid.extend(seed.iter().cloned());
+        avoid.extend(arg_refs.iter().cloned());
+        avoid.extend(temp_params.iter().cloned());
+        let mut collided: HashMap<String, String> = HashMap::new();
+        for p in temp_params.iter_mut() {
+            if seed.contains(p) {
+                let fresh = crate::passes::block_flatten::pick_fresh(p, &avoid);
+                avoid.insert(fresh.clone());
+                collided.insert(std::mem::replace(p, fresh.clone()), fresh);
+            }
+        }
+        let mut r = Renamer { allocator, map: &collided };
+        for s in body_stmts.iter_mut() {
+            r.visit_statement(s);
         }
     }
     if !subs.is_empty() {
@@ -2792,12 +2852,31 @@ mod tests {
 
     #[test]
     fn modified_param_keeps_temp_prologue() {
-        // `a` is reassigned in the body → can't be substituted; keep the temp
-        // (now α-renamed per-expansion to `a__<id>`).
+        // `a` is reassigned in the body → can't be substituted; keep the temp. No
+        // arg references `a` (arg is `x`) and — flattened into an `@optimize` host,
+        // whose merged scope is HOST-scoped — `a` doesn't collide, so the injected
+        // param stays BARE (conditional rename): `let a = x; a = a + 1`.
         let out = inline(
-            "/* @inline */ function f(a) { a = a + 1; return a; }\nexport function g(x) { let v = f(x); return v; }",
+            "function f(a) { a = a + 1; return a; }\n/* @optimize */ export function g(x) { let v = f(x); return v; }",
         );
-        assert!(out.contains("a__") && out.contains("= x"), "reassigned param keeps its (renamed) temp:\n{out}");
+        assert!(out.contains("a = x"), "reassigned param keeps its (bare) temp bound to the arg:\n{out}");
+        assert!(!out.contains("a__") && !out.contains("a$"), "uncontested param stays bare (no suffix):\n{out}");
+    }
+
+    #[test]
+    fn bare_param_collision_renamed_across_two_inlines() {
+        // Two inlines of ONE helper into one HOST-scoped `@optimize` host, no arg
+        // referencing a param name → the FIRST `a` stays BARE; the SECOND's `let a`
+        // collides with the first's in the merged host scope, so it is distinctly
+        // renamed (`a$1`) and never conflated onto one symbol (the 212-vs-424 class).
+        // `k()` side-effects force each param to bind (eval-once temp), so both
+        // survive as bindings.
+        let out = inline(
+            "function h(a) { a = a + 1; sink(a); }\n/* @optimize */ export function host() { h(k()); h(k()); }",
+        );
+        assert!(!out.contains("h(k())"), "both calls inlined:\n{out}");
+        assert!(out.contains("let a =") && out.contains("a$1"), "first param bare, colliding second distinctly renamed:\n{out}");
+        assert!(!out.contains("a__"), "no self-capture suffix (no arg references `a`):\n{out}");
     }
 
     #[test]

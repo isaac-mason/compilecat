@@ -2261,14 +2261,15 @@ mod tests {
         );
         let run_fn = out.split("function run").nth(1).expect("run in output");
         // Both arg aggregates were scalarized away (the `{x,y}` literals are gone).
-        // The inliner now α-renames the params per expansion (`a__<id>`/`b__<id>`),
-        // so SROA emits scalars named `a__<id>_x` etc. — assert both arg objects
-        // are gone and both produced scalar bindings, without hardcoding the id.
-        // (Eval-correctness — that no scalar is referenced-but-undeclared — is
-        // covered behaviorally by equivalence.test.ts `inline-object-args-then-sroa`.)
+        // The injected params `a`/`b` are uncontested in this HOST-scoped `@optimize`
+        // expansion, so they stay BARE (no per-expansion suffix), and SROA emits
+        // scalars named `a_x`/`b_x` etc. — assert both arg objects are gone and both
+        // produced scalar bindings. (Eval-correctness — that no scalar is
+        // referenced-but-undeclared — is covered behaviorally by
+        // equivalence.test.ts `inline-object-args-then-sroa`.)
         assert!(!run_fn.contains("x: 0"), "arg object `a` not scalarized:\n{out}");
         assert!(!run_fn.contains("x: 3"), "arg object `b` not scalarized:\n{out}");
-        assert!(run_fn.contains("a__") && run_fn.contains("b__"), "both args present as scalars:\n{out}");
+        assert!(run_fn.contains("a_x") && run_fn.contains("b_x"), "both args present as scalars:\n{out}");
     }
 
     #[test]

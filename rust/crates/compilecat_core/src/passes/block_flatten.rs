@@ -447,7 +447,7 @@ impl<'a> Flattener<'a> {
 /// Every identifier name appearing anywhere under `list` (bindings + references,
 /// including inside nested functions). Used as the avoid-set base so a minted
 /// `name$N` temp never collides with — or captures — an existing name.
-fn collect_all_names(list: &[Statement]) -> HashSet<String> {
+pub(crate) fn collect_all_names(list: &[Statement]) -> HashSet<String> {
     struct V {
         names: HashSet<String>,
     }
