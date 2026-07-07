@@ -8,17 +8,27 @@
 npm install compilecat
 ```
 
-Ships a prebuilt native (napi) binary per platform plus a wasm fallback. No build step or toolchain needed.
-
 # compilecat
-
-> ⚠️ This is highly experimental! It's not clear yet if this tool is even a good idea! Browse to your heart's content but expect no stability right now.
 
 A JavaScript/TypeScript compiler plugin for hot-path optimizations, driven by opt-in annotations. It does function inlining, scalar-replacement of aggregates (SROA), loop unrolling, and a Closure-style simplify tier (constant folding, purity-driven pure-call elimination, dead-store removal).
 
-Built on a Rust/oxc core. Ships as a rollup-family `transform` plugin that optimizes each source file *before* bundling while keeping TypeScript. It is **cross-module aware**: when a file imports an `@inline` donor, the plugin resolves and reads the donor module, inlines across the module boundary, and drops the now-unused import. `addWatchFile` is wired in, so editing a donor re-transforms every consumer that inlined it.
+Built on a Rust/oxc core. Ships as a bundler plugin (via [unplugin](https://github.com/unjs/unplugin)) that optimizes each source file *before* bundling while keeping TypeScript. It is **cross-module aware**: when a file imports an `@inline` donor, the plugin resolves and reads the donor module, inlines across the module boundary, and drops the now-unused import. `addWatchFile` is wired in, so editing a donor re-transforms every consumer that inlined it.
 
 ## Usage
+
+Pick the subpath for your bundler — the options API is identical across all of them:
+
+| Bundler | Import |
+|---|---|
+| Rollup | `compilecat/rollup` |
+| Vite | `compilecat/vite` |
+| Rolldown | `compilecat/rolldown` |
+| Webpack | `compilecat/webpack` |
+| esbuild | `compilecat/esbuild` |
+| Rspack | `compilecat/rspack` |
+| Rsbuild | `compilecat/rsbuild` |
+| Farm | `compilecat/farm` |
+| Bun | `compilecat/bun` |
 
 ```js
 // rollup.config.js
@@ -29,7 +39,27 @@ export default {
 };
 ```
 
-`include` scopes which module ids compilecat transforms and reads as donors (picomatch globs and/or RegExps). It's required, so `node_modules` is never trawled unless a package is listed explicitly. Swap the subpath for other rollup-family bundlers: `compilecat/vite`, `compilecat/rolldown`. A browser/edge wasm backend is available at `compilecat/wasm`.
+```js
+// vite.config.js
+import compilecat from 'compilecat/vite';
+
+export default {
+    plugins: [compilecat({ include: [/\/src\//] })],
+};
+```
+
+```js
+// webpack.config.js
+const { compilecat } = require('compilecat/webpack');
+
+module.exports = {
+    plugins: [compilecat({ include: [/\/src\//] })],
+};
+```
+
+`include` scopes which module ids compilecat transforms and reads as donors (picomatch globs and/or RegExps). It's required, so `node_modules` is never trawled unless a package is listed explicitly.
+
+A browser/edge wasm backend is available at `compilecat/wasm`.
 
 ## Directives
 
@@ -168,7 +198,7 @@ parse
   → inline-functions        (DIRECT + BLOCK inlining, FunctionArgumentInjector)
   → block-flatten           (lift the scaffolding blocks inlining emits)
   → loop-unroller
-  → scalar-replace-aggregates  (incl. module-scratch localization — see below)
+  → scalar-replace-aggregates  (incl. module-scratch localization — see `@sroa` above)
   → block-flatten           (lift the per-iteration blocks the unroller emits)
   → simplify (per-function fixpoint, ×8):
       peephole-fold-constants
@@ -191,7 +221,7 @@ Some of the optimization passes (Rust, under `rust/crates/compilecat_core/src/pa
 
 ## Plugin options
 
-The same options apply to every adapter (`compilecat/rollup`, `compilecat/vite`, `compilecat/rolldown`):
+The same options apply to every adapter:
 
 ```ts
 compilecat({
@@ -203,7 +233,7 @@ compilecat({
 })
 ```
 
-`include` is required and has no implicit default. It bounds both the files that get transformed *and* the donor modules that may be read and inlined, so `node_modules` is never trawled unless a package is listed explicitly (e.g. `['**/src/**', '**/node_modules/mathcat/**']`). It is plumbed through Rollup 4's hook-filter API, so under rolldown the scope test runs in Rust and out-of-scope files never enter the JS plugin handler at all. An in-scope file that calls an in-scope `@inline` function is always processed, even when it carries no directive of its own.
+`include` is required and has no implicit default. It bounds both the files that get transformed *and* the donor modules that may be read and inlined, so `node_modules` is never trawled unless a package is listed explicitly (e.g. `['**/src/**', '**/node_modules/mathcat/**']`). Under rolldown the scope test runs in Rust and out-of-scope files never enter the JS plugin handler at all; other bundlers apply the filter in JS. An in-scope file that calls an in-scope `@inline` function is always processed, even when it carries no directive of its own.
 
 ```ts
 // e.g. only transform engine code; everything else (app code,

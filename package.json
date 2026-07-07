@@ -26,6 +26,30 @@
 			"types": "./dist/rolldown.d.ts",
 			"import": "./dist/rolldown.js"
 		},
+		"./webpack": {
+			"types": "./dist/webpack.d.ts",
+			"import": "./dist/webpack.js"
+		},
+		"./esbuild": {
+			"types": "./dist/esbuild.d.ts",
+			"import": "./dist/esbuild.js"
+		},
+		"./rspack": {
+			"types": "./dist/rspack.d.ts",
+			"import": "./dist/rspack.js"
+		},
+		"./rsbuild": {
+			"types": "./dist/rsbuild.d.ts",
+			"import": "./dist/rsbuild.js"
+		},
+		"./farm": {
+			"types": "./dist/farm.d.ts",
+			"import": "./dist/farm.js"
+		},
+		"./bun": {
+			"types": "./dist/bun.d.ts",
+			"import": "./dist/bun.js"
+		},
 		"./wasm": {
 			"types": "./dist/wasm.d.ts",
 			"import": "./dist/wasm.js"
@@ -58,6 +82,9 @@
 		"test:js": "vitest run",
 		"fuzz": "FUZZ=1 vitest run tst/fuzz.test.ts",
 		"version:all": "node scripts/bump-version.mjs"
+	},
+	"dependencies": {
+		"unplugin": "^3.3.0"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.2.0",

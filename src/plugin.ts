@@ -7,23 +7,25 @@
 // boundary and drops the now-unused import. `addWatchFile` keeps HMR correct
 // (re-transform the consumer when a donor changes).
 //
-// Compatible with the rollup plugin shape (rollup / vite / rolldown).
+// Exposed via unplugin — supports rollup, vite, rolldown (native Rust-level id
+// filter), webpack, esbuild, and rspack from a single factory.
 
 import fs from 'node:fs';
 import path from 'node:path';
 
-import type { StringOrRegExp } from 'rollup';
+import { createUnplugin } from 'unplugin';
 
 import { createFilter } from './filter';
 
 import { createCompiler } from './compiler';
 
-export type FilterPattern = StringOrRegExp | StringOrRegExp[];
+export type FilterPattern = string | RegExp | (string | RegExp)[];
 
 function toArray<T>(v: T | T[] | undefined): T[] {
     if (v === undefined) return [];
     return Array.isArray(v) ? v : [v];
 }
+
 
 // Inlined so the native plugin doesn't pull the Babel-based compiler modules.
 const ANY_DIRECTIVE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
@@ -99,16 +101,16 @@ export interface Options {
      *  transformed *and* the donor modules that may be read+inlined are limited
      *  to this scope, so `node_modules` is never trawled unless a package is
      *  explicitly listed (e.g. `['**​/src/**', '**​/node_modules/mathcat/**']`).
-     *  Wired through Rollup 4's hook-filter API, so rolldown skips out-of-scope
-     *  files in Rust without ever calling into JS. */
+     *  For rolldown, wired through the native hook-filter API so out-of-scope
+     *  files are skipped in Rust without ever calling into JS. */
     include: FilterPattern;
     /** Ids to exclude on top of `include`. */
     exclude?: FilterPattern;
     /** Emit source maps. @default true */
     sourcemap?: boolean;
-    /** Print a per-build timing/counter breakdown at `closeBundle` (how many
-     *  files were seen vs optimized, and where wall time went: donor resolve, fs
-     *  read, native compile). @default false */
+    /** Print a per-build timing/counter breakdown at `buildEnd` (how many files
+     *  were seen vs optimized, and where wall time went: donor resolve, fs read,
+     *  native compile). @default false */
     debug?: boolean;
 }
 
@@ -144,21 +146,18 @@ function reportStats(s: PluginStats): void {
     );
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: rollup PluginContext is structural
+// biome-ignore lint/suspicious/noExplicitAny: unplugin/rollup PluginContext is structural
 type Ctx = any;
 
-export function compilecat(options: Options) {
+export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta) => {
     const compiler = createCompiler();
     const sourcemap = options.sourcemap ?? true;
     // Scope: which module ids may be transformed and read as donors. `inScope`
-    // gates donor reads in JS; `idFilter` gates the transform hook in the bundler
-    // (Rust), so out-of-scope files never reach JS at all.
+    // gates donor reads in JS; the transform filter gates the hook in the bundler
+    // (Rust for rolldown, JS for others), so out-of-scope files cost nothing.
     const inScope = createFilter(options.include, options.exclude);
-    const idFilter: { include: StringOrRegExp[]; exclude?: StringOrRegExp[] } = {
-        include: toArray(options.include),
-    };
-    const userExclude = toArray(options.exclude);
-    if (userExclude.length > 0) idFilter.exclude = userExclude;
+    const include = toArray(options.include);
+    const exclude = toArray(options.exclude);
     const stats: PluginStats | null = options.debug
         ? {
               files: 0,
@@ -222,16 +221,19 @@ export function compilecat(options: Options) {
         watchChange(this: Ctx, changedId: string) {
             donorCache.delete(changedId);
         },
-        closeBundle() {
+        buildEnd() {
             if (stats) reportStats(stats);
         },
-        // Scope the hook in the *bundler* (Rust): rolldown's `filter.id` skips
-        // out-of-scope modules without ever calling into JS, so node_modules (and
-        // anything outside `include`) costs nothing. Mirrors the OLD per-file
-        // plugin's `transform.filter`. No `code` filter here: an in-scope file
-        // that calls an in-scope `@inline` function must be processed even when
-        // it carries no directive of its own.
-        transform: { filter: { id: idFilter }, handler: transformHandler },
+        // Scope the hook at the bundler level: for rolldown, `filter.id` skips
+        // out-of-scope modules in Rust without ever crossing into JS (unplugin
+        // passes the object-form through unchanged). For other bundlers, unplugin
+        // applies a JS-level filter from the same descriptor. No `code` filter:
+        // an in-scope file that calls an in-scope `@inline` function must be
+        // processed even when it carries no directive of its own.
+        transform: {
+            filter: { id: { include, ...(exclude.length ? { exclude } : {}) } },
+            handler: transformHandler,
+        },
     };
 
     async function transformHandler(this: Ctx, code: string, id: string) {
@@ -365,6 +367,7 @@ export function compilecat(options: Options) {
         if (stats) stats.changed++;
         return { code: r.code, map: r.map };
     }
-}
+});
 
+export const compilecat = unpluginCompilecat.rollup;
 export default compilecat;

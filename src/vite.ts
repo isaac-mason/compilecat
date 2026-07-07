@@ -1,16 +1,13 @@
-// Vite adapter. compilecat has a single per-file `transform` pass (valid in both
-// `vite dev` and `vite build`), so the adapter is just the plugin — no
-// serve/build split needed.
-
+// Vite adapter.
 import type { Plugin } from 'vite';
 
-import { compilecat, type Options } from './plugin';
+import { unpluginCompilecat, type Options } from './plugin';
 
 export type { Options };
 
 export function compilecatVite(options: Options): Plugin {
-    return compilecat(options) as Plugin;
+    return unpluginCompilecat.vite(options) as Plugin;
 }
 
-export { compilecat };
+export { compilecatVite as compilecat };
 export default compilecatVite;
