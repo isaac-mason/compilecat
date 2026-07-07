@@ -3,7 +3,26 @@
 	"version": "0.0.7",
 	"description": "compiler plugin that helps you write high performance javascript.",
 	"author": "Isaac Mason <isaac@isaacmason.com>",
+	"keywords": [
+		"compiler",
+		"optimizer",
+		"plugin",
+		"rollup",
+		"vite",
+		"rolldown",
+		"webpack",
+		"esbuild",
+		"unplugin",
+		"typescript",
+		"javascript",
+		"performance"
+	],
 	"license": "MIT",
+	"repository": "github:isaac-mason/compilecat",
+	"homepage": "https://github.com/isaac-mason/compilecat",
+	"bugs": {
+		"url": "https://github.com/isaac-mason/compilecat/issues"
+	},
 	"type": "module",
 	"exports": {
 		"./vite": {
