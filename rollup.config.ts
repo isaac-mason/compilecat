@@ -19,7 +19,7 @@ const external = [
 	'@compilecat/wasm',
 ];
 
-const entries = ['index', 'vite', 'rollup', 'rolldown', 'webpack', 'esbuild', 'rspack', 'rsbuild', 'farm', 'bun', 'plugin', 'wasm'];
+const entries = ['vite', 'rollup', 'rolldown', 'webpack', 'esbuild', 'rspack', 'rsbuild', 'farm', 'bun', 'plugin', 'wasm'];
 
 export default entries.map((entry) => ({
 	input: `./src/${entry}.ts`,

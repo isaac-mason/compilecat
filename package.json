@@ -5,15 +5,7 @@
 	"author": "Isaac Mason <isaac@isaacmason.com>",
 	"license": "MIT",
 	"type": "module",
-	"module": "./dist/index.js",
-	"types": "./dist/index.d.ts",
 	"exports": {
-		".": {
-			"types": {
-				"import": "./dist/index.d.ts"
-			},
-			"import": "./dist/index.js"
-		},
 		"./vite": {
 			"types": "./dist/vite.d.ts",
 			"import": "./dist/vite.js"
