@@ -1,6 +1,6 @@
 {
   "name": "@compilecat/core-wasm32-wasi",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "main": "compilecat.wasi.cjs",
   "files": [
     "compilecat.wasm32-wasi.wasm",
