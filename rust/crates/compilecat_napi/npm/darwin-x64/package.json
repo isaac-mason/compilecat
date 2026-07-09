@@ -1,6 +1,6 @@
 {
   "name": "@compilecat/core-darwin-x64",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "cpu": [
     "x64"
   ],
