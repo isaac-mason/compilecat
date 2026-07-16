@@ -120,11 +120,7 @@ function diff(code: string): { call: string; compiled: string; want: unknown; go
  *  `donor + consumer` (source) vs `donor + compiled` (output). Prepending the
  *  donor to BOTH means a kept import resolves and an inlined copy is harmless
  *  (top-level fn redeclare is sloppy-legal), so it's a fair, symmetric eval. */
-function crossDiff(
-    donor: string,
-    consumer: string,
-    specifier: string,
-): { compiled: string; want: unknown; got: unknown } | null {
+function crossDiff(donor: string, consumer: string, specifier: string): { compiled: string; want: unknown; got: unknown } | null {
     const call = 'entry(7, 3)';
     const want = evalProgram(`${donor}\n${consumer}`, call);
     if (!want.ok) return null; // generated program threw (generation artifact) — skip
@@ -272,17 +268,24 @@ class Gen {
                 const shape = int(this.r, 0, 4);
                 if (shape === 0) out.push(`${head}function ${h.name}(a, b) { return ${this.numExpr(s, 2)}; }`);
                 else if (shape === 1)
-                    out.push(`${head}function ${h.name}(a, b) { if (${this.cond(s)}) return ${this.numExpr(s, 2)}; return ${this.numExpr(s, 2)}; }`);
+                    out.push(
+                        `${head}function ${h.name}(a, b) { if (${this.cond(s)}) return ${this.numExpr(s, 2)}; return ${this.numExpr(s, 2)}; }`,
+                    );
                 else if (shape === 2)
-                    out.push(`${head}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`);
+                    out.push(
+                        `${head}function ${h.name}(a, b) { let t; if (${this.cond(s)}) { t = ${this.numExpr(s, 2)}; } else { t = ${this.numExpr(s, 2)}; } return t; }`,
+                    );
                 else if (shape === 3)
                     // fresh-local aggregate mutation — pure iff no `eff` leaks in.
-                    out.push(`${head}function ${h.name}(a, b) { const o = [a, b]; o[0] = ${this.numExpr(s, 1)}; o[1] = ${this.numExpr(s, 1)}; return o[0] + o[1]; }`);
-                else
-                    // free-variable write — a MUTATES_GLOBAL side effect.
-                    out.push(`${head}function ${h.name}(a, b) { __g = ${this.numExpr(s, 1)}; return a + b; }`);
+                    out.push(
+                        `${head}function ${h.name}(a, b) { const o = [a, b]; o[0] = ${this.numExpr(s, 1)}; o[1] = ${this.numExpr(s, 1)}; return o[0] + o[1]; }`,
+                    );
+                // free-variable write — a MUTATES_GLOBAL side effect.
+                else out.push(`${head}function ${h.name}(a, b) { __g = ${this.numExpr(s, 1)}; return a + b; }`);
             } else if (kind === 'pt') {
-                out.push(`${head}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)} }; }`);
+                out.push(
+                    `${head}function ${h.name}(a, b) { return { x: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)}, y: ${this.numExpr({ nums: ['a', 'b'], pts: [], arrs: [], ptArrs: [] }, 1)} }; }`,
+                );
             } else {
                 // void: mutate point arg0 (a is a point here, b a number).
                 const ps: Scope = { nums: ['b'], pts: ['a'], arrs: [], ptArrs: [] };
@@ -338,8 +341,7 @@ class Gen {
                 const elems = Array.from({ length: len }, () => this.numExpr(s, 1)).join(', ');
                 stmts.push(`const ${v} = ${dir}[${elems}];`);
                 s.arrs.push({ name: v, len });
-                if (chance(this.r, 0.4))
-                    stmts.push(`${v}[${int(this.r, 0, len - 1)}] = ${this.numExpr(s, 1)};`);
+                if (chance(this.r, 0.4)) stmts.push(`${v}[${int(this.r, 0, len - 1)}] = ${this.numExpr(s, 1)};`);
                 if (chance(this.r, 0.4)) {
                     // spread a number-array into Math.max (exercises spread reads)
                     const m = this.fresh('m');
@@ -357,7 +359,9 @@ class Gen {
                 const acc = this.fresh('acc');
                 const lim = int(this.r, 1, 4);
                 const dir = chance(this.r, 0.5) ? '/* @unroll */ ' : '';
-                stmts.push(`let ${acc} = 0; ${dir}for (let i = 0; i < ${lim}; i++) { ${acc} = ${acc} + ${this.numExpr(s, 1)} + i; }`);
+                stmts.push(
+                    `let ${acc} = 0; ${dir}for (let i = 0; i < ${lim}; i++) { ${acc} = ${acc} + ${this.numExpr(s, 1)} + i; }`,
+                );
                 s.nums.push(acc);
             } else if (form === 6) {
                 // bounded WHILE loop (counter-driven → terminates) accumulating.
@@ -381,10 +385,9 @@ class Gen {
                 const v = this.fresh('pa');
                 const len = int(this.r, 2, 3);
                 const dir = chance(this.r, 0.5) ? '/* @sroa */ ' : '';
-                const elems = Array.from(
-                    { length: len },
-                    () => `{ x: ${this.numExpr(s, 1)}, y: ${this.numExpr(s, 1)} }`,
-                ).join(', ');
+                const elems = Array.from({ length: len }, () => `{ x: ${this.numExpr(s, 1)}, y: ${this.numExpr(s, 1)} }`).join(
+                    ', ',
+                );
                 stmts.push(`const ${v} = ${dir}[${elems}];`);
                 s.ptArrs.push({ name: v, len });
             } else if (form === 9) {
@@ -398,9 +401,7 @@ class Gen {
                 // struct containing an array.
                 const o = this.fresh('o');
                 const dir = chance(this.r, 0.5) ? '/* @sroa */ ' : '';
-                stmts.push(
-                    `const ${o} = ${dir}{ v: ${this.numExpr(s, 1)}, a: [${this.numExpr(s, 1)}, ${this.numExpr(s, 1)}] };`,
-                );
+                stmts.push(`const ${o} = ${dir}{ v: ${this.numExpr(s, 1)}, a: [${this.numExpr(s, 1)}, ${this.numExpr(s, 1)}] };`);
                 const sv = this.fresh('ov');
                 stmts.push(`const ${sv} = ${o}.v + ${o}.a[0] + ${o}.a[1];`);
                 s.nums.push(sv);
@@ -428,7 +429,9 @@ class Gen {
             } else {
                 // if-branch with a nested const + field/array op
                 const v = this.fresh('c');
-                stmts.push(`let ${v} = 0; if (${this.cond(s)}) { ${v} = ${this.numExpr(s, 2)}; } else { ${v} = ${this.numExpr(s, 2)}; }`);
+                stmts.push(
+                    `let ${v} = 0; if (${this.cond(s)}) { ${v} = ${this.numExpr(s, 2)}; } else { ${v} = ${this.numExpr(s, 2)}; }`,
+                );
                 s.nums.push(v);
             }
         }
@@ -457,8 +460,19 @@ function shrink(code: string): string {
         for (let i = 0; i < lines.length; i++) {
             const trimmed = lines[i].trim();
             // Never drop the closing brace / function headers that keep it parseable.
-            if (trimmed === '' || trimmed === '}' || trimmed.startsWith('function') || trimmed.includes('function entry') || trimmed.startsWith('/* @optimize */ function') || trimmed.startsWith('return ')) continue;
-            const candidate = lines.slice(0, i).concat(lines.slice(i + 1)).join('\n');
+            if (
+                trimmed === '' ||
+                trimmed === '}' ||
+                trimmed.startsWith('function') ||
+                trimmed.includes('function entry') ||
+                trimmed.startsWith('/* @optimize */ function') ||
+                trimmed.startsWith('return ')
+            )
+                continue;
+            const candidate = lines
+                .slice(0, i)
+                .concat(lines.slice(i + 1))
+                .join('\n');
             try {
                 // Keep the reduction only if it (a) still diverges AND (b) PRESERVES
                 // the original source value. (b) prevents dropping a needed
@@ -763,10 +777,7 @@ class ScratchGen {
         // scalarization, and doesn't trip the after-first-write re-entrancy guard.
         if (chance(this.r, 0.4)) body.push(`  eff(${int(this.r, 1, 9)});`);
         // v2 alias-following: reach the scratch through a `const <s> = _s` alias.
-        const acc =
-            mode === 'alias' || mode === 'aliasTrailingEff' || mode === 'aliasClosure'
-                ? `${s}a`
-                : s;
+        const acc = mode === 'alias' || mode === 'aliasTrailingEff' || mode === 'aliasClosure' ? `${s}a` : s;
         if (acc !== s) body.push(`  const ${acc} = ${s};`);
         const readAllA = idx.map((i) => `${acc}[${i}]`).join(' + ');
         const writesA = idx.map((i) => `  ${acc}[${i}] = ${this.e()};`);
@@ -815,14 +826,7 @@ class ScratchGen {
             // Read a field before its write inside the loop → reads prior iteration →
             // must BAIL (a wrong per-call scalarization diverges).
             const w = idx.map((i) => `    ${s}[${i}] = ${this.e()} + i;`);
-            body.push(
-                '  let acc = 0;',
-                '  for (let i = 0; i < 4; i++) {',
-                `    acc += ${s}[0];`,
-                ...w,
-                '  }',
-                '  return acc;',
-            );
+            body.push('  let acc = 0;', '  for (let i = 0; i < 4; i++) {', `    acc += ${s}[0];`, ...w, '  }', '  return acc;');
         } else if (mode === 'aliasClosure') {
             // Alias captured in a RETURNED closure → observes the shared buffer across
             // calls; must BAIL. The deferred call (both entries run, then both closures
@@ -888,11 +892,7 @@ class ScratchGen {
 
 /** Scratch differential: source vs compiled, two-call oracle. Only the functions
  *  are exported (scratch const stays private, else it always bails). */
-function scratchDiff(
-    program: string,
-    exports: string,
-    call: string,
-): { want: unknown; got: unknown; compiled: string } | null {
+function scratchDiff(program: string, exports: string, call: string): { want: unknown; got: unknown; compiled: string } | null {
     const want = evalProgram(program, call);
     if (!want.ok) return null;
     const withExp = `${program}\nexport { ${exports} };`;
@@ -1002,10 +1002,7 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         `/* @inline */ function h(a, b) { return b; }\n/* @optimize */ function entry(p, q) { return h(Math.max(eff(1), 9), q); }`,
     );
     // A single-def impure RHS used twice must NOT be duplicated by inline-variables.
-    chk(
-        'inline-variables no-dup impure RHS',
-        `/* @optimize */ function entry(p, q) { const v = eff(p); return v + v; }`,
-    );
+    chk('inline-variables no-dup impure RHS', `/* @optimize */ function entry(p, q) { const v = eff(p); return v + v; }`);
     // @unroll preserves the per-iteration effect count + order.
     chk(
         'unroll preserves effect count',
@@ -1090,7 +1087,29 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
 // and the additive-identity `x + 0` fold form (the -0 hazard, also pinned) is only
 // emitted under FUZZ_SPICY. So the gate is GREEN; set FUZZ_SPICY=1 to re-enable
 // the buggy shapes for an ad-hoc bug-hunting campaign.
-const CG_ARITH_BIN = ['+', '-', '*', '/', '%', '**', '|', '&', '^', '<<', '>>', '>>>', ',', '<', '>', '<=', '>=', '===', '!==', '==', '!='];
+const CG_ARITH_BIN = [
+    '+',
+    '-',
+    '*',
+    '/',
+    '%',
+    '**',
+    '|',
+    '&',
+    '^',
+    '<<',
+    '>>',
+    '>>>',
+    ',',
+    '<',
+    '>',
+    '<=',
+    '>=',
+    '===',
+    '!==',
+    '==',
+    '!=',
+];
 const CG_LOGIC = ['&&', '||', '??'];
 const CG_UNARY = ['-', '!', '~', 'typeof ', 'void ', '+'];
 class CoerceGen {
@@ -1104,10 +1123,23 @@ class CoerceGen {
     // type). Compound ones are parenthesized so `**` / `/` precedence is unambiguous.
     private spicy(): string {
         return pick(this.r, [
-            '"ab"', '"3"', '""', '"x"', '"0"', // strings (incl. numeric-looking + empty)
-            'true', 'false',
-            '0', '1', '2', '5', '9', '(-3)', '(-0)', // numbers incl. -0
-            '(0/0)', '(1/0)', '(-1/0)', // NaN, +Infinity, -Infinity
+            '"ab"',
+            '"3"',
+            '""',
+            '"x"',
+            '"0"', // strings (incl. numeric-looking + empty)
+            'true',
+            'false',
+            '0',
+            '1',
+            '2',
+            '5',
+            '9',
+            '(-3)',
+            '(-0)', // numbers incl. -0
+            '(0/0)',
+            '(1/0)',
+            '(-1/0)', // NaN, +Infinity, -Infinity
             'null',
         ]);
     }
@@ -1435,11 +1467,7 @@ class ClosureGen {
     //    reference possible. SAFE.
     private iife(): string {
         const inner = pick(this.r, ['p', 'q', `(p ${this.op()} q)`]);
-        return (
-            `/* @optimize */ function entry(p, q) {\n` +
-            `  return (() => ${inner} + eff(q))();\n` +
-            `}`
-        );
+        return `/* @optimize */ function entry(p, q) {\n` + `  return (() => ${inner} + eff(q))();\n` + `}`;
     }
 
     // 4. Nested IIFEs — outer captures a binding, inner captures it through the
@@ -1507,10 +1535,7 @@ class ClosureGen {
     //    #5 only fires when the closure ESCAPES with the alias live inside it).
     private immediateAlias(): string {
         const n = int(this.r, 2, 3);
-        const writes = Array.from(
-            { length: n },
-            (_, i) => `  sa[${i}] = ${this.numExpr()};`,
-        ).join('\n');
+        const writes = Array.from({ length: n }, (_, i) => `  sa[${i}] = ${this.numExpr()};`).join('\n');
         const reads = Array.from({ length: n }, (_, i) => `sa[${i}]`).join(' + ');
         return (
             `const _scl = /*@__PURE__*/ [${Array.from({ length: n }, () => '0').join(', ')}];\n` +

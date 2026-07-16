@@ -89,8 +89,7 @@ function loadAddon(): Addon {
             addon = require(p) as Addon;
             if (!NATIVE_PLATFORMS.has(`${process.platform}-${process.arch}`)) {
                 console.warn(
-                    `compilecat: no native binary for ${process.platform}-${process.arch} — ` +
-                        'using the slower wasm core.',
+                    `compilecat: no native binary for ${process.platform}-${process.arch} — ` + 'using the slower wasm core.',
                 );
             }
             return addon;

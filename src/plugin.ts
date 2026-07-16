@@ -14,10 +14,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { createUnplugin } from 'unplugin';
-
-import { createFilter } from './filter';
-
 import { createCompiler } from './compiler';
+import { createFilter } from './filter';
+import { declarationCandidates, specifierToSubpath, typeImportSpecifiers, typesFromExports } from './type-resolve';
 
 export type FilterPattern = string | RegExp | (string | RegExp)[];
 
@@ -26,7 +25,6 @@ function toArray<T>(v: T | T[] | undefined): T[] {
     return Array.isArray(v) ? v : [v];
 }
 
-
 // Inlined so the native plugin doesn't pull the Babel-based compiler modules.
 const ANY_DIRECTIVE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
 const TRANSFORMABLE = /\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
@@ -34,6 +32,11 @@ const TRANSFORMABLE = /\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
 const IMPORT_FROM = /import\b[^'"]*?from\s*['"]([^'"]+)['"]/g;
 // `export … from "<spec>"` re-export edges (barrels) — followed to find donors.
 const EXPORT_FROM = /export\b[^'"]*?from\s*['"]([^'"]+)['"]/g;
+// Flat re-exports only — `export * from S` and `export {…}`/`export type {…} from S`;
+// EXCLUDES `export * as ns from S`, which contributes `ns.X` not a flat name and so is
+// never followed for flat type resolution (matches the core). Keeps the donor set to a
+// package's real flat surface rather than every namespaced submodule.
+const EXPORT_FLAT_FROM = /export\s+(?:type\s+)?(?:\*(?!\s*as\b)|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]/g;
 // `import * as <ns> from "<spec>"` — a namespace import; followed only when the
 // barrel re-exports `<ns>` (the mathcat shape: `import * as vec3 from './vec3';
 // export { vec3 }`), so the impl module holding the members is read as a donor.
@@ -53,8 +56,6 @@ const reexportsLocal = (code: string, name: string): boolean => {
     }
     return false;
 };
-// Safety cap on transitive donor modules read per consumer file.
-const MAX_DONORS = 200;
 
 // Extensions/index files tried when resolving a relative import ourselves —
 // cheap fs probes instead of the bundler's `this.resolve`, which is only needed
@@ -84,6 +85,38 @@ function resolveRelative(importerId: string, spec: string): string | null {
     }
     for (const idx of REL_INDEX) {
         if (isFile(abs + idx)) return abs + idx;
+    }
+    return null;
+}
+
+// Given a resolved RUNTIME module path, find its TypeScript declaration companion
+// (`foo.js` → `foo.d.ts`, `foo.mjs` → `foo.d.mts`) — where a published package's
+// `export type`s live (the `.js` has them stripped). This is what lets the type
+// oracle read e.g. mathcat's `Vec3`/`Quat` from `dist/types.d.ts`. Returns null if
+// no declaration file sits beside it (a JS-only dep, or a first-party `.ts` source
+// which already carries its own types).
+function declarationFor(runtimePath: string): string | null {
+    if (/\.d\.(?:ts|mts|cts)$/.test(runtimePath)) return runtimePath; // already a decl file
+    const m = runtimePath.match(/\.(tsx?|jsx?|mts|cts|mjs|cjs)$/);
+    if (!m) return null;
+    const base = runtimePath.slice(0, -m[0].length);
+    const ext = m[1];
+    const candidates =
+        ext === 'mjs' || ext === 'mts' ? ['.d.mts', '.d.ts'] : ext === 'cjs' || ext === 'cts' ? ['.d.cts', '.d.ts'] : ['.d.ts'];
+    for (const c of candidates) {
+        if (isFile(base + c)) return base + c;
+    }
+    return null;
+}
+
+// Walk up from `startPath` to the nearest directory containing a package.json.
+function findPackageDir(startPath: string): string | null {
+    let dir = path.dirname(startPath);
+    for (let i = 0; i < 40; i++) {
+        if (isFile(path.join(dir, 'package.json'))) return dir;
+        const parent = path.dirname(dir);
+        if (parent === dir) return null;
+        dir = parent;
     }
     return null;
 }
@@ -191,6 +224,26 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
     //    constantly — every directive file re-walks the same barrel graph — so
     //    memoize results for the whole build. Keyed `importer\0specifier`.
     const resolveCache = new Map<string, { id: string; external?: boolean } | null>();
+    //  - pkgTypeEntryCache: a bare package's resolved `.d.ts` type entry (or null),
+    //    keyed `importer\0specifier`. Resolving it walks package.json/exports (see
+    //    `resolvePackageTypeEntry`), so memoize per build. Stores the package.json path
+    //    too, so cache hits still `addWatchFile` it (a `types`/`exports` edit must
+    //    re-transform every consumer). Distinct from `resolveCache` (runtime `.js`).
+    const pkgTypeEntryCache = new Map<string, { dts: string | null; pkgJson: string | null }>();
+    //  - pkgJsonCache: parsed package.json per package dir (read once per build).
+    const pkgJsonCache = new Map<string, Record<string, unknown> | null>();
+    const readPackageJson = (dir: string): Record<string, unknown> | null => {
+        const hit = pkgJsonCache.get(dir);
+        if (hit !== undefined) return hit;
+        let parsed: Record<string, unknown> | null = null;
+        try {
+            parsed = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+        } catch {
+            parsed = null;
+        }
+        pkgJsonCache.set(dir, parsed);
+        return parsed;
+    };
     const readDonor = (donorPath: string): { code: string; hasDirective: boolean } | null => {
         const hit = donorCache.get(donorPath);
         if (hit) {
@@ -220,6 +273,13 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         // dev adapter additionally invalidates `consumersByDonor[changedId]`.
         watchChange(this: Ctx, changedId: string) {
             donorCache.delete(changedId);
+            // A dep's package.json edit can change its `types`/`exports` entry, so the
+            // derived type-entry + parsed-package caches must drop too (keys don't
+            // include the changed path, so clear both — package.json edits are rare).
+            if (changedId.endsWith('package.json')) {
+                pkgTypeEntryCache.clear();
+                pkgJsonCache.clear();
+            }
         },
         buildEnd() {
             if (stats) reportStats(stats);
@@ -275,7 +335,10 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             }
         }
 
-        while (queue.length > 0 && byPath.size < MAX_DONORS) {
+        // No donor-count cap: the `seen` set visits each resolved module once and
+        // `inScope` bounds the frontier, so this terminates on the finite reachable
+        // graph — like a bundler, which never silently stops at a magic import count.
+        while (queue.length > 0) {
             const { specifier, importer } = queue.shift() as (typeof queue)[number];
             const importerId = importer ? importer.path : id;
             const cacheKey = `${importerId} ${specifier}`;
@@ -337,9 +400,9 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             }
         }
 
-        const donors = [...byPath.values()];
+        const runtimeDonors = [...byPath.values()];
         // Track which consumer inlined which donor (for HMR invalidation).
-        for (const d of donors) {
+        for (const d of runtimeDonors) {
             let set = consumersByDonor.get(d.path);
             if (!set) {
                 set = new Set();
@@ -347,11 +410,18 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             }
             set.add(id);
         }
-        const donorHasDirective = donors.some((d) => donorCache.get(d.path)?.hasDirective ?? false);
+        const donorHasDirective = runtimeDonors.some((d) => donorCache.get(d.path)?.hasDirective ?? false);
         if (!consumerHasDirective && !donorHasDirective) {
             if (stats) stats.skippedNoDirective++;
             return null;
         }
+
+        // Type-source donors: only a directive consumer runs type-directed passes
+        // (SROA, etc.) that need imported shapes, so gather the `.d.ts` surface of
+        // the consumer's imports only then (it's fs-cheap and resolve-cached).
+        const typeImports = consumerHasDirective ? typeImportSpecifiers(code) : [];
+        const typeDonors = typeImports.length > 0 ? await gatherTypeSourceDonors.call(this, id, typeImports) : [];
+        const donors = typeDonors.length > 0 ? [...runtimeDonors, ...typeDonors] : runtimeDonors;
 
         const c0 = stats ? performance.now() : 0;
         const r =
@@ -366,6 +436,130 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         if (!r.changed) return null;
         if (stats) stats.changed++;
         return { code: r.code, map: r.map };
+    }
+
+    // BFS the `.d.ts` type surface of a consumer's type imports so the core can resolve
+    // package type aliases. Donors carry `.d.ts` PATHS (the core parses by extension — a
+    // `.js` path silently drops the types) plus their resolved re-export edges, so the
+    // core follows re-exports without re-resolving modules.
+    async function gatherTypeSourceDonors(this: Ctx, consumerId: string, imports: string[]): Promise<PluginDonor[]> {
+        const byPath = new Map<string, PluginDonor>();
+        const seen = new Set<string>();
+        const queue: { specifier: string; importer: PluginDonor | null }[] = imports.map((specifier) => ({
+            specifier,
+            importer: null,
+        }));
+
+        // No cap: `seen` + flat-only following bound this to a package's finite type
+        // surface, so it gathers the complete set — never a silently-truncated one.
+        while (queue.length > 0) {
+            const { specifier, importer } = queue.shift() as (typeof queue)[number];
+            const importerId = importer ? importer.path : consumerId;
+
+            let dtsPath: string | null;
+            if (specifier.startsWith('.')) {
+                // A `.d.ts` re-export like `export * from './x.js'` often names a
+                // type-only module with no runtime `.js`, so probe the `.d.ts` directly
+                // before falling back to resolving a runtime module + its sibling.
+                const abs = path.resolve(path.dirname(importerId), specifier);
+                dtsPath = declarationCandidates(abs).find(isFile) ?? null;
+                if (!dtsPath) {
+                    const rt = resolveRelative(importerId, specifier);
+                    dtsPath = rt ? declarationFor(rt) : null;
+                }
+            } else {
+                dtsPath = await resolvePackageTypeEntry.call(this, specifier, importerId);
+            }
+            if (!dtsPath || !inScope(dtsPath)) continue;
+            // Record the edge (by path) so the core follows this re-export to its target.
+            if (importer) importer.resolved.push({ specifier, path: dtsPath });
+            if (seen.has(dtsPath)) continue;
+            seen.add(dtsPath);
+
+            const cached = readDonor(dtsPath);
+            if (!cached) continue;
+            this.addWatchFile?.(dtsPath);
+            const donor: PluginDonor = { specifier, path: dtsPath, code: cached.code, resolved: [] };
+            byPath.set(dtsPath, donor);
+            for (const m of cached.code.matchAll(EXPORT_FLAT_FROM)) {
+                queue.push({ specifier: m[1], importer: donor });
+            }
+        }
+
+        return [...byPath.values()];
+    }
+
+    // Resolve a bare package specifier to its `.d.ts` type entry, in TypeScript's
+    // precedence: `exports` map "types" condition → `types`/`typings` field → a
+    // sibling `.d.ts` of the resolved runtime entry. Cached per build.
+    // Known gap: `@types/<pkg>` (DefinitelyTyped, separate package) is not consulted.
+    async function resolvePackageTypeEntry(this: Ctx, specifier: string, importerId: string): Promise<string | null> {
+        const key = `${importerId}\0${specifier}`;
+        const hit = pkgTypeEntryCache.get(key);
+        if (hit !== undefined) {
+            // Watch on hits too, so every consumer of this package re-transforms when its
+            // `types`/`exports` entry changes (`watchChange` then clears these caches).
+            if (hit.pkgJson) this.addWatchFile?.(hit.pkgJson);
+            return hit.dts;
+        }
+
+        // Node-resolve the runtime entry (shares the runtime resolve cache) — used to
+        // locate the package root and as the sibling-`.d.ts` fallback.
+        const cacheKey = `${importerId} ${specifier}`;
+        let runtimeId: string | null;
+        if (resolveCache.has(cacheKey)) {
+            if (stats) stats.resolveCacheHits++;
+            runtimeId = resolveCache.get(cacheKey)?.id ?? null;
+        } else {
+            const rs0 = stats ? performance.now() : 0;
+            try {
+                const r = (await this.resolve?.(specifier, importerId)) ?? null;
+                runtimeId = r?.id ?? null;
+                resolveCache.set(cacheKey, r);
+            } catch {
+                runtimeId = null;
+            } finally {
+                if (stats) {
+                    stats.resolveMs += performance.now() - rs0;
+                    stats.resolves++;
+                }
+            }
+        }
+
+        const result = resolveTypeEntryFrom(runtimeId, specifier);
+        if (result.pkgJson) this.addWatchFile?.(result.pkgJson);
+        pkgTypeEntryCache.set(key, result);
+        return result.dts;
+    }
+
+    // The package.json half of `resolvePackageTypeEntry`: exports/types/typings, else
+    // the sibling `.d.ts`. Returns the package.json path too (for watch registration).
+    function resolveTypeEntryFrom(
+        runtimeId: string | null,
+        specifier: string,
+    ): { dts: string | null; pkgJson: string | null } {
+        if (!runtimeId) return { dts: null, pkgJson: null };
+        const pkgDir = findPackageDir(runtimeId);
+        const pkgJson = pkgDir ? path.join(pkgDir, 'package.json') : null;
+        if (pkgDir) {
+            const pj = readPackageJson(pkgDir);
+            if (pj) {
+                const subpath = specifierToSubpath(specifier);
+                const fromExports = pj.exports != null ? typesFromExports(pj.exports, subpath) : null;
+                if (fromExports) {
+                    const p = path.resolve(pkgDir, fromExports);
+                    if (isFile(p)) return { dts: p, pkgJson };
+                }
+                if (subpath === '.') {
+                    const t = pj.types ?? pj.typings;
+                    if (typeof t === 'string') {
+                        const p = path.resolve(pkgDir, t);
+                        if (isFile(p)) return { dts: p, pkgJson };
+                    }
+                }
+            }
+        }
+        return { dts: declarationFor(runtimeId), pkgJson }; // sibling `.d.ts` fallback
     }
 });
 

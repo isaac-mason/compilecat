@@ -93,6 +93,7 @@
 		"test:rust": "cargo test --manifest-path rust/Cargo.toml -p compilecat_core",
 		"test:js": "vitest run",
 		"fuzz": "FUZZ=1 vitest run tst/fuzz.test.ts",
+		"bench:type-donors": "pnpm build:ts && pnpm build:loader && node bench/type-donors.mjs",
 		"version:all": "node scripts/bump-version.mjs"
 	},
 	"dependencies": {

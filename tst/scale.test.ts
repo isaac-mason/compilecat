@@ -25,8 +25,8 @@ const compiler = createCompiler();
 
 /** Strip TS → runnable JS, drop the ESM exports so `new Function` can parse it. */
 function toJs(tsCode: string): string {
-    return transformSync(tsCode, { loader: 'ts' }).code
-        .replace(/\bexport\s*\{[^}]*\}\s*;?/g, '')
+    return transformSync(tsCode, { loader: 'ts' })
+        .code.replace(/\bexport\s*\{[^}]*\}\s*;?/g, '')
         .replace(/\bexport\s+/g, '');
 }
 
@@ -59,9 +59,7 @@ describe('scale / no-blowup net — large @flatten chain + corpus concat', () =>
     const { code: chain, host } = deepChain(CHAIN_N);
     // Annotate a spread of the corpus copies with @optimize so the compile does
     // real optimization at scale (not just carry the chain), then export the rest.
-    const corpus = uniqueCorpus
-        .map((c, i) => `${i % 3 === 0 ? '/* @optimize */ ' : ''}export ${c.src}`)
-        .join('\n');
+    const corpus = uniqueCorpus.map((c, i) => `${i % 3 === 0 ? '/* @optimize */ ' : ''}export ${c.src}`).join('\n');
     const module = `${chain}\n${corpus}`;
 
     const out = compiler.compileChunk('scale.ts', module, {}).code;

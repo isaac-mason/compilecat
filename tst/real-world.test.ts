@@ -22,8 +22,8 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 /** Strip TS → runnable JS, drop the ESM export so `new Function` can eval it. */
 function toJs(tsCode: string): string {
-    return transformSync(tsCode, { loader: 'ts' }).code
-        .replace(/\bexport\s*\{[^}]*\}\s*;?/g, '')
+    return transformSync(tsCode, { loader: 'ts' })
+        .code.replace(/\bexport\s*\{[^}]*\}\s*;?/g, '')
         .replace(/\bexport\s+/g, '');
 }
 
@@ -37,7 +37,10 @@ function prng(seed: number, range: number): () => number {
 }
 const v3 = (r: () => number): number[] => [r(), r(), r()];
 const q4 = (r: () => number): number[] => [r(), r(), r(), r()];
-const vn = (n: number) => (r: () => number): number[] => Array.from({ length: n }, r);
+const vn =
+    (n: number) =>
+    (r: () => number): number[] =>
+        Array.from({ length: n }, r);
 
 type Kernel = {
     name: string;
@@ -93,8 +96,7 @@ const KERNELS: Kernel[] = [
         fixture: 'sleep-test-points.ts',
         params: ['com', 'aabb', 'quat'],
         callBody:
-            'const o0=[0,0,0], o1=[0,0,0], o2=[0,0,0];' +
-            'sleepTestPoints(o0, o1, o2, com, aabb, quat); return [o0, o1, o2];',
+            'const o0=[0,0,0], o1=[0,0,0], o2=[0,0,0];' + 'sleepTestPoints(o0, o1, o2, com, aabb, quat); return [o0, o1, o2];',
         inputs: (r) => [v3(r), vn(6)(r), q4(r)],
     },
     {
@@ -123,12 +125,7 @@ const KERNELS: Kernel[] = [
         fixture: 'ray-cylinder.ts',
         params: ['direction', 'aPoints', 'bPoints', 'radius'],
         callBody: 'return castRayVsCylinders(direction, aPoints, bPoints, radius);',
-        inputs: (r) => [
-            v3(r),
-            Array.from({ length: 5 }, () => v3(r)),
-            Array.from({ length: 5 }, () => v3(r)),
-            1 + Math.abs(r()),
-        ],
+        inputs: (r) => [v3(r), Array.from({ length: 5 }, () => v3(r)), Array.from({ length: 5 }, () => v3(r)), 1 + Math.abs(r())],
     },
     {
         name: 'real-world: quat fromEuler (string-switch dispatch over shared trig temps)',
@@ -176,9 +173,7 @@ describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
             const r = prng(0xc0ffee, 2);
             for (let i = 0; i < 10000; i++) {
                 const args = k.inputs(r, i);
-                expect(opt(...args), `${k.name} #${i} args=${JSON.stringify(args)}`).toEqual(
-                    src(...args),
-                );
+                expect(opt(...args), `${k.name} #${i} args=${JSON.stringify(args)}`).toEqual(src(...args));
             }
         });
     }
@@ -202,11 +197,7 @@ describe('real-world: crashcat/mathcat kernels — compiled ≡ source', () => {
 // KERNELS above already prove these compile ≡ source; this pins the OPTIMIZATION.
 describe('module-scratch scalar replacement — real crashcat patterns', () => {
     const compiledFixture = (fixture: string): string =>
-        compiler.compileChunk(
-            fixture,
-            readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'),
-            {},
-        ).code;
+        compiler.compileChunk(fixture, readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'), {}).code;
 
     it('DIRECT scratch use scalarizes (const deleted, member reads → scalars)', () => {
         const out = compiledFixture('scratch-transform-point.ts');
@@ -237,6 +228,80 @@ describe('module-scratch scalar replacement — real crashcat patterns', () => {
         // every case writes all fields → must-written at the post-switch read.
         expect(out).not.toContain('const _closest');
         expect(out).toMatch(/_closest_0/);
+    });
+
+    // The real crashcat/mathcat shape, end-to-end through `compileFileCross`: an opaque
+    // `create()` scratch typed `: Quat`, where `Quat` is declared in `types.d.ts` and
+    // re-exported by the package entry via a bare `export * from './types.js'`. The
+    // type-shape oracle follows the wildcard re-export across the `.d.ts` donor graph
+    // (`resolve_type_alias_shape`, cross_file.rs) to recover the arity so SROA fires.
+    // NB: the type-source donors carry `.d.ts` paths — a `.js` path would drop the types.
+    it('cross-package type re-export: mathcat-shaped .d.ts barrel resolves for SROA', () => {
+        const consumer = `import { type Quat, quat } from 'mathcat';
+const _s: Quat = /* @__PURE__ */ quat.create();
+/* @optimize */ export function f(out: number[], a: number[]): number[] {
+    _s[0] = a[0];
+    _s[1] = a[1];
+    _s[2] = a[2];
+    _s[3] = a[3];
+    out[0] = _s[0] + _s[1] + _s[2] + _s[3];
+    return out;
+}`;
+        const out = compiler.compileFileCross(
+            'entry.ts',
+            consumer,
+            [
+                {
+                    specifier: 'mathcat',
+                    path: '/nm/mathcat/dist/index.d.ts',
+                    code: `export * from './types.js';\nexport * as quat from './quat.js';`,
+                    resolved: [
+                        { specifier: './types.js', path: '/nm/mathcat/dist/types.d.ts' },
+                        { specifier: './quat.js', path: '/nm/mathcat/dist/quat.js' },
+                    ],
+                },
+                {
+                    specifier: './types.js',
+                    path: '/nm/mathcat/dist/types.d.ts',
+                    code: `export type Quat = [x: number, y: number, z: number, w: number];`,
+                    resolved: [],
+                },
+                {
+                    specifier: './quat.js',
+                    path: '/nm/mathcat/dist/quat.js',
+                    code: `export const quat = { create: () => [0, 0, 0, 0] };`,
+                    resolved: [],
+                },
+            ],
+            {},
+        ).code;
+        expect(out).toMatch(/_s_0\b/);
+        expect(out).not.toContain('const _s =');
+    });
+
+    // RESIDUAL GAP (deprioritized, `it.fails`): the type re-export fix above covers the
+    // typed case (`: Quat` resolvable via the `.d.ts` graph). What's still unhandled is a
+    // genuinely TYPE-LESS opaque scratch — `const _s = /*@__PURE__*/ create()` with no
+    // resolvable type anywhere (a JS dep shipping no `.d.ts`). The arity is unambiguous
+    // from the constant-index uses (`_s[0..3]`), so an arity-from-uses fallback COULD
+    // recover it, but that's a separate, lower-value pass. Flip to a plain `it` if it lands.
+    it.fails('type-less opaque scratch scalarizes from constant-index uses (arity inference)', () => {
+        const out = compiler.compileChunk(
+            'opaque-scratch.ts',
+            `declare const quat: { create(): number[] };
+const _s = /* @__PURE__ */ quat.create();
+/* @optimize */ export function f(out: number[], a: number[]): number[] {
+    _s[0] = a[0];
+    _s[1] = a[1];
+    _s[2] = a[2];
+    _s[3] = a[3];
+    out[0] = _s[0] + _s[1] + _s[2] + _s[3];
+    return out;
+}`,
+            {},
+        ).code;
+        expect(out).toMatch(/_s_0\b/);
+        expect(out).not.toContain('const _s =');
     });
 });
 
@@ -274,11 +339,7 @@ describe('transitive inlining — dbvt castRay', () => {
 
 describe('real-world: optimization pins — slerp / rayCylinder', () => {
     const compiledFixture = (fixture: string): string =>
-        compiler.compileChunk(
-            fixture,
-            readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'),
-            {},
-        ).code;
+        compiler.compileChunk(fixture, readFileSync(resolve(here, 'fixtures/real-world', fixture), 'utf8'), {}).code;
 
     it('slerp: control-flow shape is preserved (both ifs stay — no if→ternary)', () => {
         const out = compiledFixture('quat-slerp.ts');
@@ -379,8 +440,7 @@ describe('composite inlining pins — helpers inline into the entry body', () =>
     const compileComposite = (fn: string): string => {
         const c = MATHCAT_COMPOSITES.find((x) => x.fn === fn);
         if (!c) throw new Error(`no composite ${fn}`);
-        return compiler.compileChunk(`${fn}.ts`, `${c.deps}\n/* @optimize */ export ${c.src}`, {})
-            .code;
+        return compiler.compileChunk(`${fn}.ts`, `${c.deps}\n/* @optimize */ export ${c.src}`, {}).code;
     };
     const entryBody = (out: string, fn: string): string => out.slice(out.indexOf(`function ${fn}`));
 

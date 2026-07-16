@@ -4,7 +4,9 @@
 // nested @inline call (3d → 2d), degenerate fallbacks.
 type Vec3 = number[];
 type BarycentricCoordinatesResult = { u: number; v: number; w: number; isValid: boolean };
-function createBarycentricCoordinatesResult(): BarycentricCoordinatesResult { return { u: 0, v: 0, w: 0, isValid: false }; }
+function createBarycentricCoordinatesResult(): BarycentricCoordinatesResult {
+    return { u: 0, v: 0, w: 0, isValid: false };
+}
 
 /* @inline */ function computeBarycentricCoordinates2d(
     out: BarycentricCoordinatesResult,
@@ -43,7 +45,6 @@ function createBarycentricCoordinatesResult(): BarycentricCoordinatesResult { re
 }
 
 const _otherBarycentric = /* @__PURE__ */ createBarycentricCoordinatesResult();
-
 
 /* @optimize */ function computeBarycentricCoordinates3d(
     out: BarycentricCoordinatesResult,

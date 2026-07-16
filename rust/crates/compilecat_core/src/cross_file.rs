@@ -699,14 +699,91 @@ fn collect_imported_type_shapes(
 ) -> HashMap<String, crate::analysis::type_shape::Shape> {
     let mut out = HashMap::new();
     for (local, specifier, imported) in imports {
-        let Some(donor) = donors.iter().find(|d| &d.specifier == specifier) else { continue };
-        let Some(parsed) = cache.get(&donor.path) else { continue };
-        let donor_shapes = crate::analysis::type_shape::build_alias_shapes(parsed.program());
-        if let Some(shape) = donor_shapes.get(imported.as_str()) {
-            out.insert(local.clone(), shape.clone());
+        // Try every donor sharing this specifier, taking the first that yields a shape.
+        // The plugin emits `[...runtime, ...typeSource]`, so a runtime `.js` (types
+        // stripped → resolves nothing) is tried before the `.d.ts` that declares the
+        // alias. Safe because a stripped `.js` never resolves a type; a future donor
+        // that is a real `.ts` declaring a same-named-but-different type would make this
+        // order load-bearing — keep type-source donors last.
+        for donor in donors.iter().filter(|d| &d.specifier == specifier) {
+            let mut visited = HashSet::new();
+            if let Some(shape) = resolve_type_alias_shape(imported, donor, donors, cache, 0, &mut visited) {
+                out.insert(local.clone(), shape);
+                break;
+            }
         }
     }
     out
+}
+
+/// Cycle/blow-up guard for type re-export following (belt-and-suspenders alongside
+/// the `visited` set, which already bounds traversal to O(donors × names)).
+const MAX_TYPE_REEXPORT_DEPTH: usize = 32;
+
+/// Resolve an imported type alias `imported` to its `Shape`, starting at `donor`
+/// and following re-exports across the donor graph — the shape a package's public
+/// type surface actually has: types declared in one `.d.ts`, re-exported through a
+/// barrel entry (`mathcat`'s `dist/index.d.ts` does `export * from './types.js'`).
+///
+/// Three sources, in order: (1) an alias declared locally in this module; (2) a
+/// named re-export `export { X as imported } from S`; (3) a bare wildcard
+/// `export * from S` (which the value/@inline path defers, but a flat type name
+/// must be followed through).
+///
+/// `visited` memoises `(donor, name)` pairs: a densely cross-re-exporting `.d.ts`
+/// graph would otherwise re-expand shared nodes exponentially (fanout^depth). Keyed
+/// by name too so a donor legitimately reached to resolve a *different* re-exported
+/// name is not spuriously skipped. NB: donor modules are parsed by their path
+/// extension, so the type-source donor must carry a TS/`.d.ts` path or its
+/// `export type`s are dropped as JS.
+fn resolve_type_alias_shape(
+    imported: &str,
+    donor: &Donor,
+    donors: &[Donor],
+    cache: &crate::ModuleCache,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) -> Option<crate::analysis::type_shape::Shape> {
+    if depth > MAX_TYPE_REEXPORT_DEPTH {
+        return None;
+    }
+    // (donor, name) already explored on this resolution → its contribution is
+    // deterministic, so re-visiting can only re-find (propagated already) or re-fail.
+    if !visited.insert(format!("{}\u{0}{}", donor.path, imported)) {
+        return None;
+    }
+    let parsed = cache.get(&donor.path)?;
+    let program = parsed.program();
+
+    // (1) declared locally in this module.
+    if let Some(shape) = crate::analysis::type_shape::build_alias_shapes(program).get(imported) {
+        return Some(shape.clone());
+    }
+
+    // (2) `export { <local> as imported } from S` (incl. `export type { … } from S`).
+    if let Some((target, _target_program, local)) =
+        resolve_named_reexport(program, donor, donors, imported, cache)
+    {
+        if let Some(shape) = resolve_type_alias_shape(&local, target, donors, cache, depth + 1, visited) {
+            return Some(shape);
+        }
+    }
+
+    // (3) bare wildcard `export * from S` — flattens S's exports into this module.
+    for stmt in &program.body {
+        let Statement::ExportAllDeclaration(e) = stmt else { continue };
+        if e.exported.is_some() {
+            continue; // `export * as ns from S` — a namespace binding, not a flat alias
+        }
+        let Some(target) = resolve_reexport_target(donor, donors, e.source.value.as_str()) else {
+            continue;
+        };
+        if let Some(shape) = resolve_type_alias_shape(imported, target, donors, cache, depth + 1, visited) {
+            return Some(shape);
+        }
+    }
+
+    None
 }
 
 /// Token starts that carry a leading `@inline` comment. The comment attaches to
@@ -1765,6 +1842,101 @@ mod tests {
         let donor = "type Pair = [number, number];\nexport type Vec2 = Pair;";
         let out = run(consumer, &[("./math", donor)]);
         assert!(out.contains("v_0") && out.contains("v_1"), "SROA fired via alias chain:\n{out}");
+    }
+
+    #[test]
+    fn resolves_imported_type_through_wildcard_reexport_barrel() {
+        // The real mathcat shape: the package entry `.d.ts` re-exports its types
+        // from a sibling module via a bare `export * from './types.js'`. The oracle
+        // must follow the wildcard re-export across the donor graph to recover the
+        // tuple arity (4) so type-aware SROA destructures the opaque `mk()` init.
+        let consumer = r#"import { Quat } from "mathcat";
+/* @sroa */ export function f(): number { const v: Quat = mk(); v[0] = v[1] + v[2] + v[3]; return v[0]; }"#;
+        let donors = vec![
+            barrel_donor(
+                "mathcat",
+                "/nm/mathcat/dist/index.d.ts",
+                "export * from './types.js';",
+                &[("./types.js", "/nm/mathcat/dist/types.d.ts")],
+            ),
+            barrel_donor(
+                "./types.js",
+                "/nm/mathcat/dist/types.d.ts",
+                "export type Quat = [number, number, number, number];",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(
+            out.contains("v_0") && out.contains("v_3"),
+            "SROA fired via the wildcard-reexport type:\n{out}"
+        );
+        assert!(!out.contains("v[1]"), "indexing rewritten to scalars:\n{out}");
+    }
+
+    #[test]
+    fn dense_reexport_graph_does_not_blow_up() {
+        // A fully-connected wildcard re-export graph with NO matching type forces a
+        // full traversal. Without the `(donor, name)` visited memo this re-expands
+        // shared nodes exponentially (fanout^depth) and hangs for minutes; with it,
+        // traversal is O(nodes). Wall-clock guard turns a regression into a clear
+        // failure rather than a CI timeout.
+        let n = 14;
+        let mut donors = vec![Donor {
+            specifier: "densepkg".into(),
+            path: "/p/index.d.ts".into(),
+            code: (0..n).map(|j| format!("export * from './m{j}.js';")).collect::<Vec<_>>().join("\n"),
+            resolved: (0..n).map(|j| (format!("./m{j}.js"), format!("/p/m{j}.d.ts"))).collect(),
+        }];
+        for i in 0..n {
+            donors.push(Donor {
+                specifier: format!("./m{i}.js"),
+                path: format!("/p/m{i}.d.ts"),
+                // each node re-exports every OTHER node (dense) — no `Quat` anywhere.
+                code: (0..n)
+                    .filter(|j| *j != i)
+                    .map(|j| format!("export * from './m{j}.js';"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                resolved: (0..n)
+                    .filter(|j| *j != i)
+                    .map(|j| (format!("./m{j}.js"), format!("/p/m{j}.d.ts")))
+                    .collect(),
+            });
+        }
+        let consumer = r#"import { Quat } from "densepkg";
+/* @sroa */ export function f(): number { const v: Quat = mk(); return v[0] + v[1] + v[2] + v[3]; }"#;
+        let start = std::time::Instant::now();
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        let elapsed = start.elapsed();
+        assert!(elapsed.as_secs() < 5, "dense graph must not blow up (took {elapsed:?})");
+        assert!(!out.contains("v_0"), "Quat is undeclared → no scalarization:\n{out}");
+    }
+
+    #[test]
+    fn does_not_follow_namespace_reexport_for_a_flat_type_name() {
+        // A namespace re-export (`export * as ns from S`) exposes `ns.X`, NOT a flat
+        // `X`, so an `import { X }` from the barrel must NOT resolve through it. The
+        // type oracle only follows FLAT re-exports; SROA must not fire here.
+        let consumer = r#"import { Quat } from "mathcat";
+/* @sroa */ export function f(): number { const v: Quat = mk(); v[0] = v[1] + v[2] + v[3]; return v[0]; }"#;
+        let donors = vec![
+            barrel_donor(
+                "mathcat",
+                "/nm/mathcat/dist/index.d.ts",
+                "export * as types from './types.js';",
+                &[("./types.js", "/nm/mathcat/dist/types.d.ts")],
+            ),
+            barrel_donor(
+                "./types.js",
+                "/nm/mathcat/dist/types.d.ts",
+                "export type Quat = [number, number, number, number];",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(out.contains("v[1]"), "SROA must NOT fire via a namespace re-export:\n{out}");
+        assert!(!out.contains("v_0"), "no scalarization expected:\n{out}");
     }
 
     #[test]

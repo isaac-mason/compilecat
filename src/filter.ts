@@ -16,8 +16,7 @@ import path from 'node:path';
 
 export type FilterPattern = string | RegExp | (string | RegExp)[];
 
-const toArray = <T>(v: T | T[] | undefined): T[] =>
-    v === undefined ? [] : Array.isArray(v) ? v : [v];
+const toArray = <T>(v: T | T[] | undefined): T[] => (v === undefined ? [] : Array.isArray(v) ? v : [v]);
 
 const toPosix = (p: string): string => p.replace(/\\/g, '/');
 
@@ -66,10 +65,7 @@ function toMatcher(pattern: string | RegExp): (id: string) => boolean {
  * empty/omitted) and not matched by `exclude`. Mirrors the `@rollup/pluginutils`
  * `createFilter` contract for the patterns compilecat documents.
  */
-export function createFilter(
-    include?: FilterPattern,
-    exclude?: FilterPattern,
-): (id: string) => boolean {
+export function createFilter(include?: FilterPattern, exclude?: FilterPattern): (id: string) => boolean {
     const inc = toArray(include).map(toMatcher);
     const exc = toArray(exclude).map(toMatcher);
     return (rawId: string) => {

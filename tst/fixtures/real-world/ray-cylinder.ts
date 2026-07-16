@@ -63,12 +63,7 @@ function rayCylinder(direction: number[], cylinderA: number[], cylinderB: number
 }
 
 /* @optimize */
-export function castRayVsCylinders(
-    direction: number[],
-    aPoints: number[][],
-    bPoints: number[][],
-    radius: number,
-): number {
+export function castRayVsCylinders(direction: number[], aPoints: number[][], bPoints: number[][], radius: number): number {
     let best = Infinity;
     for (let i = 0; i < aPoints.length; i++) {
         const t = rayCylinder(direction, aPoints[i], bPoints[i], radius);
