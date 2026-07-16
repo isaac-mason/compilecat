@@ -834,21 +834,51 @@ struct Origin {
 // (the `ResolveLeaf` trait, with an associated `Out`), so the precedence logic
 // — and the shadowing-correctness invariant it encodes — lives in ONE place.
 //
-// Precedence for an exported name (authoritative — a higher-priority source that
-// NAMES the binding but can't be followed to a usable leaf yields `None`, it must
-// NOT fall through to a lower-priority shadowed source; that fall-through is a
-// miscompile: the wrong function inlined, or the wrong shape scalarized):
-//   (A) sourced named re-export `export { L as name } from S` → resolve L in S.
-//   (B) sourceless export clause  `export { L as name }`      → resolve LOCAL L.
-//   (C) a local declaration of `name` — authoritative even when it isn't a usable
-//       leaf (a value `Opaque`, a non-scalarizable type → `None`, never continue).
-//   (D) `import { imp as name } from S` → resolve imp in S; an unresolvable /
-//       out-of-scope S still STOPS here (`None`), never falls to the wildcard.
-//   (E) bare `export * from S` → resolve `name` in each S; reached only when
-//       nothing above shadows it.
+// ── CONTRACT: authoritative precedence (do NOT add a fall-through) ──
+//
+// Precedence for an exported name — highest priority first. Each higher step
+// SHADOWS every lower one: resolve the highest-priority source that NAMES the
+// binding, and if it can't be followed to a usable leaf, return `None` — NEVER
+// try the next source. That fall-through is exactly the miscompile class this
+// walker exists to prevent: the wrong function inlined, or the wrong shape
+// scalarized (e.g. a shadowed `export *` firing under a locally-shadowed name).
+//   (A)  sourced named re-export `export { L as name } from S`  → resolve L in S.
+//   (A′) `export default <ident>` indirection (name == "default") → resolve the
+//        identifier as a LOCAL binding; explicit + unshadowable (no `export *`
+//        default), so it takes the same authoritative precedence as A.
+//   (B)  sourceless export clause  `export { L as name }`       → resolve LOCAL L.
+//   (C)  a local declaration of `name` — authoritative even when it isn't a usable
+//        leaf (a value `Opaque`, a non-scalarizable type → `None`, never continue).
+//   (D)  `import { imp as name } from S` → resolve imp in S; an unresolvable /
+//        out-of-scope S still STOPS here (`None`), never falls to the wildcard.
+//   (E)  bare `export * from S` → resolve `name` in each S; reached only when
+//        nothing above shadows it.
 // A LOCAL binding (an alias target, an imported local) is resolved WITHOUT
 // consulting this module's export clauses / `export *` — that is the export-vs-
-// local role split [`resolve_local`] embodies (steps C→D only, no A/B/E).
+// local role split [`resolve_local`] embodies (steps C→D only, no A/A′/B/E).
+//
+// The STOP points are load-bearing, not accidental: `LocalResolution::DeclaredOpaque`
+// (step C) and the `None` arm of the step-D import lookup deliberately return `None`
+// so a shadowed lower source is never reached. Adding a "try the next source when
+// one fails" fall-through here silently reintroduces the miscompile.
+//
+// Executable spec — these regression tests encode the contract and are what break
+// if the invariant is violated (grep them before touching precedence):
+//   value  · cross_file_opaque_local_shadows_wildcard_no_miscompile        (C: Opaque local shadows `export *`)
+//          · cross_file_unfollowable_import_shadows_wildcard_no_miscompile  (D: out-of-scope import stops, no fall-through)
+//          · cross_file_class_local_shadows_wildcard_no_miscompile          (C: class local shadows `export *`)
+//          · cross_file_flatten_inlines_const_alias_of_imported_fn          (C alias → D: `const set = set$1` → import)
+//          · cross_file_rebound_import_forwards_origin_module_deps          (D: rebound import resolves to origin module)
+//          · cross_file_rebound_import_via_namespace_member                 (D via namespace member)
+//          · cross_file_flatten_inlines_default_reexport_of_imported_callable (A′ → import)
+//          · cross_file_flatten_inlines_default_reexport_of_named_import      (A′ → named import)
+//   type   · type_path_local_export_shadows_wildcard_no_miscompile         (C: opaque type shadows tuple `export *`)
+//          · type_path_named_reexport_shadows_wildcard_no_miscompile        (A: named re-export shadows `export *`)
+//          · resolves_imported_type_through_sourceless_rename_clause        (B: `export { X as Y }` over a local type)
+//
+// Value/type unification: both leaves run the SAME walker; [`ResolveLeaf::local`]
+// (step C's leaf inspection) is the ONLY per-leaf difference — every graph hop
+// (A/A′/B/D/E) is shared.
 
 /// What the leaf finds when it inspects a module for a *locally-declared* name.
 /// Drives the walker's authoritative-precedence decision at step (C).
@@ -862,6 +892,8 @@ enum LocalResolution<Out> {
     /// Declared here but not a usable leaf (a value class / opaque const, or a type
     /// that isn't a scalarizable shape). Authoritative — it SHADOWS a same-named
     /// import / `export *`, so the walker stops with `None` rather than continuing.
+    /// This STOP is the CONTRACT (see the precedence block above `resolve_export`):
+    /// falling through to a shadowed lower source here reintroduces a miscompile.
     DeclaredOpaque,
     /// Not declared here — keep walking imports / `export *`.
     NotDeclared,
