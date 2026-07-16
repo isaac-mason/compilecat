@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v0.0.9 (Unreleased)
+## v0.0.9
 
 - feat: cross-package `.d.ts` type resolution
   — the type-shape oracle resolves imported type aliases from a package's declaration surface (package.json `exports` `"types"` condition -> `types`/`typings` -> sibling `.d.ts`) and follows the `.d.ts` re-export graph (bare `export * from`, named / `export type` re-exports; namespace `export * as ns` excluded). Type-directed passes (SROA, module-scratch localization) now fire on types imported from published packages that ship a `.js` + `.d.ts` split (e.g. `mathcat`'s `Vec3`/`Quat`), not only local/relative imports

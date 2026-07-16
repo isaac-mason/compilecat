@@ -1,6 +1,6 @@
 {
 	"name": "compilecat",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"description": "compiler plugin that helps you write high performance javascript.",
 	"author": "Isaac Mason <isaac@isaacmason.com>",
 	"keywords": [
@@ -120,13 +120,13 @@
 		"rollup": "^4.0.0"
 	},
 	"optionalDependencies": {
-		"@compilecat/core-darwin-arm64": "0.0.8",
-		"@compilecat/core-darwin-x64": "0.0.8",
-		"@compilecat/core-linux-x64-gnu": "0.0.8",
-		"@compilecat/core-linux-arm64-gnu": "0.0.8",
-		"@compilecat/core-win32-x64-msvc": "0.0.8",
-		"@compilecat/core-wasm32-wasi": "0.0.8",
-		"@compilecat/wasm": "0.0.8"
+		"@compilecat/core-darwin-arm64": "0.0.9",
+		"@compilecat/core-darwin-x64": "0.0.9",
+		"@compilecat/core-linux-x64-gnu": "0.0.9",
+		"@compilecat/core-linux-arm64-gnu": "0.0.9",
+		"@compilecat/core-win32-x64-msvc": "0.0.9",
+		"@compilecat/core-wasm32-wasi": "0.0.9",
+		"@compilecat/wasm": "0.0.9"
 	},
 	"packageManager": "pnpm@9.15.3+sha512.1f79bc245a66eb0b07c5d4d83131240774642caaa86ef7d0434ab47c0d16f66b04e21e0c086eb61e62c77efc4d7f7ec071afad3796af64892fae66509173893a"
 }
