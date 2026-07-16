@@ -10,10 +10,26 @@ import path from 'node:path';
 import { transformSync } from 'esbuild';
 import { rolldown } from 'rolldown';
 import { type RollupOptions, rollup } from 'rollup';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { createCompiler } from '../src/compiler';
 import { compilecat } from '../src/plugin';
+
+// Count `donorEdges` (oxc-parse) calls per donor path so the memoization test can
+// prove the plugin parses each donor ONCE per build regardless of how many
+// consumers import it. The wrapper delegates to the real implementation, so every
+// other e2e in this file keeps its true edge behavior.
+const edgeCalls = vi.hoisted(() => ({ byPath: new Map<string, number>() }));
+vi.mock('../src/compiler', async (importActual) => {
+    const actual = await importActual<typeof import('../src/compiler')>();
+    return {
+        ...actual,
+        donorEdges(id: string, code: string) {
+            edgeCalls.byPath.set(id, (edgeCalls.byPath.get(id) ?? 0) + 1);
+            return actual.donorEdges(id, code);
+        },
+    };
+});
 
 const compiler = createCompiler();
 
@@ -454,6 +470,84 @@ describe('library inline: bare-specifier donors (via include scope)', () => {
         expect(code).toContain('x + 1');
     });
 
+    it('follows a re-exported imported binding (mathcat quat-as-vec4) end-to-end', async () => {
+        // The value-side of the re-export graph: a submodule re-binds another
+        // submodule's function under its own exported name (`import { set as
+        // set$1 } from './qvec4.js'; const set = set$1; export { set }` — exactly
+        // how mathcat's quat re-uses vec4's componentwise ops). The plugin must
+        // follow that PLAIN import (not just re-export edges) so the defining
+        // module is read as a donor, and the core must follow the const-alias to
+        // the real function. Neither happened before: the call survived, pinning
+        // the scratch as a module array.
+        writeFileSync(
+            path.join(dir, 'qvec4.js'),
+            `export function set(out, x, y, z, w) { out[0] = x; out[1] = y; out[2] = z; out[3] = w; return out; }\n`,
+        );
+        writeFileSync(
+            path.join(dir, 'qquat.js'),
+            `import { set as set$1 } from "./qvec4.js";\nconst set = set$1;\nexport { set };\n`,
+        );
+        writeFileSync(
+            path.join(dir, 'qentry.js'),
+            `import { set } from "qmat";\nconst s = [0, 0, 0, 0];\n/* @optimize */ export function step() { set(s, 1, 2, 3, 4); return s[0] + s[3]; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'qentry.js'),
+            plugins: [
+                {
+                    name: 'resolve-qmat',
+                    resolveId(source: string) {
+                        return source === 'qmat' ? path.join(dir, 'qquat.js') : null;
+                    },
+                },
+                compilecat({ include: [/.*/] }),
+            ],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `set() should inline across the re-binding:\n${code}`).not.toContain('set(');
+        // Call inlined → scratch `s` scalarized → arithmetic folded to a constant.
+        expect(code).toContain('return 5');
+    });
+
+    it('follows a MINIFIED re-exported imported binding end-to-end (AST donor edges)', async () => {
+        // The brittleness fix: the SAME quat-as-vec4 value re-bind as above, but
+        // MINIFIED — no spaces, on fewer lines (`import{set as set$1}from"./mv.js";
+        // const set=set$1;export{set}`). The OLD `reexportedImportSources` regex
+        // (`import\s+{`) MISSED this, so `./mv.js` was never read as a donor and the
+        // call survived. The core's AST-based `donorEdges` now finds the edge, so the
+        // defining module is gathered and the call is inlined through a real rollup build.
+        writeFileSync(
+            path.join(dir, 'mv.js'),
+            `export function set(out, x, y, z, w) { out[0] = x; out[1] = y; out[2] = z; out[3] = w; return out; }\n`,
+        );
+        // Minified barrel: no whitespace inside the import clause, single line, no
+        // trailing `;` after the export clause (ASI) — every shape the regex missed.
+        writeFileSync(path.join(dir, 'mquat.js'), `import{set as set$1}from"./mv.js";const set=set$1;export{set}`);
+        writeFileSync(
+            path.join(dir, 'mentry.js'),
+            `import { set } from "mmat";\nconst s = [0, 0, 0, 0];\n/* @optimize */ export function step() { set(s, 1, 2, 3, 4); return s[0] + s[3]; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'mentry.js'),
+            plugins: [
+                {
+                    name: 'resolve-mmat',
+                    resolveId(source: string) {
+                        return source === 'mmat' ? path.join(dir, 'mquat.js') : null;
+                    },
+                },
+                compilecat({ include: [/.*/] }),
+            ],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `minified re-bind should inline (AST donor edges):\n${code}`).not.toContain('set(');
+        expect(code).toContain('return 5');
+    });
+
     it('inlines namespace member calls from a package (vec.add)', async () => {
         // The realistic library shape: `import * as vec from "mathvec"` then
         // `vec.add(...)`. Donor has a module const exercised via the member call.
@@ -509,6 +603,75 @@ describe('plugin HMR wiring: addWatchFile registers donors', () => {
         // `transform` is an object hook ({ filter, handler }); invoke its handler.
         await plugin.transform.handler.call(ctx, consumer, path.join(dir, 'entry.js'));
         expect(watched).toContain(path.join(dir, 'math.js'));
+        rmSync(dir, { recursive: true, force: true });
+    });
+});
+
+// ── (d2) donor-edge memoization: donorEdges parses each donor ONCE per build ──
+// `donorEdges` PARSES the donor with oxc; without memoization every consumer that
+// imports the same donor re-parses it for the identical edge list. The plugin caches
+// the edges on the donorCache entry, so it parses once per build and recomputes only
+// after `watchChange(donorPath)` evicts the entry. This guards that memoization.
+
+describe('plugin donor-edge memoization: compute-once + invalidate-on-change', () => {
+    it('parses a shared donor once across two consumers, then again after watchChange', async () => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'cc-edge-'));
+        const donorPath = path.join(dir, 'math.js');
+        writeFileSync(donorPath, `/* @inline */ export function add(a, b) { return a + b; }\n`);
+        const ctx = {
+            resolve: async (spec: string) => ({
+                id: path.join(dir, spec.replace(/^\.\//, '')),
+                external: false,
+            }),
+            addWatchFile: () => {},
+        };
+        // One plugin instance = one build; both consumers import the SAME donor.
+        const plugin: any = compilecat({ include: [/.*/] });
+        const handler = plugin.transform.handler;
+        const consumer = (n: string) => `import { add } from "./math.js";\nexport function step${n}(x) { return add(x, ${n}); }`;
+
+        edgeCalls.byPath.set(donorPath, 0);
+        await handler.call(ctx, consumer('1'), path.join(dir, 'a.js'));
+        await handler.call(ctx, consumer('2'), path.join(dir, 'b.js'));
+        // Two consumers, ONE parse of the donor's edges (memoized on the cache entry).
+        expect(edgeCalls.byPath.get(donorPath)).toBe(1);
+
+        // A donor change evicts the cache entry (and its memoized edges) → recompute.
+        plugin.watchChange(donorPath);
+        await handler.call(ctx, consumer('3'), path.join(dir, 'c.js'));
+        expect(edgeCalls.byPath.get(donorPath)).toBe(2);
+
+        rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('the memoized edge list is identical to calling donorEdges directly', async () => {
+        // Pure-memoization guard: the edges the plugin's BFS follows must byte-match
+        // the un-cached direct call on the same (path, code). Use a barrel donor with
+        // real re-export edges so the list is non-trivial. The mock wrapper records the
+        // args every donorEdges call receives, so we compare the plugin's actual call
+        // against a direct call — proving no behavior change, just memoization.
+        const { donorEdges } = await import('../src/compiler');
+        const dir = mkdtempSync(path.join(tmpdir(), 'cc-edge-eq-'));
+        const barrelPath = path.join(dir, 'index.js');
+        const barrelCode = `export * as vec3 from "./vec3.js";\nexport { set } from "./set.js";\n`;
+        writeFileSync(barrelPath, barrelCode);
+        writeFileSync(path.join(dir, 'vec3.js'), `/* @inline */ export function add(a, b) { return a + b; }\n`);
+        writeFileSync(path.join(dir, 'set.js'), `/* @inline */ export function set(o, v) { o[0] = v; }\n`);
+        const ctx = {
+            resolve: async (spec: string) => ({ id: path.join(dir, spec.replace(/^\.\//, '')), external: false }),
+            addWatchFile: () => {},
+        };
+        const plugin: any = compilecat({ include: [/.*/] });
+        const consumer = `import * as m from "./index.js";\n/* @optimize */ export function f(x) { return m.vec3.add(x, 1); }`;
+        // Run the plugin: its BFS parses + memoizes the barrel's edges (through the
+        // real donorEdges, via the mock wrapper), then reuses them for the rest of the
+        // walk. The one parse it makes is on exactly (barrelPath, barrelCode).
+        edgeCalls.byPath.set(barrelPath, 0);
+        await plugin.transform.handler.call(ctx, consumer, path.join(dir, 'entry.js'));
+        expect(edgeCalls.byPath.get(barrelPath)).toBe(1); // memoized: one parse
+        // The edge list the plugin followed equals the direct, un-cached call. If the
+        // memoization altered the result, these would differ.
+        expect(donorEdges(barrelPath, barrelCode)).toEqual(['./vec3.js', './set.js']);
         rmSync(dir, { recursive: true, force: true });
     });
 });

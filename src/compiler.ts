@@ -68,6 +68,10 @@ export type Compiler = {
 type Addon = {
     Compiler: new () => Compiler;
     format: (id: string, code: string) => string;
+    /** The specifiers the donor BFS should follow from ONE module — the AST-based
+     *  replacement for the plugin's donor-edge regexes. `id` (the donor's path)
+     *  picks the source type; returns a dedup'd, order-stable specifier list. */
+    donorEdges: (id: string, code: string) => string[];
 };
 
 let addon: Addon | undefined;
@@ -115,4 +119,12 @@ export function createCompiler(): Compiler {
  *  cosmetic formatting differences when comparing outputs. */
 export function format(id: string, code: string): string {
     return loadAddon().format(id, code);
+}
+
+/** The specifiers the donor BFS should follow from ONE module (`id` = the donor's
+ *  path, `code` = its source) — the AST-based replacement for the plugin's brittle
+ *  donor-edge regexes. Returns a dedup'd, order-stable list of import/re-export
+ *  specifiers to read as further donors. */
+export function donorEdges(id: string, code: string): string[] {
+    return loadAddon().donorEdges(id, code);
 }

@@ -50,6 +50,34 @@ pub(crate) struct Candidate<'a> {
     free: HashSet<String>,
 }
 
+/// Resets every span in a subtree to `SPAN`. Cross-file inlining clones donor AST
+/// into a *different* module; those spans index the donor's source text, so left
+/// intact they produce out-of-range / wrong sourcemap mappings against the consumer
+/// source (and trip oxc codegen's `add_source_mapping_for_name` debug-assert on a
+/// named node whose span exceeds the consumer length). Overriding `visit_span` alone
+/// is sufficient — `walk_mut` invokes it for every node's span.
+struct SpanStripper;
+
+impl<'a> VisitMut<'a> for SpanStripper {
+    fn visit_span(&mut self, span: &mut oxc_span::Span) {
+        *span = oxc_span::SPAN;
+    }
+}
+
+/// Strip every span in a statement subtree — for donor material forwarded/hoisted
+/// into a consumer during cross-file inlining. See [`SpanStripper`].
+pub(crate) fn strip_spans_in_statement(stmt: &mut Statement) {
+    SpanStripper.visit_statement(stmt);
+}
+
+impl<'a> Candidate<'a> {
+    /// Neutralise the donor spans in this candidate's spliced expression (cross-file
+    /// inlining only — see [`SpanStripper`]).
+    pub(crate) fn strip_spans(&mut self) {
+        SpanStripper.visit_expression(&mut self.value);
+    }
+}
+
 /// Returns `(inlines, targets)` where `targets` is the span-starts of functions
 /// that call an `@inline` donor — the (possibly directive-free) consumers whose
 /// inlined residue must be opted into the cleanup gate. The cross-file path
@@ -611,6 +639,16 @@ pub(crate) struct BlockCandidate<'a> {
     /// Free variable names in `body` (referenced, not a param or body-local).
     /// See `Candidate::free`.
     free: HashSet<String>,
+}
+
+impl<'a> BlockCandidate<'a> {
+    /// Neutralise the donor spans in this candidate's spliced body statements
+    /// (cross-file inlining only — see [`SpanStripper`]).
+    pub(crate) fn strip_spans(&mut self) {
+        for stmt in &mut self.body {
+            SpanStripper.visit_statement(stmt);
+        }
+    }
 }
 
 /// BLOCK iff: not async/generator, simple identifier params, and a body that is

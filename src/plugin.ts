@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { createUnplugin } from 'unplugin';
-import { createCompiler } from './compiler';
+import { createCompiler, donorEdges } from './compiler';
 import { createFilter } from './filter';
 import { declarationCandidates, specifierToSubpath, typeImportSpecifiers, typesFromExports } from './type-resolve';
 
@@ -30,32 +30,13 @@ const ANY_DIRECTIVE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
 const TRANSFORMABLE = /\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
 // Any `… from "<spec>"` import — relative (`./x`, `../x`) or bare (`pkg`).
 const IMPORT_FROM = /import\b[^'"]*?from\s*['"]([^'"]+)['"]/g;
-// `export … from "<spec>"` re-export edges (barrels) — followed to find donors.
-const EXPORT_FROM = /export\b[^'"]*?from\s*['"]([^'"]+)['"]/g;
 // Flat re-exports only — `export * from S` and `export {…}`/`export type {…} from S`;
 // EXCLUDES `export * as ns from S`, which contributes `ns.X` not a flat name and so is
 // never followed for flat type resolution (matches the core). Keeps the donor set to a
-// package's real flat surface rather than every namespaced submodule.
+// package's real flat surface rather than every namespaced submodule. Used only by the
+// SEPARATE `.d.ts` type-donor path (`gatherTypeSourceDonors`); the runtime donor BFS
+// follows edges via the core's AST-based `donorEdges` instead.
 const EXPORT_FLAT_FROM = /export\s+(?:type\s+)?(?:\*(?!\s*as\b)|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]/g;
-// `import * as <ns> from "<spec>"` — a namespace import; followed only when the
-// barrel re-exports `<ns>` (the mathcat shape: `import * as vec3 from './vec3';
-// export { vec3 }`), so the impl module holding the members is read as a donor.
-const NS_IMPORT = /import\s*\*\s*as\s+(\w+)\s+from\s*['"]([^'"]+)['"]/g;
-// A sourceless `export { … }` clause (ends in `;` or EOL, not `from`).
-const EXPORT_CLAUSE = /export\s*\{([^}]*)\}[ \t]*(?:;|$)/gm;
-// Whether `code` re-exports the local binding `name` via a sourceless clause.
-const reexportsLocal = (code: string, name: string): boolean => {
-    for (const m of code.matchAll(EXPORT_CLAUSE)) {
-        const names = m[1].split(',').map((s) =>
-            s
-                .trim()
-                .split(/\s+as\s+/)[0]
-                .trim(),
-        );
-        if (names.includes(name)) return true;
-    }
-    return false;
-};
 
 // Extensions/index files tried when resolving a relative import ourselves —
 // cheap fs probes instead of the bundler's `this.resolve`, which is only needed
@@ -158,6 +139,8 @@ interface PluginStats {
     resolveCacheHits: number;
     donorReads: number; // fs reads (cache misses)
     donorCacheHits: number;
+    edgeScans: number; // donorEdges() parses (cache misses)
+    edgeCacheHits: number;
     scanMs: number; // directive/import regex scans
     resolveMs: number; // this.resolve
     readMs: number; // fs.readFileSync donors
@@ -172,7 +155,8 @@ function reportStats(s: PluginStats): void {
         `[compilecat-native] ${s.files} files seen, ${s.directiveFiles} with directive, ` +
             `${s.skippedNoDirective} skipped, ${s.compiledFile + s.compiledCross} compiled ` +
             `(${s.compiledCross} cross-file), ${s.changed} changed.\n` +
-            `  resolves=${s.resolves} (cacheHits=${s.resolveCacheHits}) donorReads=${s.donorReads} (cacheHits=${s.donorCacheHits})\n` +
+            `  resolves=${s.resolves} (cacheHits=${s.resolveCacheHits}) donorReads=${s.donorReads} (cacheHits=${s.donorCacheHits}) ` +
+            `edgeScans=${s.edgeScans} (cacheHits=${s.edgeCacheHits})\n` +
             `${row('scan (regex)', s.scanMs)}\n${row('resolve', s.resolveMs)}\n` +
             `${row('read donors (fs)', s.readMs)}\n${row('native compile', s.compileMs)}\n` +
             `  ${'TOTAL in transform'.padEnd(20)} ${s.totalMs.toFixed(1).padStart(9)}ms`,
@@ -203,6 +187,8 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
               resolveCacheHits: 0,
               donorReads: 0,
               donorCacheHits: 0,
+              edgeScans: 0,
+              edgeCacheHits: 0,
               scanMs: 0,
               resolveMs: 0,
               readMs: 0,
@@ -217,7 +203,11 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
     //    Inlining removes the import edge, so the module graph no longer carries
     //    donor→consumer; a Vite HMR adapter uses this to invalidate consumers
     //    when a donor changes. `watchChange` also uses it to evict the cache.
-    const donorCache = new Map<string, { code: string; hasDirective: boolean }>();
+    //    `edges` (the core's AST-derived re-export/re-bind specifiers) is memoized
+    //    lazily on the entry the first time the BFS needs it, so `donorEdges` PARSES
+    //    each donor once per build, not once per consumer that imports it. It rides
+    //    on the same entry `watchChange` evicts, so a donor edit recomputes it.
+    const donorCache = new Map<string, { code: string; hasDirective: boolean; edges?: string[] }>();
     const consumersByDonor = new Map<string, Set<string>>();
     //  - resolveCache: `this.resolve` is the dominant cost (it walks the bundler's
     //    resolver + plugin pipeline). The same (importer, specifier) pair recurs
@@ -264,6 +254,20 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         const entry = { code, hasDirective: ANY_DIRECTIVE.test(code) };
         donorCache.set(donorPath, entry);
         return entry;
+    };
+    // The core's AST re-export/re-bind edges for a donor, computed once per build.
+    // `donorEdges` parses the donor with oxc, so memoize it on the cache entry —
+    // otherwise every consumer importing the same donor re-parses it for the same
+    // result. `(donorPath, code)` are the only inputs and both are stable per
+    // cached entry (the entry is dropped on change), so the memo is a pure one.
+    const donorEdgesFor = (donorPath: string, entry: { code: string; edges?: string[] }): string[] => {
+        if (entry.edges !== undefined) {
+            if (stats) stats.edgeCacheHits++;
+            return entry.edges;
+        }
+        if (stats) stats.edgeScans++;
+        entry.edges = donorEdges(donorPath, entry.code);
+        return entry.edges;
     };
 
     return {
@@ -387,16 +391,15 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 resolved: [],
             };
             byPath.set(resolved.id, donor);
-            // Follow this donor's re-export edges (barrels) to find more donors.
-            for (const m of cached.code.matchAll(EXPORT_FROM)) {
-                queue.push({ specifier: m[1], importer: donor });
-            }
-            // …and `import * as ns from S; export { ns }` — a re-exported
-            // namespace object (mathcat's barrel): S holds its members.
-            for (const m of cached.code.matchAll(NS_IMPORT)) {
-                if (reexportsLocal(cached.code, m[1])) {
-                    queue.push({ specifier: m[2], importer: donor });
-                }
+            // Follow this donor's edges to find more donors — computed by the core
+            // by PARSING (oxc), not regex. `donorEdges` returns every specifier that
+            // could surface an inlinable callable: re-export edges (barrels), a
+            // re-exported namespace object (`import * as ns from S; export { ns }`),
+            // and a re-exported imported binding (`import { set as set$1 } from S;
+            // const set = set$1; export { set }` — quat-as-vec4). AST-correct, so it
+            // catches minified / multi-declarator / ASI shapes the old regexes missed.
+            for (const s of donorEdgesFor(resolved.id, cached)) {
+                queue.push({ specifier: s, importer: donor });
             }
         }
 
@@ -534,10 +537,7 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
 
     // The package.json half of `resolvePackageTypeEntry`: exports/types/typings, else
     // the sibling `.d.ts`. Returns the package.json path too (for watch registration).
-    function resolveTypeEntryFrom(
-        runtimeId: string | null,
-        specifier: string,
-    ): { dts: string | null; pkgJson: string | null } {
+    function resolveTypeEntryFrom(runtimeId: string | null, specifier: string): { dts: string | null; pkgJson: string | null } {
         if (!runtimeId) return { dts: null, pkgJson: null };
         const pkgDir = findPackageDir(runtimeId);
         const pkgJson = pkgDir ? path.join(pkgDir, 'package.json') : null;

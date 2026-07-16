@@ -7,7 +7,7 @@
 // addon can't load) import this via `compilecat/wasm` instead of the Node-only
 // `compilecat`.
 
-import initWasm, { Compiler as WasmCompiler, format as wasmFormat } from '@compilecat/wasm';
+import initWasm, { Compiler as WasmCompiler, donorEdges as wasmDonorEdges, format as wasmFormat } from '@compilecat/wasm';
 import type { Compiler } from './compiler';
 
 export type {
@@ -42,4 +42,11 @@ export async function createCompiler(): Promise<Compiler> {
 export async function format(id: string, code: string): Promise<string> {
     await init();
     return wasmFormat(id, code);
+}
+
+/** The specifiers the donor BFS should follow from ONE module — the wasm twin of
+ *  `compiler.ts`'s `donorEdges` (async: wasm must `init()` first). */
+export async function donorEdges(id: string, code: string): Promise<string[]> {
+    await init();
+    return wasmDonorEdges(id, code);
 }

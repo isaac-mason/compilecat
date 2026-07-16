@@ -42,7 +42,7 @@ use crate::parse_program;
 use crate::passes;
 use crate::passes::inline_functions::{
     classify_block, classify_block_arrow, classify_direct, classify_direct_arrow, inline_with,
-    top_level_function, BlockCandidate, Candidate,
+    strip_spans_in_statement, top_level_function, BlockCandidate, Candidate,
 };
 
 /// A donor module the consumer imports from.
@@ -146,6 +146,11 @@ pub fn transform_cross_file(
     // via `uid_base`) — so every generated temp name is unique across all of them.
     let mut uid = 0u32;
     if !reg.direct.is_empty() || !reg.block.is_empty() {
+        // Donor AST is spliced into the consumer; its spans index the donor source,
+        // so strip them before codegen builds the consumer sourcemap (no-op otherwise).
+        if options.sourcemap {
+            reg.strip_donor_spans();
+        }
         let keys: std::collections::HashSet<String> =
             reg.direct.keys().chain(reg.block.keys()).cloned().collect();
         inline_targets = passes::inline_functions::functions_calling(&program, &keys);
@@ -186,6 +191,31 @@ pub fn transform_cross_file(
                 ) {
                     freg.inlined_locals.insert(local.clone());
                 }
+            } else {
+                // The imported name isn't a directly-declared callable here — it may be an
+                // indirection (`const set = set$1` aliasing an import, or a re-export). Follow
+                // it to the module that actually defines the callable, and register there so
+                // dep-forwarding rebases against the real source (mathcat quat-as-vec4).
+                let mut visited = HashSet::new();
+                if let Some(origin) = resolve_value_origin(imported, donor, donors, cache, 0, &mut visited) {
+                    if let Some(oparsed) = cache.get(&origin.donor_path) {
+                        if let Some(ValueBinding::Callable(callable)) =
+                            local_value_binding(oparsed.program(), &origin.name)
+                        {
+                            let export = DonorExport { name: origin.name.clone(), callable };
+                            if freg.register_export(
+                                oparsed.program(),
+                                &origin.donor_path,
+                                consumer_path,
+                                local.clone(),
+                                &export,
+                                &allocator,
+                            ) {
+                                freg.inlined_locals.insert(local.clone());
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -215,6 +245,7 @@ pub fn transform_cross_file(
                 continue;
             }
             let Some(parsed) = cache.get(&target.path) else { continue };
+            let mut resolved_members: HashSet<String> = HashSet::new();
             for export in find_all_inline_exports(parsed.program(), false) {
                 let key = format!("{ns_local}.{}", export.name);
                 if !host_calls.contains(&key) {
@@ -229,11 +260,53 @@ pub fn transform_cross_file(
                     &allocator,
                 ) {
                     freg.inlined_locals.insert(ns_local.clone());
+                    resolved_members.insert(export.name.clone());
+                }
+            }
+
+            // Fallback for members the direct export scan can't represent: a member
+            // bound to an indirection (`const set = set$1` aliasing an import, a
+            // re-export). Follow each host-called-but-unresolved member to its origin
+            // module and register the real callable there (mathcat quat-as-vec4).
+            let prefix = format!("{ns_local}.");
+            let called_members: Vec<String> = host_calls
+                .iter()
+                .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+                .collect();
+            for member in called_members {
+                if resolved_members.contains(&member) {
+                    continue;
+                }
+                let mut visited = HashSet::new();
+                let Some(origin) = resolve_value_origin(&member, target, donors, cache, 0, &mut visited)
+                else {
+                    continue;
+                };
+                let Some(oparsed) = cache.get(&origin.donor_path) else { continue };
+                let Some(ValueBinding::Callable(callable)) =
+                    local_value_binding(oparsed.program(), &origin.name)
+                else {
+                    continue;
+                };
+                let export = DonorExport { name: origin.name.clone(), callable };
+                let key = format!("{ns_local}.{member}");
+                if freg.register_export(
+                    oparsed.program(),
+                    &origin.donor_path,
+                    consumer_path,
+                    key,
+                    &export,
+                    &allocator,
+                ) {
+                    freg.inlined_locals.insert(ns_local.clone());
                 }
             }
         }
 
         if !freg.direct.is_empty() || !freg.block.is_empty() {
+            if options.sourcemap {
+                freg.strip_donor_spans();
+            }
             prepend_imports(&allocator, &mut program, freg.forward);
             insert_after_imports(&allocator, &mut program, freg.hoist);
             stats.inlined += passes::inline_functions::flatten_into_hosts(
@@ -332,6 +405,27 @@ impl<'a> Registrar<'a> {
             consumer_names,
             copied: HashMap::new(),
             rename_counter: 0,
+        }
+    }
+
+    /// Neutralise the donor source spans on every piece of donor material this
+    /// registrar will splice into the consumer — the classified candidate bodies
+    /// and the forwarded imports / hoisted decls. Those spans index the *donor's*
+    /// source, so against the consumer's sourcemap they are out of range (or map to
+    /// the wrong place). Called only when a sourcemap is being emitted; the spliced
+    /// donor code then maps to the top of the consumer rather than to a bogus offset.
+    fn strip_donor_spans(&mut self) {
+        for c in self.direct.values_mut() {
+            c.strip_spans();
+        }
+        for c in self.block.values_mut() {
+            c.strip_spans();
+        }
+        for stmt in &mut self.forward {
+            strip_spans_in_statement(stmt);
+        }
+        for stmt in &mut self.hoist {
+            strip_spans_in_statement(stmt);
         }
     }
 
@@ -720,22 +814,279 @@ fn collect_imported_type_shapes(
 /// the `visited` set, which already bounds traversal to O(donors × names)).
 const MAX_TYPE_REEXPORT_DEPTH: usize = 32;
 
-/// Resolve an imported type alias `imported` to its `Shape`, starting at `donor`
-/// and following re-exports across the donor graph — the shape a package's public
-/// type surface actually has: types declared in one `.d.ts`, re-exported through a
-/// barrel entry (`mathcat`'s `dist/index.d.ts` does `export * from './types.js'`).
+/// Where a value binding ultimately resolves: the module (`donor_path`) + the
+/// *local* name under which it is a concrete callable declaration there, after
+/// following const-aliases, imports, and re-exports. The value-side leaf of the
+/// unified cross-module resolver ([`resolve_export`] / [`resolve_local`]); the
+/// type side's leaf is a `Shape` for the SROA oracle instead of a callable for
+/// the inliner.
+struct Origin {
+    donor_path: String,
+    name: String,
+}
+
+// ── Unified cross-module precedence walker ──────────────────────────────────
+//
+// Value inlining and type SROA both walk the SAME donor module graph (imports,
+// re-exports, `export *`) under the SAME JS/TS binding-precedence rules; they
+// differ only in their *leaf* — the value side lands on a callable `Origin`, the
+// type side on a scalarizable `Shape`. The walker below is generic over that leaf
+// (the `ResolveLeaf` trait, with an associated `Out`), so the precedence logic
+// — and the shadowing-correctness invariant it encodes — lives in ONE place.
+//
+// Precedence for an exported name (authoritative — a higher-priority source that
+// NAMES the binding but can't be followed to a usable leaf yields `None`, it must
+// NOT fall through to a lower-priority shadowed source; that fall-through is a
+// miscompile: the wrong function inlined, or the wrong shape scalarized):
+//   (A) sourced named re-export `export { L as name } from S` → resolve L in S.
+//   (B) sourceless export clause  `export { L as name }`      → resolve LOCAL L.
+//   (C) a local declaration of `name` — authoritative even when it isn't a usable
+//       leaf (a value `Opaque`, a non-scalarizable type → `None`, never continue).
+//   (D) `import { imp as name } from S` → resolve imp in S; an unresolvable /
+//       out-of-scope S still STOPS here (`None`), never falls to the wildcard.
+//   (E) bare `export * from S` → resolve `name` in each S; reached only when
+//       nothing above shadows it.
+// A LOCAL binding (an alias target, an imported local) is resolved WITHOUT
+// consulting this module's export clauses / `export *` — that is the export-vs-
+// local role split [`resolve_local`] embodies (steps C→D only, no A/B/E).
+
+/// What the leaf finds when it inspects a module for a *locally-declared* name.
+/// Drives the walker's authoritative-precedence decision at step (C).
+enum LocalResolution<Out> {
+    /// A terminal: the name resolves to a usable leaf here.
+    Found(Out),
+    /// A local ALIAS (`const set = set$1`) — follow the target as a LOCAL binding
+    /// (never through this module's export surface). Value-only; the type leaf's
+    /// alias chains are already resolved inside `build_alias_shapes`.
+    AliasTo(String),
+    /// Declared here but not a usable leaf (a value class / opaque const, or a type
+    /// that isn't a scalarizable shape). Authoritative — it SHADOWS a same-named
+    /// import / `export *`, so the walker stops with `None` rather than continuing.
+    DeclaredOpaque,
+    /// Not declared here — keep walking imports / `export *`.
+    NotDeclared,
+}
+
+/// The per-leaf terminal for the unified cross-module walker. The value leaf lands
+/// on a callable [`Origin`]; the type leaf lands on a scalarizable [`Shape`]. Only
+/// [`ResolveLeaf::local`] differs between them — every graph hop (re-exports,
+/// imports, `export *`) is shared in [`resolve_export`] / [`resolve_local`].
+trait ResolveLeaf {
+    type Out;
+
+    /// The terminal for a *locally-declared* `name` in `program`, or a signal to
+    /// keep/stop walking (see [`LocalResolution`]). `donor_path` is supplied so the
+    /// value leaf can record the origin module.
+    fn local(program: &Program, name: &str, donor_path: &str) -> LocalResolution<Self::Out>;
+}
+
+/// Value leaf: a locally-declared name maps a [`ValueBinding`] onto the walker's
+/// `Callable → Found(Origin)`, `Alias → AliasTo`, `Opaque → DeclaredOpaque`,
+/// `None → NotDeclared`.
+struct ValueLeaf;
+
+impl ResolveLeaf for ValueLeaf {
+    type Out = Origin;
+
+    fn local(program: &Program, name: &str, donor_path: &str) -> LocalResolution<Origin> {
+        match local_value_binding(program, name) {
+            Some(ValueBinding::Callable(_)) => {
+                LocalResolution::Found(Origin { donor_path: donor_path.to_string(), name: name.to_string() })
+            }
+            Some(ValueBinding::Alias(target)) => LocalResolution::AliasTo(target),
+            Some(ValueBinding::Opaque) => LocalResolution::DeclaredOpaque,
+            None => LocalResolution::NotDeclared,
+        }
+    }
+}
+
+/// Type leaf: a locally-declared type maps onto `declares_type` + `build_alias_shapes`
+/// — `declared && scalarizable → Found(Shape)`, `declared && not scalarizable →
+/// DeclaredOpaque` (authoritative, shadows a same-named tuple re-export), `not
+/// declared → NotDeclared`. Never returns `AliasTo`: donor-local alias / interface
+/// chains are already followed inside `build_alias_shapes`.
+struct TypeLeaf;
+
+impl ResolveLeaf for TypeLeaf {
+    type Out = crate::analysis::type_shape::Shape;
+
+    fn local(
+        program: &Program,
+        name: &str,
+        _donor_path: &str,
+    ) -> LocalResolution<crate::analysis::type_shape::Shape> {
+        if !crate::analysis::type_shape::declares_type(program, name) {
+            return LocalResolution::NotDeclared;
+        }
+        match crate::analysis::type_shape::build_alias_shapes(program).get(name).cloned() {
+            Some(shape) => LocalResolution::Found(shape),
+            None => LocalResolution::DeclaredOpaque,
+        }
+    }
+}
+
+/// Resolve the **exported** name `name` of `donor` to its leaf (`L::Out`), walking
+/// the donor graph under authoritative precedence (A→E above). Generic over the
+/// leaf `L` — the value inliner uses `resolve_export::<ValueLeaf>` (landing on an
+/// `Origin`), the SROA oracle `resolve_export::<TypeLeaf>` (landing on a `Shape`).
 ///
-/// Three sources, in order: (1) an alias declared locally in this module; (2) a
-/// named re-export `export { X as imported } from S`; (3) a bare wildcard
-/// `export * from S` (which the value/@inline path defers, but a flat type name
-/// must be followed through).
+/// `visited` memoises `E\0(donor, name)` (the export-surface role, distinct from
+/// the `L\0…` local-binding role used by [`resolve_local`]) so a dense re-export
+/// graph can't re-expand shared nodes (fanout^depth); `MAX_TYPE_REEXPORT_DEPTH`
+/// belt-and-suspenders bounds it. A source that names `name` but can't be followed
+/// to a leaf yields `None` — never a fall-through to a shadowed lower source.
+fn resolve_export<L: ResolveLeaf>(
+    name: &str,
+    donor: &Donor,
+    donors: &[Donor],
+    cache: &crate::ModuleCache,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) -> Option<L::Out> {
+    if depth > MAX_TYPE_REEXPORT_DEPTH {
+        return None;
+    }
+    if !visited.insert(format!("E\u{0}{}\u{0}{}", donor.path, name)) {
+        return None;
+    }
+    let program = cache.get(&donor.path)?.program();
+
+    // (A) Sourced named re-export `export { L as name } from S` — explicit, shadows `export *`.
+    if let Some((target, _p, local)) = resolve_named_reexport(program, donor, donors, name, cache) {
+        return resolve_export::<L>(&local, target, donors, cache, depth + 1, visited);
+    }
+
+    // (A′) `export default <ident>` indirection — a default export is explicit and
+    // unshadowable (there is no `export *` default), so it takes the same
+    // authoritative precedence as the other explicit-export steps. Only the
+    // *identifier* form is an indirection that reaches here: `export default fn`
+    // / arrow / class / other expression are direct forms `find_export` /
+    // `default_callable` already handle (an anonymous default can't be aliased),
+    // so those return `None` for this step and fall through. The bare identifier
+    // is resolved as a LOCAL binding of the donor (never through its export
+    // surface) — `resolve_local::<ValueLeaf>` lands on the real callable `Origin`,
+    // `resolve_local::<TypeLeaf>` naturally yields `None` (a value ident has no
+    // SROA shape). Authoritative: return its result, Some or None, no fall-through.
+    if name == "default" {
+        if let Some(local) = export_default_ident(program) {
+            return resolve_local::<L>(&local, donor, donors, cache, depth + 1, visited);
+        }
+    }
+
+    // (B) Sourceless export clause `export { L as name }` — the exported name maps to
+    // the LOCAL binding L (L may == name). Explicit, shadows `export *`.
+    if let Some(local) = sourceless_export_local(program, name) {
+        return resolve_local::<L>(&local, donor, donors, cache, depth + 1, visited);
+    }
+
+    // (C) A local declaration of `name` — authoritative: it shadows imports and
+    // `export *`, so a `DeclaredOpaque` leaf stops here rather than falling through.
+    match L::local(program, name, &donor.path) {
+        LocalResolution::Found(out) => return Some(out),
+        LocalResolution::AliasTo(target) => {
+            return resolve_local::<L>(&target, donor, donors, cache, depth + 1, visited);
+        }
+        LocalResolution::DeclaredOpaque => return None,
+        LocalResolution::NotDeclared => {}
+    }
+
+    // (D) `import { imp as name } from S` — authoritative over `export *`. A missing or
+    // out-of-scope S still stops here (returns None), never falls through to a shadowed
+    // wildcard — the import is what `name` binds to at runtime.
+    if let Some((source, imported)) = import_binding_source(program, name) {
+        return match resolve_reexport_target(donor, donors, &source) {
+            Some(target) => resolve_export::<L>(&imported, target, donors, cache, depth + 1, visited),
+            None => None,
+        };
+    }
+
+    // (E) Bare `export * from S` — reached only when `name` is neither explicitly
+    // exported, locally declared, nor imported (so nothing shadows the wildcard).
+    for stmt in &program.body {
+        let Statement::ExportAllDeclaration(e) = stmt else { continue };
+        if e.exported.is_some() {
+            continue; // `export * as ns from S` — a namespace binding, not a flat name
+        }
+        let Some(target) = resolve_reexport_target(donor, donors, e.source.value.as_str()) else {
+            continue;
+        };
+        if let Some(out) = resolve_export::<L>(name, target, donors, cache, depth + 1, visited) {
+            return Some(out);
+        }
+    }
+
+    None
+}
+
+/// Resolve a **local binding** `local` of `donor` (a name bound *within* this
+/// module — a local declaration or an import) to its leaf. Unlike [`resolve_export`],
+/// a local name is NOT resolved through this module's export clauses or `export *`
+/// (those govern the export surface, not an internal binding); following an import
+/// lands on the target module's *export* surface, so it hands back to
+/// [`resolve_export`] there. Authoritative like its sibling: a declared-but-opaque
+/// local yields `None`, never a spurious match. Steps (C)→(D) only.
 ///
-/// `visited` memoises `(donor, name)` pairs: a densely cross-re-exporting `.d.ts`
-/// graph would otherwise re-expand shared nodes exponentially (fanout^depth). Keyed
-/// by name too so a donor legitimately reached to resolve a *different* re-exported
-/// name is not spuriously skipped. NB: donor modules are parsed by their path
-/// extension, so the type-source donor must carry a TS/`.d.ts` path or its
-/// `export type`s are dropped as JS.
+/// `visited` memoises `L\0(donor, name)` — a role distinct from the `E\0…`
+/// export-surface key so `export { set }` → local `set` isn't self-blocked.
+fn resolve_local<L: ResolveLeaf>(
+    local: &str,
+    donor: &Donor,
+    donors: &[Donor],
+    cache: &crate::ModuleCache,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) -> Option<L::Out> {
+    if depth > MAX_TYPE_REEXPORT_DEPTH {
+        return None;
+    }
+    if !visited.insert(format!("L\u{0}{}\u{0}{}", donor.path, local)) {
+        return None;
+    }
+    let program = cache.get(&donor.path)?.program();
+
+    // (C) A local declaration of `local`.
+    match L::local(program, local, &donor.path) {
+        LocalResolution::Found(out) => return Some(out),
+        LocalResolution::AliasTo(target) => {
+            return resolve_local::<L>(&target, donor, donors, cache, depth + 1, visited);
+        }
+        LocalResolution::DeclaredOpaque => return None,
+        LocalResolution::NotDeclared => {}
+    }
+
+    // (D) Not a local declaration — the only other way it's bound is an import.
+    let (source, imported) = import_binding_source(program, local)?;
+    let target = resolve_reexport_target(donor, donors, &source)?;
+    resolve_export::<L>(&imported, target, donors, cache, depth + 1, visited)
+}
+
+/// Resolve the exported value `name` of `donor` to the module + local name where it
+/// is a concrete callable — following const-aliases, imports, and re-exports across
+/// the donor graph, the indirections the direct export scan (`find_export`) can't
+/// represent because the callable lives in a *different* module (mathcat's
+/// quat-as-vec4 `const set = set$1; export { set }`, whose `set` is really
+/// `./vec4`'s `set`). A thin [`ValueLeaf`] wrapper over the unified [`resolve_export`].
+fn resolve_value_origin(
+    name: &str,
+    donor: &Donor,
+    donors: &[Donor],
+    cache: &crate::ModuleCache,
+    depth: usize,
+    visited: &mut HashSet<String>,
+) -> Option<Origin> {
+    resolve_export::<ValueLeaf>(name, donor, donors, cache, depth, visited)
+}
+
+/// Resolve an imported type alias `imported` to its `Shape`, starting at `donor` and
+/// following re-exports across the donor graph — the shape a package's public type
+/// surface actually has: types declared in one `.d.ts`, re-exported through a barrel
+/// entry (`mathcat`'s `dist/index.d.ts` does `export * from './types.js'`). A thin
+/// [`TypeLeaf`] wrapper over the unified [`resolve_export`]; it now also follows a
+/// sourceless rename clause (`type X = [..]; export { X as Y }`) via step (B), which
+/// the old bespoke type resolver did not.
+///
+/// NB: donor modules are parsed by their path extension, so the type-source donor
+/// must carry a TS/`.d.ts` path or its `export type`s are dropped as JS.
 fn resolve_type_alias_shape(
     imported: &str,
     donor: &Donor,
@@ -744,45 +1095,131 @@ fn resolve_type_alias_shape(
     depth: usize,
     visited: &mut HashSet<String>,
 ) -> Option<crate::analysis::type_shape::Shape> {
-    if depth > MAX_TYPE_REEXPORT_DEPTH {
-        return None;
-    }
-    // (donor, name) already explored on this resolution → its contribution is
-    // deterministic, so re-visiting can only re-find (propagated already) or re-fail.
-    if !visited.insert(format!("{}\u{0}{}", donor.path, imported)) {
-        return None;
-    }
-    let parsed = cache.get(&donor.path)?;
-    let program = parsed.program();
+    resolve_export::<TypeLeaf>(imported, donor, donors, cache, depth, visited)
+}
 
-    // (1) declared locally in this module.
-    if let Some(shape) = crate::analysis::type_shape::build_alias_shapes(program).get(imported) {
-        return Some(shape.clone());
-    }
+/// A local top-level value binding, as seen by the inliner: a concrete callable
+/// (`function f` / `const f = (…) => …`), or a bare identifier alias
+/// (`const set = set$1`) that must be followed to its real definition.
+enum ValueBinding<'b, 'a> {
+    Callable(Callable<'b, 'a>),
+    Alias(String),
+    /// The name IS declared locally, but not as something we can follow to a
+    /// callable (a class, an object/expression const, an uninitialised binding).
+    /// Distinct from "not declared" (`None`): a local declaration is
+    /// **authoritative** — it shadows a same-named import / `export *`, so a
+    /// resolver that hits `Opaque` must stop, never fall through to a shadowed
+    /// source (that would inline the WRONG function).
+    Opaque,
+}
 
-    // (2) `export { <local> as imported } from S` (incl. `export type { … } from S`).
-    if let Some((target, _target_program, local)) =
-        resolve_named_reexport(program, donor, donors, imported, cache)
-    {
-        if let Some(shape) = resolve_type_alias_shape(&local, target, donors, cache, depth + 1, visited) {
-            return Some(shape);
-        }
-    }
-
-    // (3) bare wildcard `export * from S` — flattens S's exports into this module.
+/// The top-level value binding for `name` in `program` (bare or exported):
+/// `function name` / `const name = <arrow|function-expr>` → `Callable`; `const
+/// name = <identifier>` → `Alias(identifier)`; a class / non-callable / no-init
+/// declaration of `name` → `Opaque`; `name` not declared here → `None`. The
+/// `Opaque` vs `None` distinction is load-bearing for shadowing correctness.
+fn local_value_binding<'b, 'a>(program: &'b Program<'a>, name: &str) -> Option<ValueBinding<'b, 'a>> {
     for stmt in &program.body {
-        let Statement::ExportAllDeclaration(e) = stmt else { continue };
-        if e.exported.is_some() {
-            continue; // `export * as ns from S` — a namespace binding, not a flat alias
+        if let Some(f) = top_level_function(stmt) {
+            if f.id.as_ref().map(|i| i.name.as_str()) == Some(name) {
+                return Some(ValueBinding::Callable(Callable::Func(f)));
+            }
         }
-        let Some(target) = resolve_reexport_target(donor, donors, e.source.value.as_str()) else {
-            continue;
+        // A class declaration (bare or exported) binds `name` — authoritative,
+        // but not inlinable → Opaque (must shadow any same-named `export *`).
+        let class_named = match stmt {
+            Statement::ClassDeclaration(c) => c.id.as_ref().map(|i| i.name.as_str()) == Some(name),
+            Statement::ExportNamedDeclaration(e) => matches!(
+                &e.declaration,
+                Some(Declaration::ClassDeclaration(c)) if c.id.as_ref().map(|i| i.name.as_str()) == Some(name)
+            ),
+            _ => false,
         };
-        if let Some(shape) = resolve_type_alias_shape(imported, target, donors, cache, depth + 1, visited) {
-            return Some(shape);
+        if class_named {
+            return Some(ValueBinding::Opaque);
+        }
+        let var = match stmt {
+            Statement::VariableDeclaration(v) => Some(v.as_ref()),
+            Statement::ExportNamedDeclaration(e) => match &e.declaration {
+                Some(Declaration::VariableDeclaration(v)) => Some(v.as_ref()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(v) = var else { continue };
+        for d in &v.declarations {
+            let BindingPattern::BindingIdentifier(id) = &d.id else { continue };
+            if id.name.as_str() != name {
+                continue;
+            }
+            // `name` is declared here — authoritative from this point, even when the
+            // initializer isn't something we can follow (→ Opaque, never `None`).
+            let Some(init) = &d.init else { return Some(ValueBinding::Opaque) };
+            if let Some(c) = callable_of_init(init) {
+                return Some(ValueBinding::Callable(c));
+            }
+            if let Expression::Identifier(idref) = init {
+                return Some(ValueBinding::Alias(idref.name.to_string()));
+            }
+            return Some(ValueBinding::Opaque);
         }
     }
+    None
+}
 
+/// `export { <local> as name }` with NO source (a sourceless rename clause over a
+/// local binding) → the local name. A sourced clause (`export { … } from S`) is a
+/// cross-module hop, handled by `resolve_named_reexport`, not here.
+fn sourceless_export_local(program: &Program, exported: &str) -> Option<String> {
+    for stmt in &program.body {
+        let Statement::ExportNamedDeclaration(e) = stmt else { continue };
+        if e.source.is_some() {
+            continue;
+        }
+        for spec in &e.specifiers {
+            if spec.exported.name().as_str() == exported {
+                return Some(spec.local.name().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// `export default <ident>` → the identifier's name — a default export that is an
+/// indirection to a local binding (`export default bar` where `bar` is itself
+/// `import bar from S` or `import { g as bar } from S`). Only the bare-identifier
+/// form is returned; `export default function/arrow/class/<expr>` are direct forms
+/// (handled by `find_export` / `default_callable`, never an alias target), so they
+/// yield `None` here and let the caller fall through.
+fn export_default_ident(program: &Program) -> Option<String> {
+    for stmt in &program.body {
+        let Statement::ExportDefaultDeclaration(e) = stmt else { continue };
+        if let ExportDefaultDeclarationKind::Identifier(id) = &e.declaration {
+            return Some(id.name.to_string());
+        }
+    }
+    None
+}
+
+/// `import { <imported> as name } from S` / `import name from S` (default) → the
+/// import source specifier + the name to resolve in it (`"default"` for a default
+/// import). The module the binding actually comes from.
+fn import_binding_source(program: &Program, name: &str) -> Option<(String, String)> {
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(imp) = stmt else { continue };
+        let Some(specs) = &imp.specifiers else { continue };
+        for s in specs {
+            match s {
+                ImportDeclarationSpecifier::ImportSpecifier(named) if named.local.name.as_str() == name => {
+                    return Some((imp.source.value.to_string(), named.imported.name().to_string()));
+                }
+                ImportDeclarationSpecifier::ImportDefaultSpecifier(def) if def.local.name.as_str() == name => {
+                    return Some((imp.source.value.to_string(), "default".to_string()));
+                }
+                _ => {}
+            }
+        }
+    }
     None
 }
 
@@ -1726,6 +2163,140 @@ fn remove_unused_imports<'a>(
     program.body = kept;
 }
 
+/// The specifiers the donor BFS should follow *from this one module* — computed
+/// by PARSING the module (oxc), the AST-correct replacement for the plugin's
+/// brittle donor-edge regexes (`reexportedImportSources` / `EXPORT_FROM` /
+/// `NS_IMPORT`). Given a module's source + its source type, returns every
+/// specifier `S` such that following `S` could surface a callable the consumer
+/// inlines. Single-file analysis only — the plugin still resolves specifiers to
+/// paths itself and drives the BFS; this just replaces "which edges to follow"
+/// with a parse instead of a regex, killing the minified / multi-declarator / ASI
+/// brittleness class.
+///
+/// The returned set is a SUPERSET-or-equal of what the three regexes find on
+/// well-formed code (never a regression) PLUS the shapes they miss. A missed edge
+/// is safe (the call stays a live cross-module call → correct but unoptimized), so
+/// over-inclusion is fine; but a plain import whose binding is NOT re-exported is
+/// intentionally NOT returned (matching `reexportedImportSources`' intent — don't
+/// pull unrelated submodules the core only forwards as deps, never inlines into).
+///
+/// The three edge categories (dedup, order-stable — first-seen order):
+///   1. every re-export source: `export … from S`, `export * from S`,
+///      `export * as ns from S` — a re-export edge, always followed.
+///   2. every `import * as ns from S` whose `ns` is re-exported via a sourceless
+///      `export { ns }` clause (the namespace-barrel shape) — `S` holds the members.
+///   3. every import source `S` where an imported binding feeds a **re-exported**
+///      binding: directly (`import { f } from S; export { f }`) or via a const-alias
+///      (`import { f as f$1 } from S; const f = f$1; export { f }`), including through
+///      an `export { local as exported }` rename. `S` defines the real callable.
+///
+/// Reuses the same AST binding helpers the cross-module resolver uses
+/// ([`sourceless_export_local`], [`import_binding_source`], [`local_value_binding`]
+/// / [`ValueBinding::Alias`]) — the whole point is the same AST-correct
+/// understanding, no forked binding logic.
+pub fn donor_edges(code: &str, source_type: SourceType) -> Vec<String> {
+    let allocator = Allocator::default();
+    let program = parse_program(&allocator, code, source_type);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let push = |s: &str, out: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if seen.insert(s.to_string()) {
+            out.push(s.to_string());
+        }
+    };
+
+    for stmt in &program.body {
+        match stmt {
+            // (1a) `export … from S` and `export type { … } from S` — a sourced
+            // named/flat re-export edge.
+            Statement::ExportNamedDeclaration(e) => {
+                if let Some(source) = &e.source {
+                    push(source.value.as_str(), &mut out, &mut seen);
+                }
+            }
+            // (1b) `export * from S` and (1c) `export * as ns from S` — both carry
+            // their own source; follow it either way.
+            Statement::ExportAllDeclaration(e) => {
+                push(e.source.value.as_str(), &mut out, &mut seen);
+            }
+            _ => {}
+        }
+    }
+
+    // (2) `import * as ns from S; export { ns }` — a re-exported namespace barrel.
+    // For each namespace import, follow its source only when the namespace local is
+    // surfaced by a sourceless export clause (its members live in `S`).
+    for stmt in &program.body {
+        let Statement::ImportDeclaration(imp) = stmt else { continue };
+        let Some(specs) = &imp.specifiers else { continue };
+        for s in specs {
+            let ImportDeclarationSpecifier::ImportNamespaceSpecifier(n) = s else { continue };
+            if is_reexported_local(&program, n.local.name.as_str()) {
+                push(imp.source.value.as_str(), &mut out, &mut seen);
+            }
+        }
+    }
+
+    // (3) An imported binding re-surfaced under an exported name — directly or via a
+    // const-alias — makes its real definition live in the import source `S`. Walk
+    // every sourceless export clause's LOCAL name, resolve it one hop (import, or
+    // const-alias → import), and follow that import's source.
+    for stmt in &program.body {
+        let Statement::ExportNamedDeclaration(e) = stmt else { continue };
+        if e.source.is_some() {
+            continue; // sourced clause already covered by (1a)
+        }
+        for spec in &e.specifiers {
+            let local = spec.local.name();
+            if let Some(source) = reexported_import_source(&program, local.as_str()) {
+                push(&source, &mut out, &mut seen);
+            }
+        }
+    }
+
+    out
+}
+
+/// Whether `name` is surfaced by a sourceless `export { name }` / `export { name as
+/// x }` clause of `program` — the namespace-barrel gate for [`donor_edges`] step (2),
+/// reusing the same clause scan as [`sourceless_export_local`] (the export-side lookup).
+fn is_reexported_local(program: &Program, name: &str) -> bool {
+    for stmt in &program.body {
+        let Statement::ExportNamedDeclaration(e) = stmt else { continue };
+        if e.source.is_some() {
+            continue;
+        }
+        for spec in &e.specifiers {
+            if spec.local.name().as_str() == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// If the sourceless-exported local `local` ultimately binds to an *imported*
+/// binding — directly (`import { f } from S`) or one const-alias hop away (`const f
+/// = f$1; import { f as f$1 } from S`) — the import source `S`. `None` when `local`
+/// is a module-local definition (not re-surfacing an import → don't follow). Reuses
+/// [`import_binding_source`] and [`local_value_binding`]/[`ValueBinding::Alias`], the
+/// same binding helpers the resolver walks with.
+fn reexported_import_source(program: &Program, local: &str) -> Option<String> {
+    // Direct: the exported local is itself an imported binding.
+    if let Some((source, _imported)) = import_binding_source(program, local) {
+        return Some(source);
+    }
+    // One const-alias hop: `const f = f$1` where `f$1` is imported (the mathcat
+    // quat-as-vec4 shape). Follow the alias target to its import source.
+    if let Some(ValueBinding::Alias(target)) = local_value_binding(program, local) {
+        if let Some((source, _imported)) = import_binding_source(program, &target) {
+            return Some(source);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1875,6 +2446,82 @@ mod tests {
     }
 
     #[test]
+    fn type_path_local_export_shadows_wildcard_no_miscompile() {
+        // Type-side analogue of the value shadowing bug. The barrel EXPLICITLY exports a
+        // local `type X` that is NOT scalarizable (a function type), and ALSO does
+        // `export * from './other'` where `./other` has a tuple `X`. TS binding rules: the
+        // explicit local `export type X` SHADOWS the star re-export, so the consumer's `X`
+        // is the function type — SROA must NOT fire. If `resolve_type_alias_shape` falls
+        // through the (unscalarizable-but-authoritative) local type to the wildcard's tuple
+        // `X`, it destructures a value the real type says is not a tuple → miscompile.
+        let consumer = r#"import { X } from "./barrel";
+/* @sroa */ export function f(): number { const v: X = mk(); v[0] = v[1]; return v[0]; }"#;
+        let donors = vec![
+            barrel_donor(
+                "./barrel",
+                "/p/barrel.d.ts",
+                "export type X = (n: number) => number;\nexport * from './other.js';",
+                &[("./other.js", "/p/other.d.ts")],
+            ),
+            barrel_donor(
+                "./other.js",
+                "/p/other.d.ts",
+                "export type X = [number, number];",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(
+            out.contains("v[1]") && !out.contains("v_0"),
+            "must NOT scalarize: the local `export type X` (function) shadows the wildcard tuple `X`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn type_path_named_reexport_shadows_wildcard_no_miscompile() {
+        // Step-(2) authoritative path: an explicit `export { X } from './a'` (a's `X` is a
+        // non-scalarizable function type) shadows a same-named `export * from './b'` (b's
+        // `X` is a tuple). The named re-export is what `X` resolves to, so its
+        // non-scalarizable result must STOP resolution, not fall through to b's tuple.
+        let consumer = r#"import { X } from "./barrel";
+/* @sroa */ export function f(): number { const v: X = mk(); v[0] = v[1]; return v[0]; }"#;
+        let donors = vec![
+            barrel_donor(
+                "./barrel",
+                "/p/barrel.d.ts",
+                "export { X } from './a.js';\nexport * from './b.js';",
+                &[("./a.js", "/p/a.d.ts"), ("./b.js", "/p/b.d.ts")],
+            ),
+            barrel_donor("./a.js", "/p/a.d.ts", "export type X = (n: number) => number;", &[]),
+            barrel_donor("./b.js", "/p/b.d.ts", "export type X = [number, number];", &[]),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(
+            out.contains("v[1]") && !out.contains("v_0"),
+            "must NOT scalarize: the explicit `export {{ X }} from './a'` shadows the wildcard tuple `X`:\n{out}"
+        );
+    }
+
+    #[test]
+    fn resolves_imported_type_through_sourceless_rename_clause() {
+        // Bonus of the unified walker: a donor declares a local tuple type and
+        // re-exports it under a different name via a SOURCELESS clause
+        // (`type X = [..]; export { X as Y }`), consumed as `import { Y }`. Step (B)
+        // of the precedence walk (which the old bespoke type resolver did NOT do →
+        // this was a missed SROA optimization) maps the exported `Y` to the local
+        // `X`, recovering the tuple arity (2) so type-aware SROA fires.
+        let consumer = r#"import { Vec2 } from "./math";
+/* @sroa */ export function f(): number { const v: Vec2 = mk(); return v[0] + v[1]; }"#;
+        let donor = "type Pair = [number, number];\nexport { Pair as Vec2 };";
+        let out = run(consumer, &[("./math", donor)]);
+        assert!(
+            out.contains("v_0") && out.contains("v_1"),
+            "SROA fired via the sourceless-rename type re-export:\n{out}"
+        );
+        assert!(!out.contains("v[1]"), "indexing rewritten to scalars:\n{out}");
+    }
+
+    #[test]
     fn dense_reexport_graph_does_not_blow_up() {
         // A fully-connected wildcard re-export graph with NO matching type forces a
         // full traversal. Without the `(donor, name)` visited memo this re-expands
@@ -1975,6 +2622,298 @@ mod tests {
         let out = run(consumer, &[("./m", donor)]);
         assert!(!out.contains("vec3.add"), "namespace member inlined into @optimize host:\n{out}");
         assert!(out.contains("x + 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_flatten_inlines_const_alias_of_imported_fn() {
+        // mathcat's quat-as-vec4 shape: quat re-uses vec4's componentwise ops by
+        // importing them and re-BINDING as `const set = set$1; export { set }` (quat is
+        // a vec4 under the hood). A `@optimize`/`@flatten` host calling that export
+        // should inline the underlying vec4 `set` — today it does NOT, because
+        // `callable_of_init` only accepts an arrow/function-expression initializer, not
+        // an identifier aliasing an imported callable. The surviving call then pins the
+        // scratch buffer as a module array (breaks SROA localisation). This is the
+        // value-side analogue of the type re-export following.
+        let consumer = r#"import { set } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1, 2, 3, 4); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                "import { set as set$1 } from './vec4.js';\nconst set = set$1;\nexport { set };",
+                &[("./vec4.js", "/p/vec4.ts")],
+            ),
+            barrel_donor(
+                "./vec4.js",
+                "/p/vec4.ts",
+                "export function set(out, x, y, z, w) { out[0] = x; out[1] = y; out[2] = z; out[3] = w; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("set("), "vec4-backed `const set = set$1` export should inline:\n{out}");
+        assert!(out.contains("o[0] = 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_rebound_import_forwards_origin_module_deps() {
+        // A re-bound import whose real callable references a module const of its
+        // OWN (origin) module. The dep must be copied/forwarded from the origin
+        // module (vec4), not the re-binding module (quat) — proves the value
+        // resolver registers against the origin donor so `pull_donor_deps` rebases
+        // correctly. Behavioral: SCALE must fold in, not vanish or resolve wrong.
+        let consumer = r#"import { scaleX } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return scaleX(o, 5); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                "import { scaleX as scaleX$1 } from './vec4.js';\nconst scaleX = scaleX$1;\nexport { scaleX };",
+                &[("./vec4.js", "/p/vec4.ts")],
+            ),
+            barrel_donor(
+                "./vec4.js",
+                "/p/vec4.ts",
+                "const SCALE = 3;\nexport function scaleX(out, x) { out[0] = x * SCALE; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("scaleX("), "re-bound import should inline:\n{out}");
+        //5 * SCALE(3) folds to 15 — proves vec4's `SCALE` const was forwarded from
+        // the ORIGIN module and folded, not dropped or resolved against the wrong module.
+        assert!(out.contains("o[0] = 15"), "origin dep forwarded + folded:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_rebound_import_via_namespace_member() {
+        // The namespace-member fallback: `import * as quat; quat.set(...)` where
+        // quat's `set` is a re-bound vec4 import. Exercises the path-(2) fallback
+        // (distinct from the named-import path-(1) fallback above).
+        let consumer = r#"import * as quat from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return quat.set(o, 9); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                "import { set as set$1 } from './vec4.js';\nconst set = set$1;\nexport { set };",
+                &[("./vec4.js", "/p/vec4.ts")],
+            ),
+            barrel_donor(
+                "./vec4.js",
+                "/p/vec4.ts",
+                "export function set(out, x) { out[0] = x; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("quat.set"), "re-bound namespace member should inline:\n{out}");
+        assert!(out.contains("o[0] = 9"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_flatten_inlines_default_reexport_of_imported_callable() {
+        // The default-indirection analogue of the quat-as-vec4 value re-bind: a
+        // `@optimize` host calls a DEFAULT-imported binding whose donor re-exports
+        // an *imported* callable as its default (`import bar from "./n"; export
+        // default bar;`). `find_export`/`default_callable` return None (the default
+        // is an import, not a local callable), so the named-import `@flatten`
+        // fallback runs — `resolve_value_origin("default", …)` must now follow the
+        // new `export default <ident>` step to `./n`'s real callable and inline it.
+        // Before this fix the call was left un-inlined.
+        let consumer = r#"import foo from "./m";
+/* @optimize */ export function host(x: number): number { return foo(x, 1); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./m",
+                "/p/m.ts",
+                "import bar from './n.js';\nexport default bar;",
+                &[("./n.js", "/p/n.ts")],
+            ),
+            barrel_donor(
+                "./n.js",
+                "/p/n.ts",
+                "function add(a, b) { return a + b; }\nexport default add;",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("foo("), "default re-export of imported callable should inline:\n{out}");
+        assert!(out.contains("x + 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_flatten_inlines_default_reexport_of_named_import() {
+        // Same default-indirection, but the intermediary re-exports a *named*
+        // import (`import { g as bar } from S; export default bar;`) — the second
+        // shape called out in the task. Resolves through step (A′) then the named
+        // import binding to `./n`'s `g`.
+        let consumer = r#"import foo from "./m";
+/* @optimize */ export function host(x: number): number { return foo(x, 1); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./m",
+                "/p/m.ts",
+                "import { g as bar } from './n.js';\nexport default bar;",
+                &[("./n.js", "/p/n.ts")],
+            ),
+            barrel_donor(
+                "./n.js",
+                "/p/n.ts",
+                "export function g(a, b) { return a + b; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("foo("), "default re-export of named import should inline:\n{out}");
+        assert!(out.contains("x + 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_flatten_direct_default_function_still_inlines() {
+        // Regression guard for the `find_export`/`default_callable` DIRECT path: a
+        // plain `export default function` consumed by a `@optimize` host still
+        // inlines and never reaches the new `export default <ident>` step (there is
+        // no indirection to follow).
+        let consumer = r#"import foo from "./m";
+/* @optimize */ export function host(x: number): number { return foo(x, 1); }"#;
+        let donor = "export default function add(a, b) { return a + b; }";
+        let out = run(consumer, &[("./m", donor)]);
+        assert!(!out.contains("foo("), "direct default fn still inlines:\n{out}");
+        assert!(out.contains("x + 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_flatten_default_reexport_clause_still_resolves() {
+        // `export { g as default } from S` — a sourced default re-export clause.
+        // This resolves via step (A) (`resolve_named_reexport` matches the exported
+        // name `default`) / sourceless clause handling, NOT the new step (A′); this
+        // confirms the pre-existing path is unaffected.
+        let consumer = r#"import foo from "./m";
+/* @optimize */ export function host(x: number): number { return foo(x, 1); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./m",
+                "/p/m.ts",
+                "export { g as default } from './n.js';",
+                &[("./n.js", "/p/n.ts")],
+            ),
+            barrel_donor(
+                "./n.js",
+                "/p/n.ts",
+                "export function g(a, b) { return a + b; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("foo("), "default re-export clause should inline:\n{out}");
+        assert!(out.contains("x + 1"), "body spliced:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_inline_with_sourcemap_has_no_out_of_range_spans() {
+        // Cross-file inlining splices donor AST — whose spans index the DONOR source —
+        // into the consumer. With a sourcemap enabled, codegen maps every node's span
+        // against the CONSUMER source; a donor span past the consumer's length is out of
+        // range (oxc `debug_assert`s in `add_source_mapping_for_name`, and emits a wrong
+        // mapping in release). A *named* donor node must survive inlining to hit the
+        // named-mapping assert: here the inlined `add` body calls a copied helper
+        // `padHelper`, whose reference sits (in donor coordinates) well past the short
+        // consumer's length. Must produce a sourcemap without panicking.
+        let consumer = r#"import { add } from "./m";
+/* @optimize */ export function h(x: number): number { return add(x, 1); }"#;
+        let donor = "export function add(a, b) { /* padding padding padding padding padding padding padding padding padding to push the Math reference past the consumer length */ return a + b + Math.floor(a); }";
+        let mut o = opts();
+        o.sourcemap = true;
+        let donors = vec![barrel_donor("./m", "/p/m.js", donor, &[])];
+        let out = transform_cross_file(consumer, &donors, &o, &mut crate::ModuleCache::new());
+        assert!(!out.code.contains("add("), "call inlined:\n{}", out.code);
+        // `Math` is a non-inlinable global identifier — it survives inlining as a named
+        // node carrying a donor span (past the consumer length).
+        assert!(out.code.contains("Math.floor"), "global survived as a named node:\n{}", out.code);
+        assert!(out.map.is_some(), "sourcemap produced:\n{}", out.code);
+    }
+
+    // ── Shadowing soundness: a local/import binding shadows `export *`; the resolver
+    //    must NOT fall through to a different same-named wildcard callable when it
+    //    can't follow the (authoritative) local/import binding to a callable. ──
+
+    #[test]
+    fn cross_file_opaque_local_shadows_wildcard_no_miscompile() {
+        // `const set` is a real callable at runtime (a bound method) but not one we can
+        // follow; it SHADOWS the `export *`'d `set`. Inlining the wildcard's `set` would
+        // be a miscompile. Must preserve the call.
+        let consumer = r#"import { set } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1, 2, 3, 4); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                "const set = console.log.bind(console);\nexport * from './other.js';\nexport { set };",
+                &[("./other.js", "/p/other.ts")],
+            ),
+            barrel_donor(
+                "./other.js",
+                "/p/other.ts",
+                "export function set(out, x, y, z, w) { out[99] = 12345; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("12345"), "must NOT inline the shadowed wildcard `set`:\n{out}");
+        assert!(out.contains("set("), "the local `set` call must be preserved:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_unfollowable_import_shadows_wildcard_no_miscompile() {
+        // `set` is imported from a module not in the donor set (out of scope / unresolved).
+        // That import — not the `export *`'d `set` — is what `set` binds to at runtime.
+        // Unable to follow it, the resolver must stop, NOT inline the wildcard's `set`.
+        let consumer = r#"import { set } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1, 2, 3, 4); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                // `./missing.js` is deliberately NOT a donor (no resolved edge to it).
+                "import { set } from './missing.js';\nexport * from './other.js';\nexport { set };",
+                &[("./other.js", "/p/other.ts")],
+            ),
+            barrel_donor(
+                "./other.js",
+                "/p/other.ts",
+                "export function set(out, x, y, z, w) { out[99] = 12345; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("12345"), "must NOT inline the shadowed wildcard `set`:\n{out}");
+        assert!(out.contains("set("), "the imported `set` call must be preserved:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_class_local_shadows_wildcard_no_miscompile() {
+        // A local class named `set` shadows the wildcard's function `set`. (Calling a
+        // class as a function throws at runtime, but the optimizer must not silently
+        // swap in an unrelated function body.)
+        let consumer = r#"import { set } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1, 2, 3, 4); }"#;
+        let donors = vec![
+            barrel_donor(
+                "./quat",
+                "/p/quat.ts",
+                "class set {}\nexport * from './other.js';\nexport { set };",
+                &[("./other.js", "/p/other.ts")],
+            ),
+            barrel_donor(
+                "./other.js",
+                "/p/other.ts",
+                "export function set(out, x, y, z, w) { out[99] = 12345; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &donors, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("12345"), "must NOT inline the shadowed wildcard `set`:\n{out}");
     }
 
     #[test]
@@ -2443,5 +3382,83 @@ export function useHelper() { return helper(0); }"#;
         assert_eq!(rebase_specifier("./util", "/proj/m.ts", "/proj/e.ts"), "./util");
         // parent traversal in the donor spec
         assert_eq!(rebase_specifier("../core/x", "/proj/lib/m.ts", "/proj/lib/e.ts"), "../core/x");
+    }
+
+    // ── donor_edges: the AST donor-edge finder replacing the plugin's regexes ──
+
+    fn edges(code: &str) -> Vec<String> {
+        donor_edges(code, SourceType::ts())
+    }
+
+    #[test]
+    fn donor_edges_sourced_reexports() {
+        // (1) `export … from S`, `export * from S`, `export * as ns from S` — all
+        // carry a source and are always followed.
+        assert_eq!(edges("export { a } from './x';"), vec!["./x"]);
+        assert_eq!(edges("export * from './y';"), vec!["./y"]);
+        assert_eq!(edges("export * as ns from './z';"), vec!["./z"]);
+        assert_eq!(edges("export type { T } from './t';"), vec!["./t"]);
+    }
+
+    #[test]
+    fn donor_edges_namespace_barrel() {
+        // (2) `import * as ns from S; export { ns }` — the re-exported namespace
+        // object shape (mathcat/gl-matrix barrel). Follow S; its members live there.
+        let code = "import * as vec3 from './vec3.js';\nexport { vec3 };";
+        assert_eq!(edges(code), vec!["./vec3.js"]);
+        // A namespace import that is NOT re-exported is not followed.
+        assert!(edges("import * as vec3 from './vec3.js';\nconsole.log(vec3);").is_empty());
+    }
+
+    #[test]
+    fn donor_edges_rebind_shape() {
+        // (3) the mathcat quat-as-vec4 value re-bind: an imported binding aliased
+        // through a const and re-exported under its own name → follow the import
+        // source (the module that defines the real callable).
+        let code = "import { set as set$1 } from './v.js';\nconst set = set$1;\nexport { set };";
+        assert_eq!(edges(code), vec!["./v.js"]);
+        // Direct re-surface (no alias hop): `import { f } from S; export { f }`.
+        assert_eq!(edges("import { f } from './f.js';\nexport { f };"), vec!["./f.js"]);
+        // Through an `export { local as exported }` rename.
+        assert_eq!(
+            edges("import { f as f$1 } from './f.js';\nconst f = f$1;\nexport { f as g };"),
+            vec!["./f.js"]
+        );
+    }
+
+    #[test]
+    fn donor_edges_minified_and_asi() {
+        // Minified, no spaces (`import{set as set$1}from"./v.js"`) — the OLD
+        // IMPORT_CLAUSE regex (`import\s+{`) misses this; the AST does not.
+        let code = "import{set as set$1}from\"./v.js\";const set=set$1;export{set}";
+        assert_eq!(edges(code), vec!["./v.js"]);
+        // Multi-declarator const-alias: `const a=a$1,b=b$1;` (CONST_ALIAS regex
+        // only matched a single declarator). Both aliases resolve.
+        let multi = "import{a as a$1,b as b$1}from\"./ab.js\";const a=a$1,b=b$1;export{a,b}";
+        assert_eq!(edges(multi), vec!["./ab.js"]);
+        // ASI — no trailing `;` on the export clause.
+        let asi = "import { f as f$1 } from './f.js'\nconst f = f$1\nexport { f }";
+        assert_eq!(edges(asi), vec!["./f.js"]);
+    }
+
+    #[test]
+    fn donor_edges_negative_plain_import_not_followed() {
+        // A plain import whose binding is NOT re-exported must NOT be returned:
+        // the core only forwards it as a dep, never inlines into it, so pulling
+        // its source would read an unrelated submodule (regressing the intent of
+        // the old `reexportedImportSources`).
+        let code = "import { helper } from './internal.js';\nexport function f(x) { return helper(x); }";
+        assert!(edges(code).is_empty(), "plain non-re-exported import not followed: {:?}", edges(code));
+        // A module-local binding re-exported over its own definition is not an
+        // import re-surface → no edge either.
+        assert!(edges("const k = 1;\nexport { k };").is_empty());
+    }
+
+    #[test]
+    fn donor_edges_dedup_and_order_stable() {
+        // Dedup + first-seen order: two clauses over the same source collapse to
+        // one entry; distinct sources keep source order.
+        let code = "export { a } from './x';\nexport * from './y';\nexport { b } from './x';";
+        assert_eq!(edges(code), vec!["./x", "./y"]);
     }
 }

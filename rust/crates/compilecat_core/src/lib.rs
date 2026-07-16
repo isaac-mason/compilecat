@@ -10,16 +10,20 @@ mod module_cache;
 mod options;
 mod passes;
 
-pub use cross_file::{transform_cross_file, Donor};
+pub use cross_file::{donor_edges, transform_cross_file, Donor};
 pub use module_cache::ModuleCache;
 
 pub use options::{Mode, Stats, TransformOptions, TransformOutput};
+
+/// Re-exported so hosts (napi/wasm) can derive a donor's source type from its path
+/// (`SourceType::from_path`) before calling [`donor_edges`], without depending on
+/// `oxc_span` directly.
+pub use oxc_span::SourceType;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::Program;
 use oxc_codegen::{Codegen, CodegenOptions, CodegenReturn};
 use oxc_parser::{ParseOptions, Parser};
-use oxc_span::SourceType;
 
 /// Parse with `preserve_parens: false` so the oxc AST has no
 /// `ParenthesizedExpression` nodes — the passes assume a paren-free AST.

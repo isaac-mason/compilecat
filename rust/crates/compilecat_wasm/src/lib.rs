@@ -19,8 +19,9 @@
 use std::cell::RefCell;
 
 use compilecat_core::{
-    format as core_format, run_pass as core_run_pass, transform, transform_cross_file, Donor, Mode,
-    ModuleCache, Stats, TransformOptions, TransformOutput,
+    donor_edges as core_donor_edges, format as core_format, run_pass as core_run_pass, transform,
+    transform_cross_file, Donor, Mode, ModuleCache, SourceType, Stats, TransformOptions,
+    TransformOutput,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -126,6 +127,17 @@ fn result_value(out: TransformOutput) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn format(id: String, code: String) -> String {
     core_format(&code, &id)
+}
+
+/// The specifiers the donor BFS should follow from ONE module — the AST-based
+/// replacement for the plugin's donor-edge regexes. Mirrors `donorEdges` in the
+/// napi crate: `id` (the donor's path) picks the source type, and the return is a
+/// dedup'd, order-stable list of specifiers to read as further donors (see
+/// [`compilecat_core::donor_edges`]).
+#[wasm_bindgen(js_name = donorEdges)]
+pub fn donor_edges(id: String, code: String) -> Vec<String> {
+    let source_type = SourceType::from_path(&id).unwrap_or_default();
+    core_donor_edges(&code, source_type)
 }
 
 /// Run a single named pass in isolation (per-pass differential harness). Returns

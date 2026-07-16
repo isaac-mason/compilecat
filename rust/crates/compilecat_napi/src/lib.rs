@@ -11,8 +11,8 @@
 use std::cell::RefCell;
 
 use compilecat_core::{
-    format as core_format, transform, transform_cross_file, Donor, Mode, ModuleCache, Stats,
-    TransformOptions, TransformOutput,
+    donor_edges as core_donor_edges, format as core_format, transform, transform_cross_file, Donor,
+    Mode, ModuleCache, SourceType, Stats, TransformOptions, TransformOutput,
 };
 use napi_derive::napi;
 
@@ -43,6 +43,18 @@ pub struct DonorModule {
 #[napi]
 pub fn format(id: String, code: String) -> String {
     core_format(&code, &id)
+}
+
+/// The specifiers the donor BFS should follow from ONE module — the AST-based
+/// replacement for the plugin's brittle donor-edge regexes. `id` is the donor's
+/// path, used only to pick the source type (so `.d.ts`/`.tsx`/`.js` parse
+/// correctly); the return is a dedup'd, order-stable list of import/re-export
+/// specifiers `S` the plugin should read as further donors (see
+/// [`compilecat_core::donor_edges`]).
+#[napi]
+pub fn donor_edges(id: String, code: String) -> Vec<String> {
+    let source_type = SourceType::from_path(&id).unwrap_or_default();
+    core_donor_edges(&code, source_type)
 }
 
 #[napi(object)]

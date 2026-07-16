@@ -318,6 +318,27 @@ pub(crate) fn build_type_map(program: &Program) -> HashMap<String, ResolvedType>
     out
 }
 
+/// Whether `name` is declared at top level as a type alias or interface (bare or
+/// exported) in this program — regardless of whether it resolves to a scalarizable
+/// `Shape`. The cross-file resolver needs this to tell "declared here but not a
+/// scalarizable shape" (authoritative — shadows a same-named re-export/`export *`)
+/// from "not declared here" (keep following the re-export graph). Mirrors the
+/// declaration collection in `build_type_map`.
+pub(crate) fn declares_type(program: &Program, name: &str) -> bool {
+    program.body.iter().any(|stmt| match stmt {
+        Statement::TSTypeAliasDeclaration(a) => a.id.name.as_str() == name,
+        Statement::TSInterfaceDeclaration(i) => i.id.name.as_str() == name,
+        Statement::ExportNamedDeclaration(e) => matches!(
+            &e.declaration,
+            Some(Declaration::TSTypeAliasDeclaration(a)) if a.id.name.as_str() == name
+        ) || matches!(
+            &e.declaration,
+            Some(Declaration::TSInterfaceDeclaration(i)) if i.id.name.as_str() == name
+        ),
+        _ => false,
+    })
+}
+
 /// Top-level `type X`/`interface X` → `Shape`, for the cross-file driver to
 /// resolve an *imported* type's shape from a donor program. Thin projection over
 /// the resolver's declaration phase.

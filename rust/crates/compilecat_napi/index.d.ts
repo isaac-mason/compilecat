@@ -53,6 +53,16 @@ export interface CompileStats {
   stripped: number
 }
 
+/**
+ * The specifiers the donor BFS should follow from ONE module — the AST-based
+ * replacement for the plugin's brittle donor-edge regexes. `id` is the donor's
+ * path, used only to pick the source type (so `.d.ts`/`.tsx`/`.js` parse
+ * correctly); the return is a dedup'd, order-stable list of import/re-export
+ * specifiers `S` the plugin should read as further donors (see
+ * [`compilecat_core::donor_edges`]).
+ */
+export declare function donorEdges(id: string, code: string): Array<string>
+
 export interface DonorModule {
   specifier: string
   /**
