@@ -326,6 +326,10 @@ pub(crate) fn flatten_into_hosts<'a>(
     if flatten_spans.is_empty() || (direct.is_empty() && block.is_empty()) {
         return 0;
     }
+    // Candidate declaration spans (shadowed-callee gate), computed once from the
+    // live program before the mutable host walk.
+    let cand_names: HashSet<String> = direct.keys().chain(block.keys()).cloned().collect();
+    let cand_spans = Rc::new(candidate_decl_spans(program, &cand_names));
     let mut count = 0;
     for stmt in program.body.iter_mut() {
         if !flatten_spans.contains(&stmt.span().start) {
@@ -336,8 +340,16 @@ pub(crate) fn flatten_into_hosts<'a>(
         // we splice into binds that name. A program-wide set spuriously bails an
         // inline whenever any unrelated function (or dependency module) happens to use
         // the same name as a param/local.
-        let local_names = match top_level_function(stmt) {
-            Some(f) => Rc::new(host_bound_names(f)),
+        let (local_names, host_scope) = match top_level_function(stmt) {
+            // `local_names` = the host capture guard (all host-bound names, deep).
+            // `host_scope` = the host's OWN function-scope names (params + body
+            // top-level), the seed for the shadowed-callee stack when we enter via
+            // `visit_function_body` (nested scopes are pushed as the walk descends,
+            // so a deep-nested sibling binding does NOT over-suppress).
+            Some(f) => (
+                Rc::new(host_bound_names(f)),
+                ShadowStack::function_scope_shadow_names(&f.params, f.body.as_deref(), &cand_spans),
+            ),
             None => continue,
         };
         let body = match stmt {
@@ -368,6 +380,9 @@ pub(crate) fn flatten_into_hosts<'a>(
                 local_names: local_names.clone(),
                 no_hoist: false,
                 passed_effect: false,
+                shadow: ShadowStack::seeded(host_scope.clone()),
+                in_function: true,
+                candidate_spans: cand_spans.clone(),
             };
             di.visit_function_body(body);
             count += di.count;
@@ -382,6 +397,9 @@ pub(crate) fn flatten_into_hosts<'a>(
                 trigger: None,
                 merged_scope: (*local_names).clone(),
                 local_names: local_names.clone(),
+                shadow: ShadowStack::seeded(host_scope.clone()),
+                in_function: true,
+                candidate_spans: cand_spans.clone(),
             };
             bi.visit_function_body(body);
             count += bi.count;
@@ -404,6 +422,9 @@ pub(crate) fn flatten_into_hosts<'a>(
                     local_names: local_names.clone(),
                     no_hoist: false,
                     passed_effect: false,
+                    shadow: ShadowStack::seeded(host_scope.clone()),
+                    in_function: true,
+                    candidate_spans: cand_spans.clone(),
                 };
                 di.visit_function_body(body);
                 count += di.count;
@@ -485,6 +506,8 @@ pub(crate) fn inline_callsites<'a>(
         return 0;
     }
     let local_names = Rc::new(collect_local_names(program));
+    let cand_names: HashSet<String> = direct.keys().chain(block.keys()).cloned().collect();
+    let cand_spans = Rc::new(candidate_decl_spans(program, &cand_names));
     let mut count = 0;
     if !direct.is_empty() {
         let mut di = Inliner {
@@ -497,6 +520,9 @@ pub(crate) fn inline_callsites<'a>(
             local_names: local_names.clone(),
             no_hoist: false,
             passed_effect: false,
+            shadow: ShadowStack::default(),
+            in_function: false,
+            candidate_spans: cand_spans.clone(),
         };
         di.visit_program(program);
         count += di.count;
@@ -511,6 +537,9 @@ pub(crate) fn inline_callsites<'a>(
             trigger: Some(callsite_spans.clone()),
             merged_scope: (*local_names).clone(),
             local_names: local_names.clone(),
+            shadow: ShadowStack::default(),
+            in_function: false,
+            candidate_spans: cand_spans.clone(),
         };
         bi.visit_program(program);
         count += bi.count;
@@ -609,6 +638,8 @@ pub(crate) fn inline_with<'a>(
     uid: &mut u32,
 ) -> u32 {
     let local_names = Rc::new(collect_local_names(program));
+    let cand_names: HashSet<String> = direct.keys().chain(block.keys()).cloned().collect();
+    let cand_spans = Rc::new(candidate_decl_spans(program, &cand_names));
     let mut count = 0;
     if !direct.is_empty() {
         let mut inliner = Inliner {
@@ -621,6 +652,9 @@ pub(crate) fn inline_with<'a>(
             local_names: local_names.clone(),
             no_hoist: false,
             passed_effect: false,
+            shadow: ShadowStack::default(),
+            in_function: false,
+            candidate_spans: cand_spans.clone(),
         };
         inliner.visit_program(program);
         count += inliner.count;
@@ -635,6 +669,9 @@ pub(crate) fn inline_with<'a>(
             trigger: None,
             merged_scope: (*local_names).clone(),
             local_names: local_names.clone(),
+            shadow: ShadowStack::default(),
+            in_function: false,
+            candidate_spans: cand_spans.clone(),
         };
         bi.visit_program(program);
         count += bi.count;
@@ -872,10 +909,116 @@ struct BlockInliner<'a, 'c> {
     /// child-scope inlines are seeded against each other too — sound, since
     /// minimize-exit-points may later merge them into one scope.
     merged_scope: HashSet<String>,
+    /// Enclosing-scope bound names (shadowed-callee gate); see [`ShadowStack`] and
+    /// `Inliner::shadow`.
+    shadow: ShadowStack,
+    /// True once inside ≥1 function/arrow scope (see `Inliner::in_function`).
+    in_function: bool,
+    /// Candidate declaration spans (see `Inliner::candidate_spans`).
+    candidate_spans: Rc<HashSet<u32>>,
 }
 
 impl<'a> VisitMut<'a> for BlockInliner<'a, '_> {
+    // ── shadowed-callee scope tracking (mirrors `Inliner`) ──
+    fn visit_function(&mut self, f: &mut Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        self.shadow.push(ShadowStack::function_scope_shadow_names(
+            &f.params,
+            f.body.as_deref(),
+            &self.candidate_spans,
+        ));
+        let saved = self.in_function;
+        self.in_function = true;
+        walk_mut::walk_function(self, f, flags);
+        self.in_function = saved;
+        self.shadow.pop();
+    }
+    fn visit_arrow_function_expression(&mut self, a: &mut ArrowFunctionExpression<'a>) {
+        self.shadow.push(ShadowStack::function_scope_shadow_names(
+            &a.params,
+            Some(&a.body),
+            &self.candidate_spans,
+        ));
+        let saved = self.in_function;
+        self.in_function = true;
+        walk_mut::walk_arrow_function_expression(self, a);
+        self.in_function = saved;
+        self.shadow.pop();
+    }
+    fn visit_for_statement(&mut self, s: &mut ForStatement<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let Some(ForStatementInit::VariableDeclaration(vd)) = &s.init {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
+        walk_mut::walk_for_statement(self, s);
+        if push {
+            self.shadow.pop();
+        }
+    }
+    fn visit_for_in_statement(&mut self, s: &mut ForInStatement<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let ForStatementLeft::VariableDeclaration(vd) = &s.left {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
+        walk_mut::walk_for_in_statement(self, s);
+        if push {
+            self.shadow.pop();
+        }
+    }
+    fn visit_for_of_statement(&mut self, s: &mut ForOfStatement<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let ForStatementLeft::VariableDeclaration(vd) = &s.left {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
+        walk_mut::walk_for_of_statement(self, s);
+        if push {
+            self.shadow.pop();
+        }
+    }
+    fn visit_catch_clause(&mut self, c: &mut CatchClause<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut names = HashSet::new();
+            if let Some(param) = &c.param {
+                collect_binding_names(&param.pattern, &mut names);
+            }
+            self.shadow.push(names);
+        }
+        walk_mut::walk_catch_clause(self, c);
+        if push {
+            self.shadow.pop();
+        }
+    }
+
     fn visit_statements(&mut self, stmts: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
+        // Push THIS block's own block-scoped names so calls in this list (and its
+        // nested walk) see them as enclosing — but only inside a function (a
+        // MODULE-level list holds the candidates themselves + top-level locals,
+        // which must never be treated as shadowing). The function/loop/catch scopes
+        // above are pushed by their own visitors; the outermost function-body list
+        // is the function scope (already pushed by `visit_function`), so pushing its
+        // block-scoped names again is a harmless duplicate. Popped after processing.
+        let push = self.in_function;
+        if push {
+            self.shadow.push(ShadowStack::block_scope_shadow_names(stmts, &self.candidate_spans));
+        }
         walk_mut::walk_statements(self, stmts);
 
         let ast = AstBuilder::new(self.allocator);
@@ -905,6 +1048,9 @@ impl<'a> VisitMut<'a> for BlockInliner<'a, '_> {
             }
         }
         *stmts = out;
+        if push {
+            self.shadow.pop();
+        }
     }
 }
 
@@ -1042,6 +1188,11 @@ impl<'a> BlockInliner<'a, '_> {
         if !triggered(&self.trigger, call) {
             return None;
         }
+        // Shadowed-callee gate: the callee name is bound by an enclosing scope → the
+        // call resolves to that local, not the candidate — suppress the inline.
+        if self.shadow.callee_shadowed(call) {
+            return None;
+        }
         build_block_plan(
             self.allocator,
             call,
@@ -1068,6 +1219,11 @@ impl<'a> BlockInliner<'a, '_> {
             // so sibling calls in one statement seed each other AND their new
             // locals carry forward to later statements in this pass.
             merged_scope: std::mem::take(&mut self.merged_scope),
+            // Flattened enclosing-scope bindings for the shadowed-callee gate. The
+            // hoister only touches THIS statement's own expressions (never nested
+            // statement bodies), so the current shadow stack is exactly its
+            // enclosing-scope set.
+            enclosing: self.shadow.scopes.iter().flatten().cloned().collect(),
             hoists: Vec::new(),
             no_hoist: false,
             passed_effect: false,
@@ -1099,6 +1255,10 @@ struct ExprHoister<'a, 'c> {
     /// e.g. `return h0(p, q) + h0(q, p)` (two clones of the same expansion) — seed
     /// against each other, keeping their duplicated locals distinct.
     merged_scope: HashSet<String>,
+    /// Flattened enclosing-scope bound names (shadowed-callee gate) — a call whose
+    /// callee is bound here resolves to the local, not the candidate. See
+    /// [`ShadowStack`].
+    enclosing: HashSet<String>,
     hoists: Vec<Statement<'a>>,
     /// Set inside a conditionally-evaluated sub-expression (a `?:` branch, or the
     /// short-circuit RHS of `&&`/`||`/`??`). A BLOCK inline hoists the call's body
@@ -1222,7 +1382,12 @@ impl<'a> VisitMut<'a> for ExprHoister<'a, '_> {
                 _ => format!("_result_{id}"),
             };
             let plan = match &*expr {
-                Expression::CallExpression(call) if triggered(&self.trigger, call) => {
+                Expression::CallExpression(call)
+                    if triggered(&self.trigger, call)
+                        // Shadowed-callee gate: skip a call whose callee is bound by
+                        // an enclosing scope (resolves to the local, not the candidate).
+                        && !enclosing_shadows_callee(&self.enclosing, call) =>
+                {
                     call_key(call).and_then(|k| self.candidates.get(k.as_str())).and_then(|cand| {
                         build_block_plan(
                             self.allocator,
@@ -2067,6 +2232,116 @@ fn block_scoped_names(stmts: &[Statement], out: &mut HashSet<String>) {
     }
 }
 
+/// Like [`block_scoped_names`], but a `function NAME` / `const NAME = arrow|fnexpr`
+/// whose declaration span is a registered inline-candidate span is OMITTED — a call
+/// to that name inside its own declaring scope resolves to the candidate itself, so
+/// it must inline (it is NOT a shadow). A same-named binding that is a `const`
+/// (non-fn value), a plain `let`, a class, or a *different* function/const decl
+/// (span not in `cand_spans`) IS collected — it genuinely shadows the candidate.
+fn block_scoped_shadow_names(stmts: &[Statement], cand_spans: &HashSet<u32>, out: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Statement::VariableDeclaration(v) if v.kind != VariableDeclarationKind::Var => {
+                // A `const NAME = arrow|fnexpr` whose span is a candidate span is the
+                // candidate's own decl — skip it; any other declarator shadows.
+                if cand_spans.contains(&v.span.start)
+                    && v.declarations.len() == 1
+                    && matches!(
+                        v.declarations[0].init,
+                        Some(Expression::ArrowFunctionExpression(_))
+                            | Some(Expression::FunctionExpression(_))
+                    )
+                {
+                    continue;
+                }
+                for d in &v.declarations {
+                    collect_binding_names(&d.id, out);
+                }
+            }
+            Statement::FunctionDeclaration(f) => {
+                // The candidate's own `function NAME` decl (span-matched) is not a
+                // shadow; a different same-named function IS.
+                if cand_spans.contains(&f.span.start) {
+                    continue;
+                }
+                if let Some(id) = &f.id {
+                    out.insert(id.name.to_string());
+                }
+            }
+            Statement::ClassDeclaration(c) => {
+                if let Some(id) = &c.id {
+                    out.insert(id.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Declaration span of each inline candidate — the OUTERMOST (shallowest, then
+/// first-in-source) `function NAME` / `const NAME = arrow|fnexpr` whose NAME is a
+/// candidate key. This mirrors the candidate collector's "outermost name wins": the
+/// registered candidate IS that outermost decl, so a call to NAME in the scope that
+/// owns it resolves to the candidate (not a shadow), while an INNER same-named decl
+/// is a genuine shadow (its span is NOT recorded). Recording only the outermost decl
+/// is what lets [`block_scoped_shadow_names`] distinguish the two — a nested
+/// candidate (no outer decl) records its own span; a local that shadows a top-level
+/// candidate does not.
+fn candidate_decl_spans(program: &Program, cand_names: &HashSet<String>) -> HashSet<u32> {
+    struct V<'n> {
+        names: &'n HashSet<String>,
+        depth: u32,
+        // name → (depth, span) of the outermost decl seen so far.
+        best: HashMap<String, (u32, u32)>,
+    }
+    impl<'n> V<'n> {
+        fn record(&mut self, name: &str, span: u32) {
+            if !self.names.contains(name) {
+                return;
+            }
+            let d = self.depth;
+            match self.best.get(name) {
+                Some((bd, _)) if *bd <= d => {} // an equal/shallower decl already wins
+                _ => {
+                    self.best.insert(name.to_string(), (d, span));
+                }
+            }
+        }
+    }
+    impl<'a> Visit<'a> for V<'_> {
+        fn visit_function(&mut self, f: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+            if let Some(id) = &f.id {
+                self.record(id.name.as_str(), f.span.start);
+            }
+            self.depth += 1;
+            walk::walk_function(self, f, flags);
+            self.depth -= 1;
+        }
+        fn visit_arrow_function_expression(&mut self, a: &ArrowFunctionExpression<'a>) {
+            self.depth += 1;
+            walk::walk_arrow_function_expression(self, a);
+            self.depth -= 1;
+        }
+        fn visit_variable_declaration(&mut self, vd: &VariableDeclaration<'a>) {
+            if vd.declarations.len() == 1 {
+                if let BindingPattern::BindingIdentifier(id) = &vd.declarations[0].id {
+                    if matches!(
+                        vd.declarations[0].init,
+                        Some(Expression::ArrowFunctionExpression(_))
+                            | Some(Expression::FunctionExpression(_))
+                    ) {
+                        self.record(id.name.as_str(), vd.span.start);
+                    }
+                }
+            }
+            walk::walk_variable_declaration(self, vd);
+        }
+    }
+    let mut v = V { names: cand_names, depth: 0, best: HashMap::new() };
+    v.visit_program(program);
+    v.best.into_values().map(|(_, span)| span).collect()
+}
+
 /// All binding identifiers in a pattern (handles destructuring).
 fn collect_binding_names(pattern: &BindingPattern, out: &mut HashSet<String>) {
     struct V<'o> {
@@ -2156,6 +2431,111 @@ fn collect_local_names(program: &Program) -> HashSet<String> {
     v.names
 }
 
+// ── shadowed-callee gate ─────────────────────────────────────────────────────
+//
+// An inline is keyed by the callee's textual name (`call_key`), but the name at
+// the call site may be bound by an ENCLOSING scope (a param, or a `let`/`const`/
+// `var`/`function`/`class`/catch/loop binding of a function or block that lexically
+// contains the call) — a local that SHADOWS the top-level `@inline`/`@flatten`
+// candidate. Splicing the candidate body there is a MISCOMPILE: the call resolves
+// to the local, not the candidate. Both inliners maintain a `ShadowStack` of the
+// bound names of every enclosing scope during their `walk_mut`, pushing on entry
+// to a function/block/loop/catch scope and popping on exit; `is_shadowed` at the
+// inline gate bails when the callee's leaf identifier (or, for a member callee
+// `obj.m`, the object `obj`) is bound by any enclosing scope.
+//
+// Scope-PRECISE by construction: only names of scopes on the stack (i.e. lexically
+// enclosing the current call) suppress — a same-named binding in a sibling scope,
+// already popped, does not. Top-level (module) bindings are NOT pushed (the
+// candidates themselves live there; a call to a candidate is exactly a module-name
+// reference), so an unshadowed call still inlines.
+#[derive(Default)]
+struct ShadowStack {
+    scopes: Vec<HashSet<String>>,
+}
+
+impl ShadowStack {
+    /// Names bound directly in a block's statement list, shadow-filtered against the
+    /// candidate declarations (see [`block_scoped_shadow_names`]).
+    fn block_scope_shadow_names(stmts: &[Statement], cand_spans: &HashSet<u32>) -> HashSet<String> {
+        let mut s = HashSet::new();
+        block_scoped_shadow_names(stmts, cand_spans, &mut s);
+        s
+    }
+
+    /// A stack pre-seeded with one enclosing scope — used when a walk enters mid-tree
+    /// via `visit_function_body` (the `@flatten` host path), so the host's own params
+    /// and locals are treated as enclosing bindings from the first statement. A
+    /// `visit_program` entry seeds EMPTY: module-scope names must not suppress (a
+    /// call to a top-level candidate is exactly a module-name reference).
+    fn seeded(names: HashSet<String>) -> Self {
+        ShadowStack { scopes: vec![names] }
+    }
+
+    /// A function's scope names for the shadowed-callee gate, EXCLUDING any binding
+    /// that is itself an inline-candidate declaration (its own `function NAME` /
+    /// `const NAME = arrow|fnexpr` whose span is in `cand_spans`). A call to such a
+    /// name inside its own declaring scope resolves to the CANDIDATE, so it must
+    /// still inline — only a *different* same-named binding (a `const`/param/plain
+    /// function that is not a candidate decl) is a real shadow.
+    fn function_scope_shadow_names(
+        params: &FormalParameters,
+        body: Option<&FunctionBody>,
+        cand_spans: &HashSet<u32>,
+    ) -> HashSet<String> {
+        let mut s = HashSet::new();
+        for p in &params.items {
+            collect_binding_names(&p.pattern, &mut s);
+        }
+        if let Some(rest) = &params.rest {
+            collect_binding_names(&rest.rest.argument, &mut s);
+        }
+        if let Some(body) = body {
+            hoist_vars(&body.statements, &mut s);
+            block_scoped_shadow_names(&body.statements, cand_spans, &mut s);
+        }
+        s
+    }
+
+    fn push(&mut self, names: HashSet<String>) {
+        self.scopes.push(names);
+    }
+    fn pop(&mut self) {
+        self.scopes.pop();
+    }
+    /// Whether `name` is bound by any enclosing scope currently on the stack.
+    fn is_bound(&self, name: &str) -> bool {
+        self.scopes.iter().any(|s| s.contains(name))
+    }
+    /// Whether inlining `call` must be suppressed because its callee is shadowed:
+    /// for a bare `foo(...)`, the identifier `foo`; for a member `obj.m(...)`, the
+    /// object `obj` (a local `obj` is not the imported/candidate namespace).
+    fn callee_shadowed(&self, call: &CallExpression) -> bool {
+        match &call.callee {
+            Expression::Identifier(id) => self.is_bound(id.name.as_str()),
+            Expression::StaticMemberExpression(m) => match &m.object {
+                Expression::Identifier(obj) => self.is_bound(obj.name.as_str()),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Flattened-set analogue of [`ShadowStack::callee_shadowed`] — used by the
+/// `ExprHoister`, which holds the enclosing-scope names as one flat set (it only
+/// ever inspects a single statement's own expressions).
+fn enclosing_shadows_callee(enclosing: &HashSet<String>, call: &CallExpression) -> bool {
+    match &call.callee {
+        Expression::Identifier(id) => enclosing.contains(id.name.as_str()),
+        Expression::StaticMemberExpression(m) => match &m.object {
+            Expression::Identifier(obj) => enclosing.contains(obj.name.as_str()),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 // ── call-site replacement ───────────────────────────────────────────────────
 
 struct Inliner<'a, 'c> {
@@ -2190,6 +2570,18 @@ struct Inliner<'a, 'c> {
     /// statement's FIRST effect would run its arg before those earlier effects —
     /// a reorder. While set, hoist-needing inlines bail. Reset per statement.
     passed_effect: bool,
+    /// Enclosing-scope bound names (shadowed-callee gate) — a call whose callee is
+    /// bound by an enclosing param/local resolves to that local, not the candidate,
+    /// so the inline is suppressed. See [`ShadowStack`].
+    shadow: ShadowStack,
+    /// True once inside ≥1 function/arrow scope. Block/loop/catch scopes push their
+    /// bindings onto `shadow` ONLY while set — a MODULE-level `let`/`function`/`class`
+    /// (the candidates themselves + top-level locals) must never be treated as
+    /// shadowing, or a call to a top-level candidate would be wrongly suppressed.
+    in_function: bool,
+    /// Declaration spans of the inline candidates (see [`candidate_decl_spans`]) —
+    /// a candidate's OWN nested decl is not counted as a shadow of itself.
+    candidate_spans: Rc<HashSet<u32>>,
 }
 
 impl<'a> Inliner<'a, '_> {
@@ -2297,6 +2689,18 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
     fn visit_for_statement(&mut self, s: &mut ForStatement<'a>) {
         // test/update run per-iteration → never hoist them out. (init runs once,
         // but over-suppressing it is harmless — the later pass re-inlines.)
+        // Loop-header `let`/`const`/`var` bindings scope the header + body (only
+        // meaningful inside a function — a module-level loop var is module scope).
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let Some(ForStatementInit::VariableDeclaration(vd)) = &s.init {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
         let saved = self.no_hoist;
         self.no_hoist = true;
         if let Some(init) = s.init.as_mut() {
@@ -2310,20 +2714,102 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
         }
         self.no_hoist = saved;
         self.visit_branch(&mut s.body);
+        if push {
+            self.shadow.pop();
+        }
     }
     fn visit_for_in_statement(&mut self, s: &mut ForInStatement<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let ForStatementLeft::VariableDeclaration(vd) = &s.left {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
         let saved = self.no_hoist;
         self.no_hoist = true;
         self.visit_expression(&mut s.right);
         self.no_hoist = saved;
         self.visit_branch(&mut s.body);
+        if push {
+            self.shadow.pop();
+        }
     }
     fn visit_for_of_statement(&mut self, s: &mut ForOfStatement<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut header = HashSet::new();
+            if let ForStatementLeft::VariableDeclaration(vd) = &s.left {
+                for d in &vd.declarations {
+                    collect_binding_names(&d.id, &mut header);
+                }
+            }
+            self.shadow.push(header);
+        }
         let saved = self.no_hoist;
         self.no_hoist = true;
         self.visit_expression(&mut s.right);
         self.no_hoist = saved;
         self.visit_branch(&mut s.body);
+        if push {
+            self.shadow.pop();
+        }
+    }
+
+    // ── shadowed-callee scope tracking ──
+    fn visit_function(&mut self, f: &mut Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        self.shadow.push(ShadowStack::function_scope_shadow_names(
+            &f.params,
+            f.body.as_deref(),
+            &self.candidate_spans,
+        ));
+        let saved = self.in_function;
+        self.in_function = true;
+        walk_mut::walk_function(self, f, flags);
+        self.in_function = saved;
+        self.shadow.pop();
+    }
+    fn visit_arrow_function_expression(&mut self, a: &mut ArrowFunctionExpression<'a>) {
+        self.shadow.push(ShadowStack::function_scope_shadow_names(
+            &a.params,
+            Some(&a.body),
+            &self.candidate_spans,
+        ));
+        let saved = self.in_function;
+        self.in_function = true;
+        walk_mut::walk_arrow_function_expression(self, a);
+        self.in_function = saved;
+        self.shadow.pop();
+    }
+    fn visit_block_statement(&mut self, b: &mut BlockStatement<'a>) {
+        // A function body is NOT a BlockStatement (it's a FunctionBody), so this
+        // only fires for genuine nested blocks; still gate on `in_function` so a
+        // bare module-level block doesn't treat its locals as shadowing candidates.
+        let push = self.in_function;
+        if push {
+            self.shadow.push(ShadowStack::block_scope_shadow_names(&b.body, &self.candidate_spans));
+        }
+        walk_mut::walk_block_statement(self, b);
+        if push {
+            self.shadow.pop();
+        }
+    }
+    fn visit_catch_clause(&mut self, c: &mut CatchClause<'a>) {
+        let push = self.in_function;
+        if push {
+            let mut names = HashSet::new();
+            if let Some(param) = &c.param {
+                collect_binding_names(&param.pattern, &mut names);
+            }
+            self.shadow.push(names);
+        }
+        walk_mut::walk_catch_clause(self, c);
+        if push {
+            self.shadow.pop();
+        }
     }
 
     /// Walk each statement, then splice in any arg-binding hoists its calls
@@ -2363,6 +2849,12 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
             }
             let Some(key) = call_key(call) else { break 'inline };
             let Some(cand) = self.candidates.get(key.as_str()) else { break 'inline };
+            // Shadowed-callee gate: the callee name is bound by an enclosing scope
+            // (a local/param shadowing the candidate) → the call resolves to that
+            // local, not the candidate — suppress the inline.
+            if self.shadow.callee_shadowed(call) {
+                break 'inline;
+            }
             // Disjoint field borrows: `cand` ← self.candidates, `&mut self.next_id`,
             // `&mut self.hoists`, `&self.local_names`, `self.allocator`.
             // Bail an eval-once hoist if we're in a conditional position (`no_hoist`)
@@ -3086,5 +3578,77 @@ mod tests {
         );
         assert!(!out.contains("k(p)"), "call inlined:\n{out}");
         assert!(out.contains("p.x"), "object substituted, property name preserved:\n{out}");
+    }
+
+    // ── shadowed-callee gate: a local/param binding that shadows the candidate
+    //    name must suppress the inline (the call refers to the local, not the
+    //    @inline/@flatten candidate). ──────────────────────────────────────────
+
+    #[test]
+    fn direct_const_shadow_suppresses_inline() {
+        // A local `const add` shadows the @inline candidate `add`; the call binds
+        // to the local (subtraction), so the candidate body must NOT be spliced.
+        let out = inline(
+            "/* @inline */ function add(a, b) { return a + b; }\n\
+             export function f(x) { const add = (a, b) => a - b; return add(x, 1); }",
+        );
+        assert!(!out.contains("x + 1"), "candidate body must NOT inline over a const shadow:\n{out}");
+        assert!(out.contains("add(x, 1)"), "the shadowing local's call must survive:\n{out}");
+    }
+
+    #[test]
+    fn direct_param_shadow_suppresses_inline() {
+        // The consumer parameter `add` shadows the candidate — the parameter (a
+        // function passed in) is what's called, so the inline must be suppressed.
+        let out = inline(
+            "/* @inline */ function add(a, b) { return a + b; }\n\
+             export function f(add) { return add(1, 2); }",
+        );
+        assert!(!out.contains("1 + 2"), "candidate body must NOT inline over a param shadow:\n{out}");
+        assert!(out.contains("add(1, 2)"), "the parameter's call must survive:\n{out}");
+    }
+
+    #[test]
+    fn callsite_shadow_suppresses_inline() {
+        // Call-site `/* @inline */` on a call whose callee is a local shadow.
+        let out = inline(
+            "function dbl(a) { return a * 2; }\n\
+             export function f(x) { const dbl = (v) => v + 100; return /* @inline */ dbl(x); }",
+        );
+        assert!(!out.contains("x * 2"), "call-site inline must NOT fire over a local shadow:\n{out}");
+    }
+
+    #[test]
+    fn block_shadow_suppresses_inline() {
+        // BLOCK-mode candidate (multi-statement) with a local shadow.
+        let out = inline(
+            "/* @inline */ function pick(a) { let t = a; t = t + 1; return t; }\n\
+             export function f(x) { const pick = (v) => v - 1; let r = pick(x); return r; }",
+        );
+        assert!(out.contains("pick(x)"), "BLOCK inline must NOT fire over a local shadow:\n{out}");
+    }
+
+    #[test]
+    fn sibling_scope_shadow_still_inlines() {
+        // A same-named binding in a NON-enclosing sibling scope must NOT suppress
+        // the inline in a different function that has no such shadow.
+        let out = inline(
+            "/* @inline */ function add(a, b) { return a + b; }\n\
+             export function shadowed(add) { return add(1, 2); }\n\
+             export function clean(y) { return add(y, 5); }",
+        );
+        assert!(out.contains("add(1, 2)"), "shadowed sibling stays a call:\n{out}");
+        assert!(out.contains("y + 5"), "clean sibling still inlines (no over-suppression):\n{out}");
+    }
+
+    #[test]
+    fn inner_block_shadow_does_not_suppress_outer_call() {
+        // A shadow declared in an inner block must NOT suppress an inline of the
+        // same-named candidate at an OUTER (non-enclosed) call site.
+        let out = inline(
+            "/* @inline */ function add(a, b) { return a + b; }\n\
+             export function f(x) { let r = add(x, 1); { const add = (a, b) => a - b; sink(add); } return r; }",
+        );
+        assert!(out.contains("x + 1"), "outer call (not enclosed by the inner shadow) inlines:\n{out}");
     }
 }

@@ -388,6 +388,91 @@ describe('cross-file inline: end-to-end (rollup, real files)', () => {
         expect(code, `plain (non-@inline) stays a call:\n${code}`).toContain('plain(x)');
     });
 
+    it('inlines an @inline def marked with a multi-line JSDoc block (the production form)', async () => {
+        // crashcat's real markers are multi-line JSDoc (`* @inline` on its own line, then
+        // `*/`, then `export function`), NOT the single-line `/* @inline */` form. The
+        // index regex must catch it — this is the exact shape the shipped code relies on.
+        writeFileSync(
+            path.join(dir, 'jh.js'),
+            `/**\n * Doubles its argument.\n *\n * @inline\n */\nexport function helper(a) { return a * 2; }\n`,
+        );
+        writeFileSync(
+            path.join(dir, 'jentry.js'),
+            `import { helper } from "./jh.js";\nexport function f(x) { return helper(x) + 1; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'jentry.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `JSDoc-marked @inline def should inline:\n${code}`).not.toContain('helper(');
+        expect(code).toContain('x * 2 + 1');
+    });
+
+    it('inlines an @inline def declared as a const arrow', async () => {
+        writeFileSync(path.join(dir, 'ah.js'), `/* @inline */ export const helper = (a) => a * 2;\n`);
+        writeFileSync(
+            path.join(dir, 'aentry.js'),
+            `import { helper } from "./ah.js";\nexport function f(x) { return helper(x) + 1; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'aentry.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `const-arrow @inline def should inline:\n${code}`).not.toContain('helper(');
+        expect(code).toContain('x * 2 + 1');
+    });
+
+    it('inlines an @inline def at MULTIPLE call-sites and across MULTIPLE directive-less callers', async () => {
+        // "mark once, inline everywhere" — the def is inlined at every call, in every
+        // directive-less consumer that imports it, not just the first site.
+        writeFileSync(path.join(dir, 'mh.js'), `/* @inline */ export function helper(a) { return a * 2; }\n`);
+        writeFileSync(
+            path.join(dir, 'mentry.js'),
+            `import { helper } from "./mh.js";\nimport { g } from "./mcaller.js";\n` +
+                `export function f(x) { return helper(x) + helper(x + 1); }\nexport { g };\n`,
+        );
+        writeFileSync(
+            path.join(dir, 'mcaller.js'),
+            `import { helper } from "./mh.js";\nexport function g(y) { return helper(y) - 3; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'mentry.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `every helper call across both callers should inline:\n${code}`).not.toContain('helper(');
+        expect(code).toContain('x * 2 + (x + 1) * 2'); // both sites in f
+        expect(code).toContain('y * 2 - 3'); // the site in g
+    });
+
+    it('does NOT inline an @inline def when a local param SHADOWS its name (soundness)', async () => {
+        // The gate fires on the NAME `helper`, but at the call site `helper` is the
+        // parameter, not the imported @inline def — the call must be left alone. Inlining
+        // the def here would silently discard the caller's own argument.
+        writeFileSync(path.join(dir, 'sh.js'), `/* @inline */ export function helper(a) { return a * 2; }\n`);
+        writeFileSync(
+            path.join(dir, 'sentry.js'),
+            `import { helper } from "./sh.js";\nexport function f(helper) { return helper(10); }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'sentry.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `shadowed local helper must stay a call, not inline the def:\n${code}`).toContain('helper(10)');
+        expect(code).not.toContain('10 * 2');
+    });
+
     it('forwards a dependency import dep and the bundler resolves it', async () => {
         // dependency (mathlib) needs `clamp` from a sibling file; after inlining norm
         // into entry, the forwarded `./clamp.js` import must still resolve+bundle.

@@ -1128,9 +1128,17 @@ fn resolve_export<L: ResolveLeaf>(
     }
     let program = cache.get(&dependency.path)?.program();
 
-    // (A) Sourced named re-export `export { L as name } from S` — explicit, shadows `export *`.
-    if let Some((target, _p, local)) = resolve_named_reexport(program, dependency, dependencies, name, cache) {
-        return resolve_export::<L>(&local, target, dependencies, cache, depth + 1, visited);
+    // (A) Sourced named re-export `export { L as name } from S` — explicit, shadows
+    // `export *`. Detect the CLAUSE first (authoritative, independent of whether S is
+    // followable): if present, an unfollowable / out-of-scope target STOPS here with
+    // `None` rather than falling through to a shadowed lower source — mirroring step
+    // (D). `resolve_named_reexport`'s `?`-swallowing return conflates "no clause" with
+    // "clause but unresolvable target", so using it here reintroduces the miscompile.
+    if let Some((source, local)) = sourced_named_reexport_spec(program, name) {
+        return match resolve_reexport_target(dependency, dependencies, &source) {
+            Some(target) => resolve_export::<L>(&local, target, dependencies, cache, depth + 1, visited),
+            None => None,
+        };
     }
 
     // (A′) `export default <ident>` indirection — a default export is explicit and
@@ -3524,6 +3532,35 @@ mod tests {
                 "/p/quat.ts",
                 // `./missing.js` is deliberately NOT a dependency (no resolved edge to it).
                 "import { set } from './missing.js';\nexport * from './other.js';\nexport { set };",
+                &[("./other.js", "/p/other.ts")],
+            ),
+            barrel_dependency(
+                "./other.js",
+                "/p/other.ts",
+                "export function set(out, x, y, z, w) { out[99] = 12345; return out; }",
+                &[],
+            ),
+        ];
+        let out = transform_cross_file(consumer, &dependencies, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("12345"), "must NOT inline the shadowed wildcard `set`:\n{out}");
+        assert!(out.contains("set("), "the imported `set` call must be preserved:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_unfollowable_named_reexport_shadows_wildcard_no_miscompile() {
+        // `set` is a SOURCED named re-export `export { real as set } from './missing.js'`
+        // whose target is NOT in the dependency set (external / out of scope). That
+        // named re-export — step (A), authoritative — is what `set` binds to. Unable to
+        // follow it, the resolver must STOP, NOT fall through to the `export *`'d `set`.
+        // (The step-D import analogue is covered above; step A had the same hazard.)
+        let consumer = r#"import { set } from "./quat";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1, 2, 3, 4); }"#;
+        let dependencies = vec![
+            barrel_dependency(
+                "./quat",
+                "/p/quat.ts",
+                // `./missing.js` is deliberately NOT a dependency (no resolved edge to it).
+                "export { real as set } from './missing.js';\nexport * from './other.js';",
                 &[("./other.js", "/p/other.ts")],
             ),
             barrel_dependency(

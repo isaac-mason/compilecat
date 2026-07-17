@@ -384,6 +384,14 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 pkgTypeEntryCache.clear();
                 pkgJsonCache.clear();
             }
+            // A file add / delete / rename changes what's on disk, so the fs-probe's
+            // `statCache` (does `foo.ts` exist?) and the `resolveCache` (what does a
+            // specifier bind to?) can go stale — a `.ts` that now exists, a specifier
+            // that now resolves elsewhere. Neither key is path-addressable per change,
+            // and both are cheap to repopulate lazily while watch rebuilds are
+            // human-paced, so drop them wholesale rather than risk a stale resolution.
+            statCache.clear();
+            resolveCache.clear();
         },
         buildEnd() {
             if (stats) reportStats(stats);
@@ -406,6 +414,13 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         if (stats) stats.files++;
         try {
             return await runTransform.call(this, code, id);
+        } catch (err) {
+            // An optimizer must NEVER break the user's build. If the native core throws
+            // or panics on some input (an id it can't parse, an unexpected syntax edge,
+            // malformed dependency source), surface it as a WARNING and hand back the
+            // ORIGINAL module unoptimized — visible enough to notice, non-fatal.
+            this.warn?.(`compilecat: skipped ${id} — ${err instanceof Error ? err.message : String(err)}`);
+            return null;
         } finally {
             if (stats) stats.totalMs += performance.now() - t0;
         }
@@ -535,16 +550,20 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         return { code: r.code, map: r.map };
     }
 
-    // Resolve one VALUE frontier request to its runtime module path. Uses the
-    // bundler's `this.resolve` for BOTH bare and relative specifiers - resolution
-    // is then bundler-faithful (aliases, exports maps, extension order) with no
-    // hand-rolled probe to drift from it, and it's affordable now that the pull
-    // model resolves almost nothing. Bare specifiers are identity-cached by the
-    // specifier alone (so `mathcat` resolves once, not once per importer); relative
-    // ones by `dirname(fromPath)\0specifier`.
+    // Resolve one VALUE frontier request to its runtime module path. BARE specifiers
+    // go through the bundler's `this.resolve` (that's where aliases / `exports` maps /
+    // plugins live), so they stay bundler-faithful. RELATIVE specifiers use a cheap
+    // fs-probe and DEFER to `this.resolve` only when the probe is ambiguous (0 or 2+
+    // on-disk candidates) — relatives are never bundler-aliased, so an unambiguous
+    // probe binds exactly what the bundler would while skipping its pipeline warmup.
+    // Affordable either way now that the pull model resolves almost nothing. Both
+    // are cached by `dirname(fromPath)\0specifier` — importer-DIRECTORY-scoped, since
+    // Node resolution of a bare specifier walks up `node_modules` from the importing
+    // file's directory: a global specifier-only key could hand one importer another's
+    // copy under nested/duplicated deps or workspace hoisting.
     async function resolveValueRequest(this: Ctx, req: FrontierRequest): Promise<string | null> {
         const bare = !req.specifier.startsWith('.');
-        const cacheKey = bare ? req.specifier : `${path.dirname(req.fromPath)}\0${req.specifier}`;
+        const cacheKey = `${path.dirname(req.fromPath)}\0${req.specifier}`;
         let p = resolveCache.get(cacheKey);
         if (p) {
             if (stats) stats.resolveCacheHits++;
@@ -564,8 +583,11 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 try {
                     if (bare) return (await bundlerResolve()) ?? null;
                     const abs = path.resolve(path.dirname(req.fromPath), req.specifier);
-                    // Explicit extension → unambiguous if it exists; else defer (virtual/query).
-                    if (path.extname(abs)) return (isFile(abs) ? { id: abs } : await bundlerResolve()) ?? null;
+                    // Explicit extension → fast-path only a TRANSFORMABLE module that
+                    // exists on disk. A non-transformable asset (`.json`/`.css`/`.wasm`)
+                    // or a virtual/query specifier may carry a bundler loader/transform,
+                    // so defer to `this.resolve` rather than bind the raw file.
+                    if (path.extname(abs)) return (TRANSFORMABLE.test(abs) && isFile(abs) ? { id: abs } : await bundlerResolve()) ?? null;
                     const cands: string[] = [];
                     for (const e of ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'])
                         if (isFile(abs + e)) cands.push(abs + e);

@@ -39,7 +39,7 @@
 import { transformSync } from 'esbuild';
 import { describe, expect, it } from 'vitest';
 
-import { createCompiler } from '../src/compiler';
+import { createCompiler, resolutionFrontier } from '../src/compiler';
 import type { Dependency } from '../src/loader';
 
 const compiler = createCompiler();
@@ -705,5 +705,129 @@ describe('cross-module shadowing fuzzer: compiled output ≡ source', () => {
             // vitest's default 5s per-test timeout. Scales ~3ms/iter with headroom.
         },
         Math.max(10000, ITERS * 20),
+    );
+});
+
+// ── frontier ↔ resolver LOCKSTEP fuzzer ──────────────────────────────────────
+//
+// The fuzzer above hands `compileFileCross` the WHOLE dependency set up front, so it
+// proves the RESOLVER is sound given a sufficient graph — but it never exercises
+// `resolutionFrontier`, the demand-driven walk the plugin actually uses to DISCOVER
+// which modules to gather. The frontier re-derives the resolver's A–E precedence to
+// EMIT the missing edges; if the two walks drift, the frontier can under-ask (a real
+// dependency never requested → a call the resolver WOULD inline stays a call) or spin.
+//
+// This test reproduces the plugin's pull-loop (`runTransform`) against the SAME
+// generated graphs: start with ZERO dependencies, ask the frontier what's missing,
+// satisfy exactly those from the scenario's edge wiring, and re-query to a fixpoint.
+// The oracle: the output compiled from the PULL-GATHERED set must be BYTE-IDENTICAL to
+// the output compiled with ALL dependencies pre-provided (the fuzzer above's input).
+// Same output ⇒ the frontier gathered a sufficient set. A divergence is a lockstep
+// bug; exceeding the iteration bound is a non-termination bug.
+
+describe('frontier ↔ resolver lockstep: pull-gathered ≡ all-provided', () => {
+    const DEEP = !!process.env.FUZZ;
+    const ITERS = Number(process.env.FUZZ_ITERS ?? 0) || (DEEP ? 1500 : 60);
+    const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x5adf00d;
+    const ID = 'entry.ts';
+
+    // Reproduce the plugin's `runTransform` fixpoint: ask the frontier what's missing,
+    // resolve each request against the scenario's edge wiring (consumer imports the
+    // entry spec; every deeper edge is a dependency's own `resolved` entry), stamp the
+    // gathered deps exactly as the plugin does, and re-query until empty or no progress.
+    function pullGather(consumer: string, allDeps: Dependency[], entrySpec: string, entryPath: string): Dependency[] {
+        // (fromPath, specifier) → target path — the ground-truth resolver the plugin's
+        // `resolveValueRequest`/`this.resolve` stands in for at build time.
+        const edge = new Map<string, string>();
+        edge.set(`${ID}\0${entrySpec}`, entryPath);
+        for (const d of allDeps) for (const e of d.resolved) edge.set(`${d.path}\0${e.specifier}`, e.path);
+        const resolveTo = (fromPath: string, spec: string): string | undefined => edge.get(`${fromPath}\0${spec}`);
+
+        const byPath = new Map<string, Dependency>();
+        const provided: Dependency[] = [];
+        const attempted = new Set<string>();
+        const MAX_ITERS = allDeps.length + 8; // finite graph → bounded; a spin trips this
+
+        let requests = resolutionFrontier(ID, consumer, provided, []);
+        let iters = 0;
+        while (requests.length > 0) {
+            if (++iters > MAX_ITERS) throw new Error(`frontier did not converge in ${MAX_ITERS} rounds (spin?)`);
+            let progress = false;
+            for (const req of requests) {
+                const key = `${req.specifier}\0${req.fromPath}\0${req.kind}`;
+                if (attempted.has(key)) continue;
+                attempted.add(key);
+                const targetPath = resolveTo(req.fromPath, req.specifier);
+                if (!targetPath) continue; // genuinely unresolvable (mirrors an out-of-scope import)
+                let dep = byPath.get(targetPath);
+                if (!dep) {
+                    const src = allDeps.find((d) => d.path === targetPath);
+                    if (!src) continue;
+                    dep = { specifier: req.specifier, path: targetPath, code: src.code, resolved: [] };
+                    byPath.set(targetPath, dep);
+                    provided.push(dep);
+                    progress = true;
+                }
+                if (req.fromPath === ID) {
+                    if (dep.specifier !== req.specifier) {
+                        dep.specifier = req.specifier;
+                        progress = true;
+                    }
+                } else {
+                    const from = byPath.get(req.fromPath);
+                    if (from && !from.resolved.some((e) => e.specifier === req.specifier && e.path === targetPath)) {
+                        from.resolved.push({ specifier: req.specifier, path: targetPath });
+                        progress = true;
+                    }
+                }
+            }
+            if (!progress) break;
+            requests = resolutionFrontier(ID, consumer, provided, []);
+        }
+        return provided;
+    }
+
+    it(
+        `${ITERS} random graphs: the pull loop gathers a set sufficient for identical output`,
+        () => {
+            for (let i = 0; i < ITERS; i++) {
+                const seed = (BASE + i * 2654435761) >>> 0;
+                const { consumer, dependencies } = new ShadowGen(mulberry32(seed)).scenario();
+                // The entry module is the one the consumer imports from.
+                const entrySpecMatch =
+                    consumer.match(/import\s*\{[^}]*\}\s*from\s*["']([^"']+)["']/) ||
+                    consumer.match(/import\s+[A-Za-z_$][\w$]*\s+from\s*["']([^"']+)["']/);
+                const entrySpec = entrySpecMatch ? entrySpecMatch[1] : './m0';
+                const entry = dependencies.find((d) => d.specifier === entrySpec);
+                if (!entry) continue;
+
+                let allOut: string;
+                let pullOut: string;
+                try {
+                    allOut = compiler.compileFileCross(ID, consumer, dependencies, {}).code;
+                    const gathered = pullGather(consumer, dependencies, entrySpec, entry.path);
+                    pullOut =
+                        gathered.length > 0
+                            ? compiler.compileFileCross(ID, consumer, gathered, {}).code
+                            : compiler.compileFile(ID, consumer, {}).code;
+                } catch (e) {
+                    throw new Error(`FRONTIER LOCKSTEP threw (seed=${seed}, i=${i}): ${(e as Error).message}`);
+                }
+
+                if (pullOut !== allOut) {
+                    const dump = dependencies
+                        .map((m) => `--- ${m.specifier} (${m.path}) ---\n${m.code}\n  resolved: ${JSON.stringify(m.resolved)}`)
+                        .join('\n\n');
+                    throw new Error(
+                        `FRONTIER UNDER-GATHERED (seed=${seed}, FUZZ_SEED=${BASE} i=${i})\n` +
+                            `The pull loop missed a dependency the resolver needs → different output.\n\n` +
+                            `--- consumer ---\n${consumer}\n\n${dump}\n\n` +
+                            `--- all-provided output ---\n${allOut}\n\n--- pull-gathered output ---\n${pullOut}\n`,
+                    );
+                }
+            }
+            expect(true).toBe(true);
+        },
+        Math.max(10000, ITERS * 25),
     );
 });
