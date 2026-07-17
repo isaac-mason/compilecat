@@ -3,7 +3,7 @@
 //   (a) core behavioral equivalence (compileFileCross + eval the combined modules)
 //   (b) end-to-end through a real rollup build with real files on disk.
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -471,6 +471,49 @@ describe('cross-file inline: end-to-end (rollup, real files)', () => {
         const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
         expect(code, `shadowed local helper must stay a call, not inline the def:\n${code}`).toContain('helper(10)');
         expect(code).not.toContain('10 * 2');
+    });
+
+    it('inlines from the SAME file imported under TWO specifiers (multi-specifier seed)', async () => {
+        // A host that imports the same module under two specifiers (`./m.js` and the
+        // extensionless `./m`, both resolving to m.js) and calls a binding from EACH
+        // must inline BOTH — the plugin must not collapse the file to a single seed
+        // specifier and drop one import's inlining.
+        writeFileSync(path.join(dir, 'm.js'), `export function a() { return 1; }\nexport function b() { return 2; }\n`);
+        writeFileSync(
+            path.join(dir, 'twospec.js'),
+            `import { a } from "./m.js";\nimport { b } from "./m";\n/* @optimize */ export function f() { return a() + b(); }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'twospec.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `both a() and b() should inline across the two specifiers:\n${code}`).not.toContain('a(');
+        expect(code).not.toContain('b(');
+        expect(code).toContain('return 3'); // 1 + 2, both inlined then const-folded
+    });
+
+    it('indexes an @inline def in an in-scope DOTDIR (e.g. .generated/)', async () => {
+        // The build-start def scan skips dotdirs by default (never descend into .git),
+        // but an in-scope source dir whose name starts with `.` must still be indexed so
+        // its @inline defs inline at directive-less callers.
+        mkdirSync(path.join(dir, '.generated'), { recursive: true });
+        writeFileSync(path.join(dir, '.generated', 'gdef.js'), `/* @inline */ export function gen(a) { return a * 2; }\n`);
+        writeFileSync(
+            path.join(dir, 'gcaller.js'),
+            `import { gen } from "./.generated/gdef.js";\nexport function f(x) { return gen(x) + 1; }\n`,
+        );
+        const bundle = await rollup({
+            input: path.join(dir, 'gcaller.js'),
+            plugins: [compilecat({ include: [/.*/], scanRoot: dir })],
+            onwarn: () => {},
+        });
+        const { output } = await bundle.generate({ format: 'es' });
+        const code = output.map((o) => ('code' in o ? o.code : '')).join('\n');
+        expect(code, `@inline def in .generated/ should be indexed and inline:\n${code}`).not.toContain('gen(');
+        expect(code).toContain('x * 2 + 1');
     });
 
     it('forwards a dependency import dep and the bundler resolves it', async () => {

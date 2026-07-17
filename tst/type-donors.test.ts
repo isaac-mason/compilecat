@@ -112,6 +112,32 @@ describe('cross-package .d.ts type resolution (e2e via rollup)', () => {
         expect(scalarized(out)).toBe(false);
     });
 
+    it('falls back to @types/<pkg> (DefinitelyTyped) when the package ships no own declarations', async () => {
+        // `phantom` ships JS only; its declarations live in the separate `@types/phantom`
+        // package. The type resolver must consult `@types/<pkg>` so `Quat` resolves and
+        // SROA fires — the classic DefinitelyTyped split.
+        writePkg('phantom', { main: 'index.js' }, { 'index.js': 'export const create = () => [0, 0, 0, 0];' });
+        writePkg('@types/phantom', { types: 'index.d.ts' }, {
+            'index.d.ts':
+                'export type Quat = [x: number, y: number, z: number, w: number];\nexport declare const create: () => Quat;',
+        });
+        const plugin: any = compilecat({ include: [/.*/] });
+        const ctx = {
+            async resolve(source: string) {
+                if (source.startsWith('.') || source.startsWith('/')) return null;
+                // A subpath (e.g. `@types/phantom/package.json`) → the literal file.
+                if (source.endsWith('/package.json')) return { id: path.join(root, 'node_modules', source) };
+                return { id: path.join(root, 'node_modules', source, 'index.js') };
+            },
+            addWatchFile() {},
+        };
+        const t: any = plugin.transform;
+        const handler = typeof t === 'function' ? t : t.handler;
+        const res = await handler.call(ctx, CONSUMER('phantom'), path.join(root, 'entry.ts'));
+        const out = res ? res.code : '';
+        expect(scalarized(out), `expected SROA to fire via @types/phantom:\n${out}`).toBe(true);
+    });
+
     it('watches the package.json AND the .d.ts so edits invalidate (no stale cache)', async () => {
         writePkg(
             'watchpkg',

@@ -115,6 +115,12 @@ function findPackageDir(startPath: string): string | null {
     return null;
 }
 
+// The package name of a bare specifier: `foo/sub` → `foo`, `@scope/foo/sub` → `@scope/foo`.
+function packageNameOf(specifier: string): string {
+    const parts = specifier.split('/');
+    return specifier.startsWith('@') && parts.length > 1 ? `${parts[0]}/${parts[1]}` : parts[0];
+}
+
 interface PluginDependency {
     specifier: string;
     path: string;
@@ -256,7 +262,12 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             for (const e of entries) {
                 const full = path.join(dir, e.name);
                 if (e.isDirectory()) {
-                    if (!PRUNE_DIRS.has(e.name) && !e.name.startsWith('.')) stack.push(full);
+                    if (PRUNE_DIRS.has(e.name)) continue;
+                    // Skip dotdirs (`.git`, `.cache`) UNLESS the scope filter would admit
+                    // files under them — so an in-scope source dir like `.generated/` is
+                    // still indexed rather than blanket-skipped. Probe with a synthetic child.
+                    if (e.name.startsWith('.') && !inScope(path.join(full, '__cc_probe__.ts'))) continue;
+                    stack.push(full);
                     continue;
                 }
                 if (!e.isFile() || !TRANSFORMABLE.test(e.name) || !inScope(full)) continue;
@@ -376,6 +387,14 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 inlineDefIndex.clear();
                 for (const set of inlineDefNamesByFile.values()) for (const n of set) inlineDefIndex.add(n);
                 inlineDefIndexVersion++;
+                // KNOWN LIMITATION (dev/watch only): if this edit ADDS a new `@inline`
+                // def, callers that already transformed against the old index keep their
+                // cached (un-inlined) output until they themselves change — no bundler
+                // exposes a portable "re-transform this unchanged module" trigger, and a
+                // caller re-inlines correctly on its next edit or any full/production
+                // build. This is correctness-preserving: dev output is merely UNoptimized,
+                // never wrong. (A Vite adapter can force it via `consumersByDependency` +
+                // `moduleGraph.invalidateModule`; that lives outside this portable core.)
             }
             // A dep's package.json edit can change its `types`/`exports` entry, so the
             // derived type-entry + parsed-package caches must drop too (keys don't
@@ -457,7 +476,29 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         const valueDeps: PluginDependency[] = [];
         const typeDeps: PluginDependency[] = [];
         const byPath = new Map<string, PluginDependency>();
-        const providedOf = () => (typeDeps.length ? [...valueDeps, ...typeDeps] : valueDeps);
+        // Top-level seed specifiers per resolved path. A file imported under MULTIPLE
+        // specifiers (e.g. `./m.js` and the extensionless `./m`) is ONE `byPath` entry
+        // but must be handed to the core as one VIEW per specifier — the core matches a
+        // seed by `d.specifier`, so a single specifier would drop the other import's
+        // inlining. Views share code + resolved edges (same file), which the core
+        // tolerates (phase-1 caches by path; deeper edges resolve by path).
+        const seedSpecs = new Map<string, Set<string>>();
+        const providedOf = (): PluginDependency[] => {
+            const base = typeDeps.length ? [...valueDeps, ...typeDeps] : valueDeps;
+            // Fast path: expand lazily, only if some file carries >1 seed specifier.
+            let expanded: PluginDependency[] | null = null;
+            for (let i = 0; i < base.length; i++) {
+                const d = base[i];
+                const specs = seedSpecs.get(d.path);
+                if (specs && specs.size > 1) {
+                    if (!expanded) expanded = base.slice(0, i);
+                    for (const s of specs) expanded.push(s === d.specifier ? d : { ...d, specifier: s });
+                } else if (expanded) {
+                    expanded.push(d);
+                }
+            }
+            return expanded ?? base;
+        };
         // A request tried once (resolved, out-of-scope, or unresolvable) is never
         // retried, so an unsatisfiable edge can't spin the loop.
         const attempted = new Set<string>();
@@ -480,8 +521,15 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 if (attempted.has(attemptKey)) continue;
                 attempted.add(attemptKey);
 
-                const resolvedPath =
-                    req.kind === 'type' ? await resolveTypeRequest.call(this, req) : await resolveValueRequest.call(this, req);
+                // Route by kind EXHAUSTIVELY: a future core `FrontierKind` the plugin
+                // doesn't know must NOT be silently treated as a value need — warn + skip.
+                let resolvedPath: string | null;
+                if (req.kind === 'type') resolvedPath = await resolveTypeRequest.call(this, req);
+                else if (req.kind === 'value') resolvedPath = await resolveValueRequest.call(this, req);
+                else {
+                    this.warn?.(`compilecat: unknown frontier kind '${req.kind}' — skipping ${req.specifier}`);
+                    resolvedPath = null;
+                }
                 // Skip unresolved / externalized / out-of-scope - the last is what
                 // keeps node_modules outside `include` from being read.
                 if (!resolvedPath || !inScope(resolvedPath)) continue;
@@ -503,8 +551,18 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                 // `.specifier`; a deeper edge is matched by PATH, so push it onto the
                 // importing dependency's `.resolved` (deduped).
                 if (req.fromPath === id) {
-                    if (dependency.specifier !== req.specifier) {
-                        dependency.specifier = req.specifier;
+                    // Top-level seed: record the specifier (a file may be imported under
+                    // several). The FIRST becomes the canonical `dependency.specifier`
+                    // (the single-specifier common case needs no expansion); `providedOf`
+                    // fans out any file that accrues more than one.
+                    let specs = seedSpecs.get(resolvedPath);
+                    if (!specs) {
+                        specs = new Set();
+                        seedSpecs.set(resolvedPath, specs);
+                    }
+                    if (!specs.has(req.specifier)) {
+                        if (specs.size === 0) dependency.specifier = req.specifier;
+                        specs.add(req.specifier);
                         addedEdge = true;
                     }
                 } else {
@@ -550,17 +608,16 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         return { code: r.code, map: r.map };
     }
 
-    // Resolve one VALUE frontier request to its runtime module path. BARE specifiers
-    // go through the bundler's `this.resolve` (that's where aliases / `exports` maps /
-    // plugins live), so they stay bundler-faithful. RELATIVE specifiers use a cheap
-    // fs-probe and DEFER to `this.resolve` only when the probe is ambiguous (0 or 2+
-    // on-disk candidates) — relatives are never bundler-aliased, so an unambiguous
-    // probe binds exactly what the bundler would while skipping its pipeline warmup.
-    // Affordable either way now that the pull model resolves almost nothing. Both
-    // are cached by `dirname(fromPath)\0specifier` — importer-DIRECTORY-scoped, since
-    // Node resolution of a bare specifier walks up `node_modules` from the importing
-    // file's directory: a global specifier-only key could hand one importer another's
-    // copy under nested/duplicated deps or workspace hoisting.
+    // Resolve one VALUE frontier request to its runtime module path, bundler-faithfully
+    // via `this.resolve` (aliases / `exports` / `resolve.extensions` / plugins) — EXCEPT
+    // the one case a probe can't get wrong: a RELATIVE specifier with an explicit,
+    // transformable extension that exists on disk (a cheap `isFile`, skipping
+    // `this.resolve`'s pipeline warmup). Everything else — bare specifiers, and
+    // EXTENSIONLESS relatives whose extension/index the bundler picks by config — defers.
+    // Affordable now that the pull model resolves almost nothing. Cached by
+    // `dirname(fromPath)\0specifier` — importer-DIRECTORY-scoped, since Node resolution
+    // depends on the importing file's directory (nested/duplicated deps, workspace
+    // hoisting), so a global specifier-only key could hand one importer another's copy.
     async function resolveValueRequest(this: Ctx, req: FrontierRequest): Promise<string | null> {
         const bare = !req.specifier.startsWith('.');
         const cacheKey = `${path.dirname(req.fromPath)}\0${req.specifier}`;
@@ -571,13 +628,8 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             if (stats) stats.resolves++;
             const rs0 = performance.now();
             // Start + cache the PROMISE synchronously (before any await) so concurrent
-            // callers dedup onto it. A relative specifier is resolved by a cheap fs-probe
-            // (relatives are never bundler-aliased, and it avoids `this.resolve`'s pipeline
-            // warmup) — but ONLY when the probe is UNAMBIGUOUS (exactly one candidate on
-            // disk). If both e.g. `foo.ts` and `foo.js` exist, the probe can't know which
-            // the bundler binds, so it DEFERS to `this.resolve` (soundness — never guess
-            // `.ts`-first and risk inlining the wrong module). Bare specifiers always go
-            // through `this.resolve` (that's where aliases / exports / plugins live).
+            // callers dedup onto it. See the doc above: `this.resolve` for everything
+            // except a relative specifier with an explicit transformable extension on disk.
             const bundlerResolve = () => this.resolve?.(req.specifier, req.fromPath, { skipSelf: true });
             p = (async () => {
                 try {
@@ -588,23 +640,14 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
                     // or a virtual/query specifier may carry a bundler loader/transform,
                     // so defer to `this.resolve` rather than bind the raw file.
                     if (path.extname(abs)) return (TRANSFORMABLE.test(abs) && isFile(abs) ? { id: abs } : await bundlerResolve()) ?? null;
-                    const cands: string[] = [];
-                    for (const e of ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'])
-                        if (isFile(abs + e)) cands.push(abs + e);
-                    for (const i of [
-                        '/index.ts',
-                        '/index.tsx',
-                        '/index.mts',
-                        '/index.cts',
-                        '/index.js',
-                        '/index.jsx',
-                        '/index.mjs',
-                        '/index.cjs',
-                    ])
-                        if (isFile(abs + i)) cands.push(abs + i);
-                    // Exactly one candidate → the bundler must bind it too (fast path).
-                    // Zero (virtual module) or two+ (ambiguous) → let the bundler decide.
-                    return cands.length === 1 ? { id: cands[0] } : ((await bundlerResolve()) ?? null);
+                    // Extensionless relative → defer to `this.resolve`. WHICH extension
+                    // (and index file) the bundler binds is CONFIG-sensitive:
+                    // `resolve.extensions` order + allowlist, `alias`, tsconfig `paths`.
+                    // An fs-probe can't see that config, so "exactly one candidate on
+                    // disk" is NOT proof the bundler binds it (it may be told to ignore
+                    // that extension, or redirect the path). Only the explicit-extension
+                    // case above is probe-safe (no guessing).
+                    return (await bundlerResolve()) ?? null;
                 } catch {
                     return null;
                 } finally {
@@ -637,8 +680,9 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
 
     // Resolve a bare package specifier to its `.d.ts` type entry, in TypeScript's
     // precedence: `exports` map "types" condition → `types`/`typings` field → a
-    // sibling `.d.ts` of the resolved runtime entry. Cached per build.
-    // Known gap: `@types/<pkg>` (DefinitelyTyped, separate package) is not consulted.
+    // sibling `.d.ts` of the resolved runtime entry → the DefinitelyTyped
+    // `@types/<pkg>` package (see `resolveAtTypesEntry`). Cached per build.
+    // Known gap: `typesVersions` (TS-version-keyed `.d.ts` redirects) is not consulted.
     async function resolvePackageTypeEntry(this: Ctx, specifier: string, importerId: string): Promise<string | null> {
         const key = `${importerId}\0${specifier}`;
         const hit = pkgTypeEntryCache.get(key);
@@ -658,10 +702,50 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             kind: 'value',
         } as FrontierRequest);
 
-        const result = resolveTypeEntryFrom(runtimeId, specifier);
+        let result = resolveTypeEntryFrom(runtimeId, specifier);
+        // DefinitelyTyped fallback: a package that ships NO own types (no `exports`
+        // "types" / `types` field / sibling `.d.ts`) may have its declarations in a
+        // separate `@types/<pkg>` package. Consult it before giving up.
+        if (!result.dts) {
+            const at = await resolveAtTypesEntry.call(this, specifier, importerId);
+            if (at.dts) result = at;
+        }
         if (result.pkgJson) this.addWatchFile?.(result.pkgJson);
         pkgTypeEntryCache.set(key, result);
         return result.dts;
+    }
+
+    // Resolve a package's DefinitelyTyped `@types/<pkg>` declarations, if installed.
+    // `@types/<mangled>` where `@scope/foo` → `scope__foo`. Resolves the @types
+    // package.json (an always-present subpath) through the bundler, then reads its
+    // `exports` "types" / `types` field / default `index.d.ts` (the DT convention).
+    async function resolveAtTypesEntry(
+        this: Ctx,
+        specifier: string,
+        importerId: string,
+    ): Promise<{ dts: string | null; pkgJson: string | null }> {
+        const pkgName = packageNameOf(specifier);
+        const mangled = pkgName.startsWith('@') ? pkgName.slice(1).replace('/', '__') : pkgName;
+        const resolved = await this.resolve?.(`@types/${mangled}/package.json`, importerId, { skipSelf: true });
+        if (!resolved || resolved.external) return { dts: null, pkgJson: null };
+        const pkgJson = resolved.id;
+        const pkgDir = path.dirname(pkgJson);
+        const pj = readPackageJson(pkgDir);
+        if (pj) {
+            const fromExports = pj.exports != null ? typesFromExports(pj.exports, '.') : null;
+            if (fromExports) {
+                const p = path.resolve(pkgDir, fromExports);
+                if (isFile(p)) return { dts: p, pkgJson };
+            }
+            const t = pj.types ?? pj.typings;
+            if (typeof t === 'string') {
+                const p = path.resolve(pkgDir, t);
+                if (isFile(p)) return { dts: p, pkgJson };
+            }
+        }
+        const idx = path.join(pkgDir, 'index.d.ts'); // DefinitelyTyped default entry
+        if (isFile(idx)) return { dts: idx, pkgJson };
+        return { dts: null, pkgJson };
     }
 
     // The package.json half of `resolvePackageTypeEntry`: exports/types/typings, else

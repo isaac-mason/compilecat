@@ -1186,7 +1186,13 @@ fn resolve_export<L: ResolveLeaf>(
     }
 
     // (E) Bare `export * from S` — reached only when `name` is neither explicitly
-    // exported, locally declared, nor imported (so nothing shadows the wildcard).
+    // exported, locally declared, nor imported (so nothing shadows the wildcard). A
+    // name provided by TWO INDEPENDENT stars is AMBIGUOUS in ES (importing it is a
+    // SyntaxError → not an export), so resolve EVERY star and bail to `None` if more
+    // than one provides `name`. The shared `visited` set collapses diamonds / duplicate
+    // re-exports (a shared subgraph is walked once, the re-entry pruned), so a SECOND
+    // `Some` here is a genuinely distinct provider — not the same binding reached twice.
+    let mut found: Option<L::Out> = None;
     for stmt in &program.body {
         let Statement::ExportAllDeclaration(e) = stmt else { continue };
         if e.exported.is_some() {
@@ -1196,11 +1202,14 @@ fn resolve_export<L: ResolveLeaf>(
             continue;
         };
         if let Some(out) = resolve_export::<L>(name, target, dependencies, cache, depth + 1, visited) {
-            return Some(out);
+            if found.is_some() {
+                return None; // ambiguous: two independent `export *` provide `name`
+            }
+            found = Some(out);
         }
     }
 
-    None
+    found
 }
 
 /// Resolve a **local binding** `local` of `dependency` (a name bound *within* this
@@ -3133,6 +3142,30 @@ mod tests {
     }
 
     #[test]
+    fn type_path_ambiguous_double_wildcard_no_scalarize() {
+        // Type-side analogue of the ambiguity fix: `X` is provided by TWO independent
+        // `export *` as DIFFERENT tuple shapes → ambiguous, not an export. The resolver
+        // must yield no shape, so SROA must NOT scalarize (the tuple access is preserved).
+        let consumer = r#"import { X } from "./barrel";
+/* @sroa */ export function f(): number { const v: X = mk(); v[0] = v[1]; return v[0]; }"#;
+        let dependencies = vec![
+            barrel_dependency(
+                "./barrel",
+                "/p/barrel.d.ts",
+                "export * from './a.js';\nexport * from './b.js';",
+                &[("./a.js", "/p/a.d.ts"), ("./b.js", "/p/b.d.ts")],
+            ),
+            barrel_dependency("./a.js", "/p/a.d.ts", "export type X = [number, number];", &[]),
+            barrel_dependency("./b.js", "/p/b.d.ts", "export type X = [number, number, number];", &[]),
+        ];
+        let out = transform_cross_file(consumer, &dependencies, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(
+            out.contains("v[1]") && !out.contains("v_0"),
+            "ambiguous `X` from two `export *` must NOT scalarize:\n{out}"
+        );
+    }
+
+    #[test]
     fn type_path_named_reexport_shadows_wildcard_no_miscompile() {
         // Step-(2) authoritative path: an explicit `export { X } from './a'` (a's `X` is a
         // non-scalarizable function type) shadows a same-named `export * from './b'` (b's
@@ -3573,6 +3606,52 @@ mod tests {
         let out = transform_cross_file(consumer, &dependencies, &opts(), &mut crate::ModuleCache::new()).code;
         assert!(!out.contains("12345"), "must NOT inline the shadowed wildcard `set`:\n{out}");
         assert!(out.contains("set("), "the imported `set` call must be preserved:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_ambiguous_double_wildcard_no_miscompile() {
+        // `set` is provided by TWO independent `export *` re-exports with DIFFERENT
+        // bodies. In ES that name is ambiguous — importing it is a SyntaxError, so it is
+        // NOT an export of the barrel. The resolver must NOT pick one arbitrarily; it
+        // must leave the call alone (step E: 2+ independent providers → None).
+        let consumer = r#"import { set } from "./barrel";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1); }"#;
+        let dependencies = vec![
+            barrel_dependency(
+                "./barrel",
+                "/p/barrel.ts",
+                "export * from './a.js';\nexport * from './b.js';",
+                &[("./a.js", "/p/a.ts"), ("./b.js", "/p/b.ts")],
+            ),
+            barrel_dependency("./a.js", "/p/a.ts", "export function set(out, x) { out[0] = 111; return out; }", &[]),
+            barrel_dependency("./b.js", "/p/b.ts", "export function set(out, x) { out[0] = 222; return out; }", &[]),
+        ];
+        let out = transform_cross_file(consumer, &dependencies, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(!out.contains("111") && !out.contains("222"), "ambiguous `set` must NOT inline either body:\n{out}");
+        assert!(out.contains("set("), "the ambiguous `set` call must be preserved:\n{out}");
+    }
+
+    #[test]
+    fn cross_file_diamond_wildcard_still_inlines() {
+        // Control for the ambiguity fix: two `export *` reach the SAME underlying `set`
+        // (a diamond via two intermediates). That is NOT ambiguous — one binding reached
+        // twice — so it must STILL inline. The shared `visited` set collapses the diamond
+        // to a single provider.
+        let consumer = r#"import { set } from "./barrel";
+/* @optimize */ export function host(o: number[]): number[] { return set(o, 1); }"#;
+        let dependencies = vec![
+            barrel_dependency(
+                "./barrel",
+                "/p/barrel.ts",
+                "export * from './a.js';\nexport * from './b.js';",
+                &[("./a.js", "/p/a.ts"), ("./b.js", "/p/b.ts")],
+            ),
+            barrel_dependency("./a.js", "/p/a.ts", "export * from './c.js';", &[("./c.js", "/p/c.ts")]),
+            barrel_dependency("./b.js", "/p/b.ts", "export * from './c.js';", &[("./c.js", "/p/c.ts")]),
+            barrel_dependency("./c.js", "/p/c.ts", "export function set(out, x) { out[0] = 333; return out; }", &[]),
+        ];
+        let out = transform_cross_file(consumer, &dependencies, &opts(), &mut crate::ModuleCache::new()).code;
+        assert!(out.contains("333"), "the diamond's single `set` must still inline:\n{out}");
     }
 
     #[test]
