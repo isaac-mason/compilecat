@@ -1,7 +1,7 @@
 // Cross-module SHADOWING fuzzer — the automated hunt for the resolver bug class
 // described in cross_file.rs (resolve_export / resolve_local behind
 // resolve_value_origin). The consumer imports ONE name it calls; that name is
-// reachable across a random donor graph via a mix of JS/TS binding-precedence
+// reachable across a random dependency graph via a mix of JS/TS binding-precedence
 // shapes:
 //
 //   (A) sourced named re-export      `export { g as f } from S`
@@ -21,15 +21,15 @@
 // constant + a function of the args), so the oracle "compiled ≡ source" actually
 // distinguishes "inlined the RIGHT function" from "inlined a shadowed one".
 //
-// ORACLE: compile the consumer against the donors via `compileFileCross`, then run
-// `donors + consumer` (source) vs `donors + compiled` (output) in a plain-Function
+// ORACLE: compile the consumer against the dependencies via `compileFileCross`, then run
+// `dependencies + consumer` (source) vs `dependencies + compiled` (output) in a plain-Function
 // sandbox and assert the SAME result. We do NOT predict the resolver's decision —
 // only that behavior is unchanged. Every generated program is deterministic and
 // total (no Math.random / Date; callables return a comparable number), so any
 // divergence is a genuine miscompile.
 //
 // SEEDED: a mulberry32 PRNG seeded from the iteration index. A failure prints the
-// seed and the exact donor + consumer sources for a minimal handoff repro.
+// seed and the exact dependency + consumer sources for a minimal handoff repro.
 //
 //   pnpm test:js                                  # 60 seeded iters (fast CI gate)
 //   FUZZ=1 vitest run tst/fuzz-cross-shadow.test.ts   # 1500 iters (deep campaign)
@@ -40,7 +40,7 @@ import { transformSync } from 'esbuild';
 import { describe, expect, it } from 'vitest';
 
 import { createCompiler } from '../src/compiler';
-import type { DonorModule } from '../src/loader';
+import type { Dependency } from '../src/loader';
 
 const compiler = createCompiler();
 
@@ -64,7 +64,7 @@ const int = (r: Rng, lo: number, hi: number): number => lo + Math.floor(r() * (h
 
 // ── eval sandbox (mirrors cross-file.test.ts `ev`) ───────────────────────────
 //
-// Strip module syntax BEFORE esbuild so a combined donors+consumer (which has both
+// Strip module syntax BEFORE esbuild so a combined dependencies+consumer (which has both
 // `import { f }` and `function f`) doesn't trip a redeclare, then eval in a plain
 // Function. Both source and compiled go through the identical strip, so it's a
 // fair differential — the strip only removes import/export lines, never the body a
@@ -87,8 +87,8 @@ function equiv(want: EvalRes, got: EvalRes): boolean {
 
 // ── module-graph model ───────────────────────────────────────────────────────
 //
-// We build N donor modules m0..m(k-1). The consumer imports ONE flat name `f` from
-// the ENTRY donor m0 and calls `f(P, Q)` inside an `@optimize` (sometimes plain)
+// We build N dependency modules m0..m(k-1). The consumer imports ONE flat name `f` from
+// the ENTRY dependency m0 and calls `f(P, Q)` inside an `@optimize` (sometimes plain)
 // host. `f` is provided in m0 by ONE randomly chosen PRIMARY shape (A–E / opaque),
 // and — for the shadowing shapes — ALSO by a bare `export * from S` pointing at a
 // DIFFERENT module whose `f` has a distinct body. The generator wires the `resolved`
@@ -134,7 +134,7 @@ class ShadowGen {
         return this.idCounter++;
     }
 
-    /** A donor module that DIRECTLY defines + exports the callable `f` with a fresh
+    /** A dependency module that DIRECTLY defines + exports the callable `f` with a fresh
      *  identity. Used as the target of re-exports and `export *`. Sometimes the
      *  defining local name differs from `f` (renamed export). */
     private definingModule(name: string): { mod: Mod; id: number } {
@@ -152,7 +152,7 @@ class ShadowGen {
         return { mod: { specifier: spec, path, lines, edges: [] }, id };
     }
 
-    /** A donor module whose DEFAULT export is a fresh callable, in one of the
+    /** A dependency module whose DEFAULT export is a fresh callable, in one of the
      *  default shapes: `export default function name`, or a locally-declared
      *  callable re-surfaced as `export default name`. Used as the import target of
      *  the default-indirection primary shapes. */
@@ -178,8 +178,8 @@ class ShadowGen {
         return { mod: { specifier: spec, path, lines, edges: [] }, id };
     }
 
-    /** Build the whole scenario: consumer + donors + import specifier. */
-    scenario(): { consumer: string; donors: DonorModule[] } {
+    /** Build the whole scenario: consumer + dependencies + import specifier. */
+    scenario(): { consumer: string; dependencies: Dependency[] } {
         this.uid = 0;
         this.idCounter = 0;
         const name = 'f';
@@ -278,11 +278,11 @@ class ShadowGen {
             entry.lines.push(`import { ${name} } from "${def.mod.specifier}";`);
             entry.lines.push(`export { ${name} };`);
         } else if (primary === 'importUnresolvable') {
-            // `import { f } from S` where S is NOT in the donor set (out of scope).
+            // `import { f } from S` where S is NOT in the dependency set (out of scope).
             // Authoritative binding the resolver CANNOT follow → must stay a call,
             // must NOT fall through to a shadowed wildcard. No inlinable id.
             primaryId = null;
-            entry.lines.push(`import { ${name} } from "./unresolved-donor";`);
+            entry.lines.push(`import { ${name} } from "./unresolved-dependency";`);
             entry.lines.push(`export { ${name} };`);
         } else if (primary === 'opaqueGlobal') {
             // `const f = someGlobal.bind(...)` — a real callable at runtime but not
@@ -344,21 +344,21 @@ class ShadowGen {
         const optimize = chance(this.r, 0.85) ? '/* @optimize */ ' : '';
         const P = int(this.r, 2, 20);
         const Q = int(this.r, 1, 9);
-        // Occasionally mark the entry donor's export @inline (some primaries produce
+        // Occasionally mark the entry dependency's export @inline (some primaries produce
         // a plain fn the host wants inlined). We tag via a leading comment on the def
         // — only affects `function f`/`const f` local defs; harmless otherwise.
         const consumer =
             `import { ${name} } from "${entry.specifier}";\n` +
             `${optimize}export function entry(p, q) {\n  return ${name}(p + ${P}, q + ${Q});\n}`;
 
-        const donors: DonorModule[] = mods.map((m) => ({
+        const dependencies: Dependency[] = mods.map((m) => ({
             specifier: m.specifier,
             path: m.path,
             code: m.lines.join('\n'),
             resolved: m.edges,
         }));
         void primaryId;
-        return { consumer, donors };
+        return { consumer, dependencies };
     }
 
     /** DEFAULT-import scenario: the consumer does `import f from m0`, and the entry
@@ -374,7 +374,7 @@ class ShadowGen {
      *                                          the pre-existing step-A path)
      *    - `export default class`              (opaque — must throw, not fall through)
      *  No `export *` default exists, so these don't participate in wildcard shadowing. */
-    private defaultScenario(name: string, entry: Mod, mods: Mod[]): { consumer: string; donors: DonorModule[] } {
+    private defaultScenario(name: string, entry: Mod, mods: Mod[]): { consumer: string; dependencies: Dependency[] } {
         const shape = pick(this.r, [
             'defaultFn',
             'defaultLocalIdent',
@@ -432,46 +432,46 @@ class ShadowGen {
             `import ${name} from "${entry.specifier}";\n` +
             `${optimize}export function entry(p, q) {\n  return ${name}(p + ${P}, q + ${Q});\n}`;
 
-        const donors: DonorModule[] = mods.map((m) => ({
+        const dependencies: Dependency[] = mods.map((m) => ({
             specifier: m.specifier,
             path: m.path,
             code: m.lines.join('\n'),
             resolved: m.edges,
         }));
-        return { consumer, donors };
+        return { consumer, dependencies };
     }
 }
 
 // ── differential oracle ──────────────────────────────────────────────────────
 //
-// Compile consumer against donors, then compare `donorCode + consumer` (source)
-// vs `donorCode + compiled` (output). We prepend the ENTRY donor's code (m0) so a
+// Compile consumer against dependencies, then compare `dependencyCode + consumer` (source)
+// vs `dependencyCode + compiled` (output). We prepend the ENTRY dependency's code (m0) so a
 // kept import resolves and an inlined copy is harmless; but because m0 may itself
 // re-export from siblings that also define `f`, we must build a self-contained
 // module for the sandbox. We inline the WHOLE graph's callable definitions plus
 // the consumer's own binding of `f`.
 
-/** Flatten the donor graph into an executable prelude that reproduces what `f`
+/** Flatten the dependency graph into an executable prelude that reproduces what `f`
  *  binds to at runtime in the ENTRY module, following the same JS precedence the
  *  resolver models. Rather than re-implement resolution, we simply eval the real
- *  module graph: esbuild-bundle-free, we concatenate all donor bodies + consumer
+ *  module graph: esbuild-bundle-free, we concatenate all dependency bodies + consumer
  *  and let the sandbox's own scope + the consumer's `import { f }` line (stripped)
  *  fall back to the entry module's binding. To make that deterministic we instead
  *  RESOLVE `f` by executing the graph as ES modules via esbuild is overkill; a
  *  simpler, robust approach: run source and compiled through the SAME concatenation
  *  so any resolution asymmetry shows as a divergence. */
-function crossDiff(consumer: string, donors: DonorModule[]): { want: unknown; got: unknown; compiled: string } | null {
+function crossDiff(consumer: string, dependencies: Dependency[]): { want: unknown; got: unknown; compiled: string } | null {
     // The self-contained "source" program: define `f` exactly as the ENTRY module
     // binds it, by evaluating the real module graph. We build a tiny CJS-ish harness
-    // that wires each donor into a `require`-like map keyed by path, honoring the
+    // that wires each dependency into a `require`-like map keyed by path, honoring the
     // resolved edges — this reproduces runtime binding precedence faithfully.
     const call = 'entry(7, 3)';
-    const want = evalGraph(consumer, donors, call);
-    const compiled = compiler.compileFileCross('entry.ts', consumer, donors, {}).code;
+    const want = evalGraph(consumer, dependencies, call);
+    const compiled = compiler.compileFileCross('entry.ts', consumer, dependencies, {}).code;
     // The compiled consumer either inlined `f` (self-contained) or kept the import.
     // If it kept the import, we must still bind `f` from the graph, so run it through
     // the SAME graph harness with the compiled consumer body substituted.
-    const got = evalGraph(compiled, donors, call);
+    const got = evalGraph(compiled, dependencies, call);
 
     // Throwing is an equivalence CLASS, not a skip: an opaque/unresolvable `f` that
     // throws "not a function"/"class constructor" at runtime MUST still throw after
@@ -484,32 +484,32 @@ function crossDiff(consumer: string, donors: DonorModule[]): { want: unknown; go
 }
 
 /** Execute the module graph faithfully: a minimal ESM-linker in a Function sandbox.
- *  Each donor becomes a module object; imports/re-exports/`export *` are resolved by
+ *  Each dependency becomes a module object; imports/re-exports/`export *` are resolved by
  *  path via the `resolved` edges, reproducing JS binding precedence at RUNTIME (the
  *  ground truth the compiler must preserve). The consumer is the entry; we call
  *  `entry(...)` and return its value. */
-function evalGraph(consumer: string, donors: DonorModule[], call: string): EvalRes {
+function evalGraph(consumer: string, dependencies: Dependency[], call: string): EvalRes {
     try {
-        // Map path -> donor module. Entry donor is the one whose specifier matches the
+        // Map path -> dependency module. Entry dependency is the one whose specifier matches the
         // consumer's `import { … } from "<spec>"`.
-        const byPath = new Map<string, DonorModule>();
-        for (const d of donors) {
+        const byPath = new Map<string, Dependency>();
+        for (const d of dependencies) {
             byPath.set(d.path, d);
         }
         const entrySpecMatch =
             consumer.match(/import\s*\{[^}]*\}\s*from\s*["']([^"']+)["']/) ||
             consumer.match(/import\s+[A-Za-z_$][\w$]*\s+from\s*["']([^"']+)["']/);
         const entrySpec = entrySpecMatch ? entrySpecMatch[1] : './m0';
-        const entryDonor = donors.find((d) => d.specifier === entrySpec);
-        if (!entryDonor) return { ok: false };
+        const entryDependency = dependencies.find((d) => d.specifier === entrySpec);
+        if (!entryDependency) return { ok: false };
 
         // Resolve a module's exported bindings into a flat record { name: value }.
         // Memoized per path; follows named/sourceless exports, imports, and export *.
         const moduleCache = new Map<string, Record<string, unknown>>();
         const resolving = new Set<string>();
 
-        function evalModuleLocals(d: DonorModule): Record<string, unknown> {
-            // Execute the donor's body in a sandbox where its imports are pre-bound
+        function evalModuleLocals(d: Dependency): Record<string, unknown> {
+            // Execute the dependency's body in a sandbox where its imports are pre-bound
             // to the resolved targets' exports. Returns the module's LOCAL scope
             // (all declared/imported names) so export clauses can pick from it.
             const edgeByspec = new Map(d.resolved.map((e) => [e.specifier, e.path]));
@@ -564,7 +564,7 @@ function evalGraph(consumer: string, donors: DonorModule[], call: string): EvalR
             return fn(...argVals) as Record<string, unknown>;
         }
 
-        function resolveExports(d: DonorModule): Record<string, unknown> {
+        function resolveExports(d: Dependency): Record<string, unknown> {
             if (moduleCache.has(d.path)) return moduleCache.get(d.path)!;
             if (resolving.has(d.path)) return {}; // cycle guard
             resolving.add(d.path);
@@ -635,7 +635,7 @@ function evalGraph(consumer: string, donors: DonorModule[], call: string): EvalR
         // Bind `f` (and any other imported names) from the entry module's exports.
         // A named import (`import { f }`) binds each name from the matching export;
         // a default import (`import f from`) binds the local to the `default` export.
-        const entryExports = resolveExports(entryDonor);
+        const entryExports = resolveExports(entryDependency);
         const args: string[] = [];
         const argVals: unknown[] = [];
         const consumerNamedImport = consumer.match(/import\s*\{([^}]*)\}\s*from/);
@@ -673,28 +673,28 @@ describe('cross-module shadowing fuzzer: compiled output ≡ source', () => {
     const BASE = Number(process.env.FUZZ_SEED ?? 0) || 0x5adf00d;
 
     it(
-        `${ITERS} random donor-graph scenarios preserve semantics`,
+        `${ITERS} random dependency-graph scenarios preserve semantics`,
         () => {
             for (let i = 0; i < ITERS; i++) {
                 const seed = (BASE + i * 2654435761) >>> 0;
-                const { consumer, donors } = new ShadowGen(mulberry32(seed)).scenario();
+                const { consumer, dependencies } = new ShadowGen(mulberry32(seed)).scenario();
                 let d: ReturnType<typeof crossDiff>;
                 try {
-                    d = crossDiff(consumer, donors);
+                    d = crossDiff(consumer, dependencies);
                 } catch (e) {
                     d = { want: 'n/a', got: `<compile threw: ${(e as Error).message}>`, compiled: '' };
                 }
                 if (d) {
-                    const donorDump = donors
+                    const dependencyDump = dependencies
                         .map(
                             (m) =>
-                                `--- donor ${m.specifier} (${m.path}) ---\n${m.code}\n  resolved: ${JSON.stringify(m.resolved)}`,
+                                `--- dependency ${m.specifier} (${m.path}) ---\n${m.code}\n  resolved: ${JSON.stringify(m.resolved)}`,
                         )
                         .join('\n\n');
                     throw new Error(
                         `CROSS-SHADOW MISCOMPILE (seed=${seed}, FUZZ_SEED=${BASE} i=${i})\n` +
                             `entry(7, 3)   want=${JSON.stringify(d.want)} got=${JSON.stringify(d.got)}\n\n` +
-                            `--- consumer ---\n${consumer}\n\n${donorDump}\n\n` +
+                            `--- consumer ---\n${consumer}\n\n${dependencyDump}\n\n` +
                             `--- compiled ---\n${d.compiled}\n`,
                     );
                 }

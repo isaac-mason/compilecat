@@ -52,7 +52,7 @@ pub fn run_all<'a>(
 /// cleanup gate — used by the cross-file path to mark `@inline` *target*
 /// functions (which carry no directive of their own) so their inlined residue
 /// gets cleaned. `uid_base` continues the cross-file driver's inline-temp counter
-/// so generated names stay unique across the donor-inline → local-pipeline
+/// so generated names stay unique across the dependency-inline → local-pipeline
 /// boundary (single-file callers pass 0).
 pub fn run_all_gated<'a>(
     allocator: &'a Allocator,
@@ -83,7 +83,7 @@ pub fn run_all_gated<'a>(
     // directive (and their subtrees), PLUS the `@inline` consumers above, are
     // optimized/cleaned; everything else is left byte-identical. Built after
     // inlining so those consumer spans are known (the surviving directive
-    // comments are still present — inline only strips fully-inlined donors).
+    // comments are still present — inline only strips fully-inlined dependencies).
     // `gate()` mints a fresh gate per pass.
     let mut touched_set = directives::touched_spans(program);
     touched_set.extend(extra_touched.iter().copied());

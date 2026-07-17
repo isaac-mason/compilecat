@@ -3,10 +3,10 @@
 export declare class Compiler {
   constructor()
   /**
-   * Cross-module per-file pass: inline `@inline` donors the consumer imports.
-   * The JS plugin resolves + reads the donor modules and passes them here.
+   * Cross-module per-file pass: inline `@inline` dependencies the consumer imports.
+   * The JS plugin resolves + reads the dependency modules and passes them here.
    */
-  compileFileCross(id: string, code: string, donors: Array<DonorModule>, options?: CompileOptions | undefined | null): CompileResult
+  compileFileCross(id: string, code: string, dependencies: Array<Dependency>, options?: CompileOptions | undefined | null): CompileResult
   /** Per-file pass — universal (every bundler has a `transform` hook). */
   compileFile(id: string, code: string, options?: CompileOptions | undefined | null): CompileResult
   /** Whole-program pass — rollup-family `renderChunk` only. */
@@ -53,28 +53,28 @@ export interface CompileStats {
   stripped: number
 }
 
-/**
- * The specifiers the donor BFS should follow from ONE module — the AST-based
- * replacement for the plugin's brittle donor-edge regexes. `id` is the donor's
- * path, used only to pick the source type (so `.d.ts`/`.tsx`/`.js` parse
- * correctly); the return is a dedup'd, order-stable list of import/re-export
- * specifiers `S` the plugin should read as further donors (see
- * [`compilecat_core::donor_edges`]).
- */
-export declare function donorEdges(id: string, code: string): Array<string>
-
-export interface DonorModule {
+export interface Dependency {
   specifier: string
   /**
-   * The donor's own resolved path — lets the core rebase the donor's relative
+   * The dependency's own resolved path — lets the core rebase the dependency's relative
    * imports when forwarding them into the consumer, and match it as a
    * re-export target.
    */
   path: string
   code: string
-  /** Resolved re-export/import edges of this donor (specifier → path). */
+  /** Resolved re-export/import edges of this dependency (specifier → path). */
   resolved: Array<ResolvedEdge>
 }
+
+/**
+ * The specifiers the dependency BFS should follow from ONE module — the AST-based
+ * replacement for the plugin's brittle dependency-edge regexes. `id` is the dependency's
+ * path, used only to pick the source type (so `.d.ts`/`.tsx`/`.js` parse
+ * correctly); the return is a dedup'd, order-stable list of import/re-export
+ * specifiers `S` the plugin should read as further dependencies (see
+ * [`compilecat_core::dependency_edges`]).
+ */
+export declare function dependencyEdges(id: string, code: string): Array<string>
 
 /**
  * Identity reprint (parse → codegen, no passes). The differential harness runs
@@ -83,9 +83,36 @@ export interface DonorModule {
 export declare function format(id: string, code: string): string
 
 /**
- * A donor module the consumer imports from (already resolved + read by the JS
+ * One module edge the host still needs but that isn't reachable within the
+ * dependencies gathered so far — the demand-driven counterpart to a `Dependency`.
+ * The plugin resolves `specifier` relative to `from_path` (as a runtime module for
+ * `kind: "value"`, a type module for `kind: "type"`), reads it, adds it as a dependency,
+ * and calls [`resolution_frontier`] again until the frontier is empty.
+ */
+export interface FrontierRequest {
+  specifier: string
+  fromPath: string
+  /** `"value"` (runtime `.js`) or `"type"` (`.d.ts`). */
+  kind: string
+}
+
+/**
+ * The module edges the host still needs given the dependencies gathered so far — the
+ * demand-driven dependency-gather fixpoint's "what's still missing?" query. STATELESS:
+ * the plugin calls this with a growing `provided` set until it returns `[]`, then
+ * hands the assembled set to `compileFileCross` (the unchanged inliner). A
+ * directive-less host needs nothing → `[]`, UNLESS it calls a first-party
+ * `@inline`-def name in `inline_def_names` (the build-start index of
+ * `/* @inline *\/ export function NAME` defs) — then that def's module is a value
+ * need. `id` is the host's path (picks the source type). See
+ * [`compilecat_core::resolution_frontier`].
+ */
+export declare function resolutionFrontier(id: string, code: string, provided: Array<Dependency>, inlineDefNames: Array<string>): Array<FrontierRequest>
+
+/**
+ * A dependency module the consumer imports from (already resolved + read by the JS
  * plugin, which owns module resolution and the filesystem/watch).
- * A resolved `… from '<specifier>'` edge of a donor — lets the core follow a
+ * A resolved `… from '<specifier>'` edge of a dependency — lets the core follow a
  * re-export (`export * as vec3 from './vec3'`) to the module at `path`.
  */
 export interface ResolvedEdge {

@@ -11,14 +11,16 @@
 use std::cell::RefCell;
 
 use compilecat_core::{
-    donor_edges as core_donor_edges, format as core_format, transform, transform_cross_file, Donor,
-    Mode, ModuleCache, SourceType, Stats, TransformOptions, TransformOutput,
+    dependency_edges as core_dependency_edges, format as core_format,
+    resolution_frontier as core_resolution_frontier, transform, transform_cross_file,
+    Dependency as CoreDependency, FrontierKind as CoreFrontierKind, Mode, ModuleCache, SourceType,
+    Stats, TransformOptions, TransformOutput,
 };
 use napi_derive::napi;
 
-/// A donor module the consumer imports from (already resolved + read by the JS
+/// A dependency module the consumer imports from (already resolved + read by the JS
 /// plugin, which owns module resolution and the filesystem/watch).
-/// A resolved `… from '<specifier>'` edge of a donor — lets the core follow a
+/// A resolved `… from '<specifier>'` edge of a dependency — lets the core follow a
 /// re-export (`export * as vec3 from './vec3'`) to the module at `path`.
 #[napi(object)]
 pub struct ResolvedEdge {
@@ -27,14 +29,14 @@ pub struct ResolvedEdge {
 }
 
 #[napi(object)]
-pub struct DonorModule {
+pub struct Dependency {
     pub specifier: String,
-    /// The donor's own resolved path — lets the core rebase the donor's relative
+    /// The dependency's own resolved path — lets the core rebase the dependency's relative
     /// imports when forwarding them into the consumer, and match it as a
     /// re-export target.
     pub path: String,
     pub code: String,
-    /// Resolved re-export/import edges of this donor (specifier → path).
+    /// Resolved re-export/import edges of this dependency (specifier → path).
     pub resolved: Vec<ResolvedEdge>,
 }
 
@@ -45,16 +47,86 @@ pub fn format(id: String, code: String) -> String {
     core_format(&code, &id)
 }
 
-/// The specifiers the donor BFS should follow from ONE module — the AST-based
-/// replacement for the plugin's brittle donor-edge regexes. `id` is the donor's
+/// The specifiers the dependency BFS should follow from ONE module — the AST-based
+/// replacement for the plugin's brittle dependency-edge regexes. `id` is the dependency's
 /// path, used only to pick the source type (so `.d.ts`/`.tsx`/`.js` parse
 /// correctly); the return is a dedup'd, order-stable list of import/re-export
-/// specifiers `S` the plugin should read as further donors (see
-/// [`compilecat_core::donor_edges`]).
+/// specifiers `S` the plugin should read as further dependencies (see
+/// [`compilecat_core::dependency_edges`]).
 #[napi]
-pub fn donor_edges(id: String, code: String) -> Vec<String> {
+pub fn dependency_edges(id: String, code: String) -> Vec<String> {
     let source_type = SourceType::from_path(&id).unwrap_or_default();
-    core_donor_edges(&code, source_type)
+    core_dependency_edges(&code, source_type)
+}
+
+/// The JS string a core `FrontierKind` marshals to — `"value"` (a runtime `.js`
+/// need) or `"type"` (a `.d.ts` need). A plain string keeps the JS contract exactly
+/// `kind: "value" | "type"` (a napi `string_enum` would escape the reserved variant
+/// name `type` into the value `"r#type"`).
+fn kind_str(k: CoreFrontierKind) -> String {
+    match k {
+        CoreFrontierKind::Value => "value".to_string(),
+        CoreFrontierKind::Type => "type".to_string(),
+    }
+}
+
+/// One module edge the host still needs but that isn't reachable within the
+/// dependencies gathered so far — the demand-driven counterpart to a `Dependency`.
+/// The plugin resolves `specifier` relative to `from_path` (as a runtime module for
+/// `kind: "value"`, a type module for `kind: "type"`), reads it, adds it as a dependency,
+/// and calls [`resolution_frontier`] again until the frontier is empty.
+#[napi(object)]
+pub struct FrontierRequest {
+    pub specifier: String,
+    pub from_path: String,
+    /// `"value"` (runtime `.js`) or `"type"` (`.d.ts`).
+    pub kind: String,
+}
+
+/// The module edges the host still needs given the dependencies gathered so far — the
+/// demand-driven dependency-gather fixpoint's "what's still missing?" query. STATELESS:
+/// the plugin calls this with a growing `provided` set until it returns `[]`, then
+/// hands the assembled set to `compileFileCross` (the unchanged inliner). A
+/// directive-less host needs nothing → `[]`, UNLESS it calls a first-party
+/// `@inline`-def name in `inline_def_names` (the build-start index of
+/// `/* @inline */ export function NAME` defs) — then that def's module is a value
+/// need. `id` is the host's path (picks the source type). See
+/// [`compilecat_core::resolution_frontier`].
+#[napi]
+pub fn resolution_frontier(
+    id: String,
+    code: String,
+    provided: Vec<Dependency>,
+    inline_def_names: Vec<String>,
+) -> Vec<FrontierRequest> {
+    let provided: Vec<CoreDependency> = provided
+        .into_iter()
+        .map(|d| CoreDependency {
+            specifier: d.specifier,
+            path: d.path,
+            code: d.code,
+            resolved: d.resolved.into_iter().map(|r| (r.specifier, r.path)).collect(),
+        })
+        .collect();
+    core_resolution_frontier(
+        &id,
+        &code,
+        &provided,
+        &inline_def_names,
+        &TransformOptions {
+            filename: id.clone(),
+            source_type: None,
+            mode: Mode::PerFile,
+            sourcemap: false,
+        },
+    )
+    .into_iter()
+    .map(|(specifier, from_path, kind)| FrontierRequest {
+        specifier,
+        from_path,
+        kind: kind_str(kind),
+    })
+    .collect()
 }
 
 #[napi(object)]
@@ -121,12 +193,12 @@ pub struct CompileOptions {
 
 #[napi]
 pub struct Compiler {
-    /// Build-scoped parsed-module cache, amortized across every call (donors
+    /// Build-scoped parsed-module cache, amortized across every call (dependencies
     /// parsed once per build). Behind a `RefCell` because napi methods take
     /// `&self` and the bundler drives plugin transforms on one JS thread, so the
     /// `!Send` oxc ASTs it holds are never shared across threads — and napi does
     /// NOT require the `#[napi]` struct to be `Send` (verified: this compiles).
-    /// `compile_file_cross` parses every donor through it once per build.
+    /// `compile_file_cross` parses every dependency through it once per build.
     cache: RefCell<ModuleCache>,
 }
 
@@ -138,20 +210,20 @@ impl Compiler {
         Compiler { cache: RefCell::new(ModuleCache::new()) }
     }
 
-    /// Cross-module per-file pass: inline `@inline` donors the consumer imports.
-    /// The JS plugin resolves + reads the donor modules and passes them here.
+    /// Cross-module per-file pass: inline `@inline` dependencies the consumer imports.
+    /// The JS plugin resolves + reads the dependency modules and passes them here.
     #[napi]
     pub fn compile_file_cross(
         &self,
         id: String,
         code: String,
-        donors: Vec<DonorModule>,
+        dependencies: Vec<Dependency>,
         options: Option<CompileOptions>,
     ) -> CompileResult {
         let sourcemap = options.as_ref().and_then(|o| o.sourcemap).unwrap_or(true);
-        let donors: Vec<Donor> = donors
+        let dependencies: Vec<CoreDependency> = dependencies
             .into_iter()
-            .map(|d| Donor {
+            .map(|d| CoreDependency {
                 specifier: d.specifier,
                 path: d.path,
                 code: d.code,
@@ -160,7 +232,7 @@ impl Compiler {
             .collect();
         let out = transform_cross_file(
             &code,
-            &donors,
+            &dependencies,
             &TransformOptions { filename: id, source_type: None, mode: Mode::PerFile, sourcemap },
             &mut self.cache.borrow_mut(),
         );

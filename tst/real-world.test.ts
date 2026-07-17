@@ -233,9 +233,9 @@ describe('module-scratch scalar replacement — real crashcat patterns', () => {
     // The real crashcat/mathcat shape, end-to-end through `compileFileCross`: an opaque
     // `create()` scratch typed `: Quat`, where `Quat` is declared in `types.d.ts` and
     // re-exported by the package entry via a bare `export * from './types.js'`. The
-    // type-shape oracle follows the wildcard re-export across the `.d.ts` donor graph
+    // type-shape oracle follows the wildcard re-export across the `.d.ts` dependency graph
     // (`resolve_type_alias_shape`, cross_file.rs) to recover the arity so SROA fires.
-    // NB: the type-source donors carry `.d.ts` paths — a `.js` path would drop the types.
+    // NB: the type-source dependencies carry `.d.ts` paths — a `.js` path would drop the types.
     it('cross-package type re-export: mathcat-shaped .d.ts barrel resolves for SROA', () => {
         const consumer = `import { type Quat, quat } from 'mathcat';
 const _s: Quat = /* @__PURE__ */ quat.create();

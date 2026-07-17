@@ -1,4 +1,4 @@
-// Pure (fs-free) type-resolution helpers used by the plugin's type-source donor
+// Pure (fs-free) type-resolution helpers used by the plugin's type-source dependency
 // gathering: mapping runtime specifiers to `.d.ts` candidates, resolving a
 // package.json `exports` map to its `"types"` target, and detecting which imports
 // are TYPE imports. Kept separate from the plugin so they're unit-testable without
@@ -12,7 +12,7 @@ const IMPORT_CLAUSE = /import\b([^'"]*?)from\s*['"]([^'"]+)['"]/g;
  * The BARE specifiers a module imports TYPES from (`import type …` or an inline
  * `{ type X }`). Type-source `.d.ts` gathering is scoped to these — a package used
  * purely at runtime is never trawled. Relative imports are excluded: their `.ts`
- * source is the runtime donor and already carries its types.
+ * source is the runtime dependency and already carries its types.
  */
 export function typeImportSpecifiers(code: string): string[] {
     const out: string[] = [];

@@ -1,5 +1,5 @@
 //! Port of the `remove-unused-code.ts` slice (jscomp `RemoveUnusedCode` subset):
-//! drop bindings left unused after inlining so fully-inlined donors and their
+//! drop bindings left unused after inlining so fully-inlined dependencies and their
 //! imports don't linger in the intermediate TS output. Removes:
 //!   - unused `let|const|var` declarators with a pure / absent init,
 //!   - unused `function NAME() {}` declarations,

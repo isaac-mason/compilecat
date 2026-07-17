@@ -185,7 +185,7 @@ function scale(a, s) { return { x: a.x * s, y: a.y * s }; }
         call: 'f(6)',
     },
     {
-        // init-position reuse is UNSAFE: the donor body free-refs `base` (the
+        // init-position reuse is UNSAFE: the dependency body free-refs `base` (the
         // module const), which matches the consumer's `let base`. Naive reuse
         // (`let base; { …base… }`) would read the TDZ var — must demote to a
         // fresh temp so `a + base` still binds the module const (100).

@@ -7,7 +7,7 @@
 //!
 //! Lives in `analysis/` because it's cross-cutting: SROA projects a
 //! `ResolvedType` down to a [`Shape`] via [`shape_of`] to scalarize aggregates,
-//! and the cross-file driver runs [`build_alias_shapes`] over donor programs to
+//! and the cross-file driver runs [`build_alias_shapes`] over dependency programs to
 //! resolve *imported* types. Future passes (const-enum, narrowing) will consume
 //! the richer `ResolvedType` variants directly.
 
@@ -340,7 +340,7 @@ pub(crate) fn declares_type(program: &Program, name: &str) -> bool {
 }
 
 /// Top-level `type X`/`interface X` → `Shape`, for the cross-file driver to
-/// resolve an *imported* type's shape from a donor program. Thin projection over
+/// resolve an *imported* type's shape from a dependency program. Thin projection over
 /// the resolver's declaration phase.
 pub(crate) fn build_alias_shapes(program: &Program) -> HashMap<String, Shape> {
     build_type_map(program)

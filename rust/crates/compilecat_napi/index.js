@@ -587,5 +587,6 @@ if (!nativeBinding) {
 
 module.exports = nativeBinding
 module.exports.Compiler = nativeBinding.Compiler
-module.exports.donorEdges = nativeBinding.donorEdges
+module.exports.dependencyEdges = nativeBinding.dependencyEdges
 module.exports.format = nativeBinding.format
+module.exports.resolutionFrontier = nativeBinding.resolutionFrontier

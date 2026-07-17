@@ -1,4 +1,4 @@
-// End-to-end type-source donor resolution: a real on-disk package (package.json +
+// End-to-end type-source dependency resolution: a real on-disk package (package.json +
 // dist `.js`/`.d.ts`) imported for TYPES, driven through the compilecat plugin in a
 // real rollup build. Proves the plugin resolves the `.d.ts` type surface (types
 // field / exports condition), follows the `.d.ts` re-export graph, and feeds the
@@ -62,7 +62,7 @@ const _s: Quat = /* @__PURE__ */ create();
 const scalarized = (code: string) => /_s_0\b/.test(code) && !/\b_s\[/.test(code);
 
 beforeAll(() => {
-    root = mkdtempSync(path.join(tmpdir(), 'cc-typedonors-'));
+    root = mkdtempSync(path.join(tmpdir(), 'cc-typedeps-'));
 });
 afterAll(() => {
     rmSync(root, { recursive: true, force: true });

@@ -33,7 +33,7 @@ async function build(files: Record<string, string>, input: string): Promise<stri
 }
 
 describe('compiler per-file transform plugin (rollup)', () => {
-    it('inlines an @inline donor during transform', async () => {
+    it('inlines an @inline dependency during transform', async () => {
         const code = await build(
             {
                 'entry.js': `/* @inline */ function add(a, b) { return a + b; }\nexport function step(x) { return add(x, 1); }`,

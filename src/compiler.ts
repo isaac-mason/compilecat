@@ -44,23 +44,35 @@ export type ResolvedEdge = {
     path: string;
 };
 
-export type DonorModule = {
+export type Dependency = {
     specifier: string;
-    /** The donor's own resolved path — lets the core rebase the donor's relative
+    /** The dependency's own resolved path — lets the core rebase the dependency's relative
      *  imports when forwarding them into the consumer, and match it as a
      *  re-export target. */
     path: string;
     code: string;
-    /** Resolved `… from '<specifier>'` edges of this donor (specifier → path),
+    /** Resolved `… from '<specifier>'` edges of this dependency (specifier → path),
      *  so the core can follow re-export barrels without resolving modules. */
     resolved: ResolvedEdge[];
+};
+
+/** One module edge the host still needs but that isn't reachable within the
+ *  dependencies gathered so far — the demand-driven counterpart to a `Dependency`.
+ *  The plugin resolves `specifier` relative to `fromPath` (as a runtime module
+ *  for `kind: "value"`, a type module for `kind: "type"`), reads it, adds it as a
+ *  dependency, and calls `resolutionFrontier` again until the frontier is empty. */
+export type FrontierRequest = {
+    specifier: string;
+    fromPath: string;
+    /** `"value"` (runtime `.js`) or `"type"` (`.d.ts`). */
+    kind: string;
 };
 
 export type Compiler = {
     compileFile(id: string, code: string, options?: CompileOptions): CompileResult;
     compileChunk(id: string, code: string, options?: CompileOptions): CompileResult;
-    /** Cross-module: inline `@inline` donors the consumer imports. */
-    compileFileCross(id: string, code: string, donors: DonorModule[], options?: CompileOptions): CompileResult;
+    /** Cross-module: inline `@inline` dependencies the consumer imports. */
+    compileFileCross(id: string, code: string, dependencies: Dependency[], options?: CompileOptions): CompileResult;
     /** Run a single named pass in isolation. Null for an unknown pass. */
     runPass(name: string, id: string, code: string): CompileResult | null;
 };
@@ -68,10 +80,15 @@ export type Compiler = {
 type Addon = {
     Compiler: new () => Compiler;
     format: (id: string, code: string) => string;
-    /** The specifiers the donor BFS should follow from ONE module — the AST-based
-     *  replacement for the plugin's donor-edge regexes. `id` (the donor's path)
+    /** The specifiers the dependency BFS should follow from ONE module — the AST-based
+     *  replacement for the plugin's dependency-edge regexes. `id` (the dependency's path)
      *  picks the source type; returns a dedup'd, order-stable specifier list. */
-    donorEdges: (id: string, code: string) => string[];
+    dependencyEdges: (id: string, code: string) => string[];
+    /** The module edges the host still needs given the dependencies gathered so far —
+     *  the demand-driven dependency-gather fixpoint's "what's still missing?" query.
+     *  `inlineDefNames` is the build-start index of first-party `@inline`-def names;
+     *  a host that CALLS one gathers its module even with no directive of its own. */
+    resolutionFrontier: (id: string, code: string, provided: Dependency[], inlineDefNames: string[]) => FrontierRequest[];
 };
 
 let addon: Addon | undefined;
@@ -109,7 +126,7 @@ function loadAddon(): Addon {
 }
 
 /** Mirrors the `createCompiler()` seam — one instance per build amortizes any
- *  internal caches (donor parse cache, etc.). */
+ *  internal caches (dependency parse cache, etc.). */
 export function createCompiler(): Compiler {
     const { Compiler } = loadAddon();
     return new Compiler();
@@ -121,10 +138,25 @@ export function format(id: string, code: string): string {
     return loadAddon().format(id, code);
 }
 
-/** The specifiers the donor BFS should follow from ONE module (`id` = the donor's
+/** The specifiers the dependency BFS should follow from ONE module (`id` = the dependency's
  *  path, `code` = its source) — the AST-based replacement for the plugin's brittle
- *  donor-edge regexes. Returns a dedup'd, order-stable list of import/re-export
- *  specifiers to read as further donors. */
-export function donorEdges(id: string, code: string): string[] {
-    return loadAddon().donorEdges(id, code);
+ *  dependency-edge regexes. Returns a dedup'd, order-stable list of import/re-export
+ *  specifiers to read as further dependencies. */
+export function dependencyEdges(id: string, code: string): string[] {
+    return loadAddon().dependencyEdges(id, code);
+}
+
+/** The module edges the host still needs given the dependencies gathered so far — the
+ *  demand-driven dependency-gather fixpoint's "what's still missing?" query. STATELESS:
+ *  the plugin calls this with a growing `provided` set until it returns `[]`, then
+ *  hands the assembled set to `compileFileCross`. A directive-less host → `[]`, unless
+ *  it calls a first-party `@inline`-def name in `inlineDefNames` (the build-start index),
+ *  in which case that def's defining module is gathered so the call can be inlined. */
+export function resolutionFrontier(
+    id: string,
+    code: string,
+    provided: Dependency[],
+    inlineDefNames: string[],
+): FrontierRequest[] {
+    return loadAddon().resolutionFrontier(id, code, provided, inlineDefNames);
 }

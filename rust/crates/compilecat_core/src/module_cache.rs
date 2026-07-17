@@ -1,9 +1,9 @@
 //! Persistent parsed-module cache (see `rust/ARCHITECTURE.md`).
 //!
 //! Caches parsed modules by `(path, content-hash)` so a module is parsed **once
-//! per build** and reused — whatever role it plays (an inlining donor today, a
+//! per build** and reused — whatever role it plays (an inlining dependency today, a
 //! type source for the type-resolution layer tomorrow, etc.). This layer is
-//! deliberately role-agnostic: it knows about *modules*, not "donors". Callers
+//! deliberately role-agnostic: it knows about *modules*, not "dependencies". Callers
 //! assign the role. `ParsedModule` owns its parse (source + arena + AST) so it
 //! stays alive across calls; nodes are `clone_in`'d *out* into a consumer arena
 //! at use time, keeping arenas independent.

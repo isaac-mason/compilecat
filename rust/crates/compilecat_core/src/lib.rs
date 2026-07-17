@@ -10,13 +10,15 @@ mod module_cache;
 mod options;
 mod passes;
 
-pub use cross_file::{donor_edges, transform_cross_file, Donor};
+pub use cross_file::{
+    dependency_edges, resolution_frontier, transform_cross_file, Dependency, FrontierKind,
+};
 pub use module_cache::ModuleCache;
 
 pub use options::{Mode, Stats, TransformOptions, TransformOutput};
 
-/// Re-exported so hosts (napi/wasm) can derive a donor's source type from its path
-/// (`SourceType::from_path`) before calling [`donor_edges`], without depending on
+/// Re-exported so hosts (napi/wasm) can derive a dependency's source type from its path
+/// (`SourceType::from_path`) before calling [`dependency_edges`], without depending on
 /// `oxc_span` directly.
 pub use oxc_span::SourceType;
 
@@ -62,7 +64,7 @@ pub fn transform(source: &str, options: &TransformOptions) -> TransformOutput {
     let mut program = parse_program(&allocator, source, source_type);
 
     let mut stats = Stats::default();
-    // No donors in the per-file path → no cross-module type aliases.
+    // No dependencies in the per-file path → no cross-module type aliases.
     passes::run_all(
         &allocator,
         &mut program,
@@ -247,12 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn inline_fires_on_exported_donor() {
+    fn inline_fires_on_exported_dependency() {
         let out = inline(
             "/* @inline */ export function add(a, b) { return a + b; }\nexport function s(x) { return add(x, 1); }",
         );
         assert!(out.contains("return x + 1"), "got: {out}");
-        // exported donor is kept (other modules may import it)
+        // exported dependency is kept (other modules may import it)
         assert!(out.contains("export function add"), "got: {out}");
     }
 
@@ -260,7 +262,7 @@ mod tests {
     fn inline_block_void_helper() {
         let out = inline("/* @inline */ function init(o, a) { o.x = a; o.y = a; }\nfunction s(v) { init(v, 5); }");
         assert!(!out.contains("init("), "call should be spliced: {out}");
-        assert!(!out.contains("function init"), "donor should be stripped: {out}");
+        assert!(!out.contains("function init"), "dependency should be stripped: {out}");
         assert!(out.contains(".x ="), "body should be spliced: {out}");
     }
 

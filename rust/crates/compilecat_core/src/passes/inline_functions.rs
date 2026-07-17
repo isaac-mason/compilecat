@@ -13,7 +13,7 @@
 //!
 //! The declaration is removed once no references remain. Member calls
 //! (`NS.fn(...)`) are matched via `call_key` for cross-file namespace/object
-//! donors.
+//! dependencies.
 //!
 //! Side-effect safety: a param whose arg may have side effects and is used more
 //! than once in a DIRECT body bails that call — and falls back to BLOCK (whose
@@ -50,8 +50,8 @@ pub(crate) struct Candidate<'a> {
     free: HashSet<String>,
 }
 
-/// Resets every span in a subtree to `SPAN`. Cross-file inlining clones donor AST
-/// into a *different* module; those spans index the donor's source text, so left
+/// Resets every span in a subtree to `SPAN`. Cross-file inlining clones dependency AST
+/// into a *different* module; those spans index the dependency's source text, so left
 /// intact they produce out-of-range / wrong sourcemap mappings against the consumer
 /// source (and trip oxc codegen's `add_source_mapping_for_name` debug-assert on a
 /// named node whose span exceeds the consumer length). Overriding `visit_span` alone
@@ -64,14 +64,14 @@ impl<'a> VisitMut<'a> for SpanStripper {
     }
 }
 
-/// Strip every span in a statement subtree — for donor material forwarded/hoisted
+/// Strip every span in a statement subtree — for dependency material forwarded/hoisted
 /// into a consumer during cross-file inlining. See [`SpanStripper`].
 pub(crate) fn strip_spans_in_statement(stmt: &mut Statement) {
     SpanStripper.visit_statement(stmt);
 }
 
 impl<'a> Candidate<'a> {
-    /// Neutralise the donor spans in this candidate's spliced expression (cross-file
+    /// Neutralise the dependency spans in this candidate's spliced expression (cross-file
     /// inlining only — see [`SpanStripper`]).
     pub(crate) fn strip_spans(&mut self) {
         SpanStripper.visit_expression(&mut self.value);
@@ -79,7 +79,7 @@ impl<'a> Candidate<'a> {
 }
 
 /// Returns `(inlines, targets)` where `targets` is the span-starts of functions
-/// that call an `@inline` donor — the (possibly directive-free) consumers whose
+/// that call an `@inline` dependency — the (possibly directive-free) consumers whose
 /// inlined residue must be opted into the cleanup gate. The cross-file path
 /// computes the same set itself (`inline_targets`); the same-file caller folds
 /// this into the gate so `@inline` output is flattened like `@optimize`'s.
@@ -98,7 +98,7 @@ pub fn run<'a>(
     }
 
     // Discover top-level candidates — DIRECT (single-return) or BLOCK (void
-    // multi-statement). Exported donors are never stripped below (the strip
+    // multi-statement). Exported dependencies are never stripped below (the strip
     // loop only removes bare FunctionDeclarations).
     // Discover `@inline` candidates at ANY scope — `function NAME` and
     // `const NAME = <arrow|function-expr>`, top-level or nested. Each is
@@ -115,23 +115,28 @@ pub fn run<'a>(
         c.visit_program(program);
         (c.direct, c.block)
     };
-    let callsite = has_callsite_annotation(program, &inline_spans);
+    // The subset of `@inline` spans that sit on a *call* (a call-site
+    // `/* @inline */ foo()`), as opposed to on a candidate declaration. These are
+    // the calls the call-site pass inlines regardless of whether the callee was
+    // declared `@inline`.
+    let callsite_spans = callsite_inline_spans_in(program, &inline_spans);
+    let callsite = !callsite_spans.is_empty();
     if candidates.is_empty() && block_candidates.is_empty() && flatten_spans.is_empty() && !callsite
     {
         return (0, HashSet::new());
     }
 
-    // Functions that call an `@inline` donor — captured BEFORE inlining, while the
+    // Functions that call an `@inline` dependency — captured BEFORE inlining, while the
     // calls still exist. These are the consumers whose residue must be cleaned
     // even when they carry no directive (see this fn's doc).
-    let donor_keys: HashSet<String> =
+    let dependency_keys: HashSet<String> =
         candidates.keys().chain(block_candidates.keys()).cloned().collect();
-    let targets = functions_calling(program, &donor_keys);
+    let targets = functions_calling(program, &dependency_keys);
 
     // ONE program-global counter (`uid`, threaded in by `&mut`) for every
     // inline-generated name across ALL phases (declaration inlining,
     // @optimize/@flatten, call-site) — and, via the caller, across the cross-file
-    // donor-inline that precedes this. Each generated `_inl_arg_<n>` /
+    // dependency-inline that precedes this. Each generated `_inl_arg_<n>` /
     // `_inline_<callee>_<n>` (block label) / `_…__result_<n>` / `p__<n>` is unique by
     // construction, preventing the illegal same-scope redeclaration that
     // `oxc_semantic` conflates (which defeats the block_flatten renamer and yields
@@ -187,39 +192,11 @@ pub fn run<'a>(
     // Call-site `/* @inline */ foo()`: inline calls explicitly annotated at the
     // call site (using all top-level functions as candidates), even callees not
     // declared `@inline`. Guarded so the common no-call-site case pays nothing.
+    // The cross-file driver runs the identical pass with IMPORTED-callable
+    // candidates (see `inline_callsites`); here the candidates are local.
     if callsite {
         let (all_direct, all_block) = gather_all_callables(allocator, program);
-        let local_names = Rc::new(collect_local_names(program));
-        if !all_direct.is_empty() {
-            let mut di = Inliner {
-                allocator,
-                candidates: &all_direct,
-                count: 0,
-                next_id: *uid,
-                hoists: Vec::new(),
-                trigger: Some(inline_spans.clone()),
-                local_names: local_names.clone(),
-                no_hoist: false,
-                passed_effect: false,
-            };
-            di.visit_program(program);
-            count += di.count;
-            *uid = di.next_id;
-        }
-        if !all_block.is_empty() {
-            let mut bi = BlockInliner {
-                allocator,
-                candidates: &all_block,
-                count: 0,
-                next_id: *uid,
-                trigger: Some(inline_spans.clone()),
-                merged_scope: (*local_names).clone(),
-                local_names: local_names.clone(),
-            };
-            bi.visit_program(program);
-            count += bi.count;
-            *uid = bi.next_id;
-        }
+        count += inline_callsites(allocator, program, &callsite_spans, &all_direct, &all_block, uid);
     }
 
     // Strip declarations that have no remaining references. Only `@inline`
@@ -239,7 +216,7 @@ pub fn run<'a>(
             // Remove 0-ref candidate FunctionDeclarations at ANY scope — a
             // fully-inlined *nested* `@inline` function is the inline pass's own
             // residue (same reason we strip top-level ones). Only bare
-            // FunctionDeclarations match, so exported donors are never stripped.
+            // FunctionDeclarations match, so exported dependencies are never stripped.
             let mut sv = StripVisitor { allocator, strip: &strip };
             sv.visit_program(program);
         }
@@ -355,9 +332,9 @@ pub(crate) fn flatten_into_hosts<'a>(
             continue;
         }
         // Capture guard is scoped to THIS host's own bindings, not the whole
-        // program: a donor free var is only at risk of capture if the consumer
+        // program: a dependency free var is only at risk of capture if the consumer
         // we splice into binds that name. A program-wide set spuriously bails an
-        // inline whenever any unrelated function (or donor module) happens to use
+        // inline whenever any unrelated function (or dependency module) happens to use
         // the same name as a param/local.
         let local_names = match top_level_function(stmt) {
             Some(f) => Rc::new(host_bound_names(f)),
@@ -449,24 +426,97 @@ pub(crate) fn top_level_function<'b, 'a>(stmt: &'b Statement<'a>) -> Option<&'b 
     }
 }
 
-/// True if any call expression's span carries a leading annotation (i.e. a
-/// call-site `/* @inline */ foo()` exists). Cheap guard before the call-site pass.
-fn has_callsite_annotation(program: &Program, spans: &HashSet<u32>) -> bool {
+/// The subset of `@inline`-annotated spans that sit on a *call expression* — i.e.
+/// the call-site `/* @inline */ foo()` markers, as opposed to `@inline` on a
+/// candidate declaration. This is the exact set the call-site inline pass keys on
+/// (`triggered` matches a call's `span.start` against it). `spans` is the full
+/// `@inline` span set (from `annotated_spans_with_exports`); this narrows it to the
+/// calls actually present, so a decl-only `@inline` file yields an empty set and
+/// the call-site pass is skipped.
+fn callsite_inline_spans_in(program: &Program, spans: &HashSet<u32>) -> HashSet<u32> {
     struct V<'s> {
         spans: &'s HashSet<u32>,
-        found: bool,
+        found: HashSet<u32>,
     }
     impl<'a> Visit<'a> for V<'_> {
         fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
             if self.spans.contains(&call.span.start) {
-                self.found = true;
+                self.found.insert(call.span.start);
             }
             walk::walk_call_expression(self, call);
         }
     }
-    let mut v = V { spans, found: false };
+    let mut v = V { spans, found: HashSet::new() };
     v.visit_program(program);
     v.found
+}
+
+/// The set of call-site `/* @inline */` spans in `program` (the call expressions
+/// carrying a leading `@inline` comment). Both the same-file pass and the
+/// cross-file driver need this set — the former to inline against local
+/// candidates, the latter against imported ones — so it is exposed here rather than
+/// recomputed. Returns the empty set when there is no call-site `@inline`.
+pub(crate) fn callsite_inline_spans(program: &Program) -> HashSet<u32> {
+    let inline_spans = super::directives::annotated_spans_with_exports(program, &["@inline"]);
+    if inline_spans.is_empty() {
+        return HashSet::new();
+    }
+    callsite_inline_spans_in(program, &inline_spans)
+}
+
+/// Inline every call whose span is in `callsite_spans` using the PROVIDED
+/// candidate maps — the call-site-scoped analogue of [`flatten_into_hosts`]. Unlike
+/// the `@inline`/`@flatten` passes it does not gather its own candidates: the
+/// same-file caller passes `gather_all_callables` (local top-level functions), the
+/// cross-file driver passes the resolved imported callables. Only the marked calls
+/// are inlined (via the `trigger` gate); an unmarked call to the same callee stays
+/// a call. `uid` is threaded so generated temp names stay unique across phases.
+/// Returns the number of calls inlined. Does NOT strip declarations — imports /
+/// local decls are cleaned by the caller.
+pub(crate) fn inline_callsites<'a>(
+    allocator: &'a Allocator,
+    program: &mut Program<'a>,
+    callsite_spans: &HashSet<u32>,
+    direct: &HashMap<String, Candidate<'a>>,
+    block: &HashMap<String, BlockCandidate<'a>>,
+    uid: &mut u32,
+) -> u32 {
+    if callsite_spans.is_empty() || (direct.is_empty() && block.is_empty()) {
+        return 0;
+    }
+    let local_names = Rc::new(collect_local_names(program));
+    let mut count = 0;
+    if !direct.is_empty() {
+        let mut di = Inliner {
+            allocator,
+            candidates: direct,
+            count: 0,
+            next_id: *uid,
+            hoists: Vec::new(),
+            trigger: Some(callsite_spans.clone()),
+            local_names: local_names.clone(),
+            no_hoist: false,
+            passed_effect: false,
+        };
+        di.visit_program(program);
+        count += di.count;
+        *uid = di.next_id;
+    }
+    if !block.is_empty() {
+        let mut bi = BlockInliner {
+            allocator,
+            candidates: block,
+            count: 0,
+            next_id: *uid,
+            trigger: Some(callsite_spans.clone()),
+            merged_scope: (*local_names).clone(),
+            local_names: local_names.clone(),
+        };
+        bi.visit_program(program);
+        count += bi.count;
+        *uid = bi.next_id;
+    }
+    count
 }
 
 /// The `VariableDeclaration` of a statement, whether bare or `export`ed.
@@ -548,7 +598,7 @@ impl<'a> CandidateCollector<'a, '_> {
 
 /// Run the DIRECT + BLOCK inliners with pre-built candidate maps (keyed by the
 /// call name). Returns the number of calls inlined. Used by both the local pass
-/// (comment-discovered candidates) and cross-file inlining (donor candidates
+/// (comment-discovered candidates) and cross-file inlining (dependency candidates
 /// keyed by the consumer's local import name). Does NOT strip declarations —
 /// the caller removes local decls / unused imports as appropriate.
 pub(crate) fn inline_with<'a>(
@@ -642,7 +692,7 @@ pub(crate) struct BlockCandidate<'a> {
 }
 
 impl<'a> BlockCandidate<'a> {
-    /// Neutralise the donor spans in this candidate's spliced body statements
+    /// Neutralise the dependency spans in this candidate's spliced body statements
     /// (cross-file inlining only — see [`SpanStripper`]).
     pub(crate) fn strip_spans(&mut self) {
         for stmt in &mut self.body {
@@ -748,7 +798,7 @@ fn block_body_classifiable(stmts: &[Statement]) -> bool {
 }
 
 /// `this`/`arguments` reads outside a nested non-arrow function (arrows capture
-/// the donor's `this`/`arguments`, so we descend into them).
+/// the dependency's `this`/`arguments`, so we descend into them).
 fn reads_this_or_arguments_stmts(stmts: &[Statement]) -> bool {
     struct V {
         found: bool,
@@ -772,7 +822,7 @@ fn reads_this_or_arguments_stmts(stmts: &[Statement]) -> bool {
     v.found
 }
 
-/// `try`/`with`/`yield`/`await` at the donor body's top level (skipping all
+/// `try`/`with`/`yield`/`await` at the dependency body's top level (skipping all
 /// nested functions, whose control flow comes along verbatim).
 fn has_unsupported_construct(stmts: &[Statement]) -> bool {
     struct V {
@@ -1308,8 +1358,8 @@ fn build_block_plan<'a>(
     if call.arguments.len() > cand.params.len() {
         return None;
     }
-    // Capture guard: a donor free var that collides with a consumer-local
-    // binding would be captured after splicing (e.g. donor reads module `base`,
+    // Capture guard: a dependency free var that collides with a consumer-local
+    // binding would be captured after splicing (e.g. dependency reads module `base`,
     // consumer has `let base`) — bail rather than miscompile.
     if !cand.free.is_disjoint(local_names) {
         return None;
@@ -1766,7 +1816,7 @@ fn body_references_name(stmts: &[Statement], name: &str) -> bool {
 
 /// The lookup key for a call site: a plain `fn(...)` keys on `"fn"`; a member
 /// call `obj.fn(...)` keys on `"obj.fn"` (how cross-file registers namespace /
-/// object donors, e.g. `vec3.add`). Other callee shapes don't inline.
+/// object dependencies, e.g. `vec3.add`). Other callee shapes don't inline.
 fn call_key(call: &CallExpression) -> Option<String> {
     match &call.callee {
         Expression::Identifier(id) => Some(id.name.to_string()),
@@ -1868,7 +1918,7 @@ fn free_vars_stmts(stmts: &[Statement], params: &[String]) -> HashSet<String> {
 }
 
 /// A reference is free iff no enclosing scope (function, block, loop header,
-/// catch) within the candidate binds it. Mirrors lexical scoping so a donor's
+/// catch) within the candidate binds it. Mirrors lexical scoping so a dependency's
 /// own block-scoped locals (`let x` inside an `if`) are NOT mistaken for free
 /// vars — which would otherwise spuriously collide with a host local of the
 /// same name and bail the inline.
@@ -2032,20 +2082,20 @@ fn collect_binding_names(pattern: &BindingPattern, out: &mut HashSet<String>) {
 }
 
 /// Names bound in any NON-module scope of `program` — function/arrow params, and
-/// `var`/`let`/`const`/catch bindings inside functions, at any nesting. A donor
+/// `var`/`let`/`const`/catch bindings inside functions, at any nesting. A dependency
 /// free var colliding with one of these would be captured by the consumer
 /// binding after splicing, so such an inline is bailed.
 ///
 /// A *top-level* function/class declaration name is module-scoped and safe for a
-/// donor to reference (no capture), so those are not collected. A *nested*
+/// dependency to reference (no capture), so those are not collected. A *nested*
 /// declaration name, however, is a real local that can capture — those ARE
 /// collected (class ids via the default `visit_class` walk; function ids
 /// explicitly below, since `visit_function` controls its own descent).
 /// Names bound *within* a single host function — its params plus every
 /// binding (local, nested param, nested function/class name) inside its body.
-/// This is the capture set for inlining into that host: a donor free var can
+/// This is the capture set for inlining into that host: a dependency free var can
 /// only be captured if the host itself binds the same name. Scoped per-host so
-/// unrelated functions (and donor modules in the per-file build) don't trigger
+/// unrelated functions (and dependency modules in the per-file build) don't trigger
 /// spurious bails. Conservatively includes nested-scope bindings (a safe
 /// over-approximation — never a miscompile).
 fn host_bound_names(f: &Function) -> HashSet<String> {
@@ -2073,7 +2123,7 @@ fn collect_local_names(program: &Program) -> HashSet<String> {
     impl<'a> Visit<'a> for V {
         fn visit_function(&mut self, f: &Function<'a>, _flags: oxc_semantic::ScopeFlags) {
             // A nested `function name` (enclosing scope already a function) binds
-            // a local that can capture a donor free var — collect it. Top-level
+            // a local that can capture a dependency free var — collect it. Top-level
             // names (depth 0) are module-scoped and safe, so they're skipped.
             // (Harmlessly over-guards named function *expressions* too — a rare
             // extra bail, never a miss.)
@@ -2220,7 +2270,7 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
     // inlining, so this statement-position guard is essentially dead there — it
     // only fires on the cross-file path, which inlines pre-normalize. A bailed
     // LOCAL call is re-inlined by `run_all_gated`'s post-normalize inline pass; a
-    // bailed cross-file DONOR call is NOT (donors are only inlined by
+    // bailed cross-file DEPENDENCY call is NOT (dependencies are only inlined by
     // `cross_file`'s pre-normalize pass) → a narrow, permanent optimization loss.
     // Correctness is preserved either way — the bail just leaves the call.)
     fn visit_if_statement(&mut self, s: &mut IfStatement<'a>) {
@@ -2373,7 +2423,7 @@ fn build_inlined<'a>(
     if call.arguments.len() > cand.params.len() {
         return None; // ignore extras for v1
     }
-    // Capture guard (see `build_block_plan`): a donor free var colliding with a
+    // Capture guard (see `build_block_plan`): a dependency free var colliding with a
     // consumer-local binding would be captured after splicing.
     if !cand.free.is_disjoint(local_names) {
         return None;
@@ -2515,7 +2565,7 @@ impl<'a> Visit<'a> for RefCounter {
 
 /// Removes 0-ref candidate `FunctionDeclaration`s at any scope (top-level and
 /// nested). Recurses first so nested declarations in a stripped block are also
-/// handled. Only bare `FunctionDeclaration`s are removed — `export`ed donors
+/// handled. Only bare `FunctionDeclaration`s are removed — `export`ed dependencies
 /// (an `ExportNamedDeclaration`) are left intact.
 struct StripVisitor<'a, 's> {
     allocator: &'a Allocator,
@@ -2565,7 +2615,7 @@ mod tests {
         );
         assert!(!out.contains("pick(x)"), "call inlined:\n{out}");
         assert!(out.contains("break"), "early return uses break:\n{out}");
-        assert!(!out.contains("function pick"), "donor stripped:\n{out}");
+        assert!(!out.contains("function pick"), "dependency stripped:\n{out}");
     }
 
     #[test]
@@ -2854,7 +2904,7 @@ mod tests {
             "const base = 100;\n/* @inline */ function calc(a) { return a + base; }\nexport function f() { let base = 1; return calc(5) + base; }",
         );
         assert!(out.contains("calc(5)"), "capture-unsafe call left intact:\n{out}");
-        assert!(out.contains("function calc"), "donor kept (still referenced):\n{out}");
+        assert!(out.contains("function calc"), "dependency kept (still referenced):\n{out}");
     }
 
     #[test]
@@ -2878,7 +2928,7 @@ mod tests {
 
     #[test]
     fn inlines_free_var_when_no_consumer_collision() {
-        // A donor free var that the consumer does NOT shadow inlines normally.
+        // A dependency free var that the consumer does NOT shadow inlines normally.
         let out = inline(
             "const base = 100;\n/* @inline */ function calc(a) { return a + base; }\nexport function f() { let n = 1; return calc(5) + n; }",
         );
@@ -2989,27 +3039,27 @@ mod tests {
 
     #[test]
     fn rejects_async_callee() {
-        // An `async` donor can't be inlined into a sync body — the call stays.
+        // An `async` dependency can't be inlined into a sync body — the call stays.
         let out = inline(
             "/* @inline */ async function fetchOnce() { return 1; }\nexport function g() { return fetchOnce(); }",
         );
         assert!(out.contains("fetchOnce()"), "async call NOT inlined:\n{out}");
-        assert!(out.contains("async function fetchOnce"), "async donor preserved:\n{out}");
+        assert!(out.contains("async function fetchOnce"), "async dependency preserved:\n{out}");
     }
 
     #[test]
     fn rejects_generator_callee() {
-        // A generator donor can't be inlined — the call stays.
+        // A generator dependency can't be inlined — the call stays.
         let out = inline(
             "/* @inline */ function* gen() { yield 1; }\nexport function g() { return gen(); }",
         );
         assert!(out.contains("gen()"), "generator call NOT inlined:\n{out}");
-        assert!(out.contains("function* gen"), "generator donor preserved:\n{out}");
+        assert!(out.contains("function* gen"), "generator dependency preserved:\n{out}");
     }
 
     #[test]
     fn rejects_this_using_callee() {
-        // A donor referencing `this` would change meaning if spliced — rejected.
+        // A dependency referencing `this` would change meaning if spliced — rejected.
         let out = inline(
             "/* @inline */ function getProp() { return this.p; }\nexport function g() { return getProp(); }",
         );

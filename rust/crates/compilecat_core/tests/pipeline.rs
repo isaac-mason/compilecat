@@ -92,12 +92,12 @@ fn does_not_rename_declared_function_parameters() {
     assert!(!out.code.contains("rC__"), "no param suffix:\n{}", out.code);
 }
 
-// ── single-file slice of the old per-file.test.ts (cross-file donor cases stay
+// ── single-file slice of the old per-file.test.ts (cross-file dependency cases stay
 //    in tst/parity/cross-file.parity.ts — they need the plugin's resolver) ──
 
 #[test]
 fn perfile_mode_leaves_undirected_code_alone() {
-    // PerFile mode with no directives anywhere: a no-op (no donors, nothing
+    // PerFile mode with no directives anywhere: a no-op (no dependencies, nothing
     // opted in). The shape is preserved.
     let out = transform(
         "export function f(x) { return x + 1; }",
@@ -287,7 +287,7 @@ fn deferred_var_aggregate_not_merged() {
 
 #[test]
 fn same_file_inline_flattens_directive_free_consumer() {
-    // `@inline` on the donor; the consumer `f` carries no directive of its own.
+    // `@inline` on the dependency; the consumer `f` carries no directive of its own.
     // Its inlined residue (a BLOCK inline's scaffolding `{ … }`) must still be
     // flattened — `f` is opted into the cleanup gate (the same-file analogue of
     // the cross-file `inline_targets`). Previously the bare block leaked through.
@@ -296,14 +296,14 @@ fn same_file_inline_flattens_directive_free_consumer() {
          export function f(v, k) { let r = scale(v, k); g(r); return r; }",
         &opts("test.ts"),
     );
-    assert!(!out.code.contains("scale("), "donor inlined:\n{}", out.code);
+    assert!(!out.code.contains("scale("), "dependency inlined:\n{}", out.code);
     let bare_blocks = out.code.lines().filter(|l| l.trim() == "{").count();
     assert_eq!(bare_blocks, 0, "consumer inline residue not flattened:\n{}", out.code);
 }
 
 #[test]
 fn inline_gate_does_not_reach_uninvolved_functions() {
-    // The gate now opts in `@inline` consumers — but ONLY them. `g` calls the donor
+    // The gate now opts in `@inline` consumers — but ONLY them. `g` calls the dependency
     // (gets cleaned); `h` calls nothing inlined and carries no directive, so it must
     // stay un-optimized: its foldable `1 + 2` is left verbatim, never folded to `3`.
     let out = transform(
@@ -312,7 +312,7 @@ fn inline_gate_does_not_reach_uninvolved_functions() {
          export function h() { return 1 + 2; }",
         &opts("test.ts"),
     );
-    assert!(!out.code.contains("id2("), "donor inlined into g:\n{}", out.code);
+    assert!(!out.code.contains("id2("), "dependency inlined into g:\n{}", out.code);
     assert!(out.code.contains("1 + 2"), "uninvolved h must stay un-optimized:\n{}", out.code);
 }
 
@@ -326,7 +326,7 @@ fn same_file_inline_flattens_multi_return_consumer() {
          export function f(x) { let s = sign(x); return s * 10; }",
         &opts("test.ts"),
     );
-    assert!(!out.code.contains("sign("), "donor inlined:\n{}", out.code);
+    assert!(!out.code.contains("sign("), "dependency inlined:\n{}", out.code);
     assert!(
         !out.code.contains("_inline_"),
         "labeled-block residue not flattened:\n{}",

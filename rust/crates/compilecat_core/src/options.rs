@@ -2,7 +2,7 @@ use oxc_span::SourceType;
 
 /// The optimization unit being processed. Mirrors `Mode` in the TS pipeline
 /// (`src/compiler/pipeline.ts`): the pass set is the same in both, the
-/// difference is whether cross-file inlining (resolver + donor splicing) is in
+/// difference is whether cross-file inlining (resolver + dependency splicing) is in
 /// play. Whole-program runs on a tree-shaken chunk where every `@inline` target
 /// is already in scope, so no resolver is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

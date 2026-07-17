@@ -16,7 +16,7 @@
 //! The arity (tuple) or field set (record) comes from a literal initializer, or
 //! — when the initializer is opaque — from the declaration's TYPE: an inline
 //! tuple/object type, a local `type`/`interface`, or one resolved cross-module
-//! from a donor (see `Shape` + `build_alias_shapes`, the type-shape oracle).
+//! from a dependency (see `Shape` + `build_alias_shapes`, the type-shape oracle).
 //!
 //! Candidates are collected recursively, so an aggregate declared inside a
 //! nested block (a loop/if/switch/try body) is scalarized too.

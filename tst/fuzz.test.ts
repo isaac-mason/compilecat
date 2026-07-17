@@ -116,21 +116,25 @@ function diff(code: string): { call: string; compiled: string; want: unknown; go
     return { call, compiled, want: want.ok ? want.value : '<threw>', got: got.ok ? got.value : '<threw>' };
 }
 
-/** Cross-file differential: compile the consumer against the donor and compare
- *  `donor + consumer` (source) vs `donor + compiled` (output). Prepending the
- *  donor to BOTH means a kept import resolves and an inlined copy is harmless
+/** Cross-file differential: compile the consumer against the dependency and compare
+ *  `dependency + consumer` (source) vs `dependency + compiled` (output). Prepending the
+ *  dependency to BOTH means a kept import resolves and an inlined copy is harmless
  *  (top-level fn redeclare is sloppy-legal), so it's a fair, symmetric eval. */
-function crossDiff(donor: string, consumer: string, specifier: string): { compiled: string; want: unknown; got: unknown } | null {
+function crossDiff(
+    dependency: string,
+    consumer: string,
+    specifier: string,
+): { compiled: string; want: unknown; got: unknown } | null {
     const call = 'entry(7, 3)';
-    const want = evalProgram(`${donor}\n${consumer}`, call);
+    const want = evalProgram(`${dependency}\n${consumer}`, call);
     if (!want.ok) return null; // generated program threw (generation artifact) — skip
     const compiled = compiler.compileFileCross(
         'entry.ts',
         withExports(consumer),
-        [{ specifier, path: '/p/donor.ts', code: donor, resolved: [] }],
+        [{ specifier, path: '/p/dependency.ts', code: dependency, resolved: [] }],
         {},
     ).code;
-    const got = evalProgram(`${donor}\n${compiled}`, call);
+    const got = evalProgram(`${dependency}\n${compiled}`, call);
     if (resultsEquiv(want, got, /* looseZero: allowlist known -0 fold bug */ true)) return null;
     return { compiled, want: want.ok ? want.value : '<threw>', got: got.ok ? got.value : '<threw>' };
 }
@@ -246,8 +250,8 @@ class Gen {
     }
 
     // Build helper declarations and register them (so entry/consumer calls them).
-    // `prefix` keeps donor (`d*`) and consumer-local (`h*`) names disjoint;
-    // `exported` emits `export` for cross-file donors.
+    // `prefix` keeps dependency (`d*`) and consumer-local (`h*`) names disjoint;
+    // `exported` emits `export` for cross-file dependencies.
     private genHelpers(count?: number, prefix = 'h', exported = false): string {
         const n = count ?? int(this.r, 1, 4);
         const out: string[] = [];
@@ -295,18 +299,18 @@ class Gen {
         return out.join('\n');
     }
 
-    /** Cross-file: a donor module (exported helpers, `d*`) + a consumer that
+    /** Cross-file: a dependency module (exported helpers, `d*`) + a consumer that
      *  imports them and calls them (alongside its own `h*` helpers) in an
      *  @optimize entry. Returns the two module sources + the import specifier. */
-    crossProgram(): { donor: string; consumer: string; specifier: string } {
-        const donorBody = this.genHelpers(int(this.r, 1, 3), 'd', true);
-        const donorNames = this.helpers.map((h) => h.name); // all d* so far
+    crossProgram(): { dependency: string; consumer: string; specifier: string } {
+        const dependencyBody = this.genHelpers(int(this.r, 1, 3), 'd', true);
+        const dependencyNames = this.helpers.map((h) => h.name); // all d* so far
         const localHelpers = this.genHelpers(int(this.r, 0, 2), 'h', false);
-        const specifier = './donor';
-        const importLine = `import { ${donorNames.join(', ')} } from "${specifier}";`;
+        const specifier = './dependency';
+        const importLine = `import { ${dependencyNames.join(', ')} } from "${specifier}";`;
         const optimize = chance(this.r, 0.8) ? '/* @optimize */ ' : '';
         const consumer = `${importLine}\n${localHelpers}\n${optimize}function entry(p, q) {\n  ${this.genEntryBody()}\n}`;
-        return { donor: donorBody, consumer, specifier };
+        return { dependency: dependencyBody, consumer, specifier };
     }
 
     private genEntryBody(): string {
@@ -544,18 +548,18 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
         expect(true).toBe(true);
     });
 
-    // Cross-file variant: a consumer imports `@inline`/plain donor helpers and
+    // Cross-file variant: a consumer imports `@inline`/plain dependency helpers and
     // uses them in an @optimize entry, compiled via `compileFileCross`. Exercises
-    // the donor-inline + cross-file SROA + global-counter-across-the-boundary
+    // the dependency-inline + cross-file SROA + global-counter-across-the-boundary
     // paths. Fewer iters (each compiles two modules); scales with FUZZ_ITERS.
     const XITERS = Math.max(50, Math.floor(ITERS / 2));
     it(`${XITERS} cross-file programs preserve semantics`, () => {
         for (let i = 0; i < XITERS; i++) {
             const seed = (BASE ^ 0x5bd1e995) + i * 2654435761;
-            const { donor, consumer, specifier } = new Gen(mulberry32(seed >>> 0)).crossProgram();
+            const { dependency, consumer, specifier } = new Gen(mulberry32(seed >>> 0)).crossProgram();
             let d: ReturnType<typeof crossDiff>;
             try {
-                d = crossDiff(donor, consumer, specifier);
+                d = crossDiff(dependency, consumer, specifier);
             } catch (e) {
                 d = { compiled: `<compile threw: ${(e as Error).message}>`, want: 'n/a', got: 'n/a' };
             }
@@ -563,7 +567,7 @@ describe('behavioral fuzzer: compiled output ≡ source', () => {
                 throw new Error(
                     `CROSS-FILE MISCOMPILE (seed=${seed >>> 0}, FUZZ_SEED=${BASE} i=${i})\n` +
                         `entry(7, 3)   want=${JSON.stringify(d.want)} got=${JSON.stringify(d.got)}\n\n` +
-                        `--- donor ---\n${donor}\n\n--- consumer ---\n${consumer}\n\n` +
+                        `--- dependency ---\n${dependency}\n\n--- consumer ---\n${consumer}\n\n` +
                         `--- compiled ---\n${d.compiled}\n`,
                 );
             }
@@ -1057,13 +1061,13 @@ describe('effect-preservation regressions (Closure-aligned)', () => {
         expect(out).not.toMatch(/lenSq\s*\(/); // both calls inlined away
     });
 
-    // Cross-file: inlining a donor whose param sits in a conditional branch
+    // Cross-file: inlining a dependency whose param sits in a conditional branch
     // substituted the impure arg into that branch, dropping its effect when the
     // branch wasn't taken. Now the impure arg is hoisted eager.
     it('cross-file conditional-param drop preserved', () => {
-        const donor = `export function d0(a, b) { return (eff(2) > a ? (b - 9) : 5); }`;
-        const consumer = `import { d0 } from "./donor";\n/* @optimize */ function entry(p, q) { return q - d0(Math.abs(99), eff(0)); }`;
-        expect(crossDiff(donor, consumer, './donor')).toBe(null);
+        const dependency = `export function d0(a, b) { return (eff(2) > a ? (b - 9) : 5); }`;
+        const consumer = `import { d0 } from "./dependency";\n/* @optimize */ function entry(p, q) { return q - d0(Math.abs(99), eff(0)); }`;
+        expect(crossDiff(dependency, consumer, './dependency')).toBe(null);
     });
 });
 

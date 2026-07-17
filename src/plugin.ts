@@ -1,11 +1,18 @@
 // compilecat's bundler plugin (Rust/oxc core).
 //
 // Optimizes each source file in the `transform` hook, BEFORE bundling, keeping
-// TypeScript. It is **cross-module aware**: when a file imports an `@inline`
-// donor, the plugin resolves + reads the donor module (via the bundler's
-// resolver + fs) and hands it to the core, which inlines across the module
-// boundary and drops the now-unused import. `addWatchFile` keeps HMR correct
-// (re-transform the consumer when a donor changes).
+// TypeScript. It is **cross-module aware**: when a file's `@optimize`/`@flatten`/
+// `@sroa` directives reference an imported callable or type, the plugin resolves
+// + reads exactly that dependency module (via the bundler's resolver + fs) and hands it
+// to the core, which inlines across the module boundary and drops the now-unused
+// import. `addWatchFile` keeps HMR correct (re-transform the consumer when a dependency
+// changes).
+//
+// Dependency gathering is DEMAND-DRIVEN: instead of eagerly resolving the whole
+// reachable module graph, the plugin asks the core's stateless `resolutionFrontier`
+// what modules are still MISSING to satisfy the host's directives, resolves+reads
+// only those, and re-queries until the frontier is empty. A directive-less file
+// resolves and reads nothing.
 //
 // Exposed via unplugin — supports rollup, vite, rolldown (native Rust-level id
 // filter), webpack, esbuild, and rspack from a single factory.
@@ -14,9 +21,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { createUnplugin } from 'unplugin';
-import { createCompiler, donorEdges } from './compiler';
+import type { FrontierRequest } from './compiler';
+import { createCompiler, resolutionFrontier } from './compiler';
 import { createFilter } from './filter';
-import { declarationCandidates, specifierToSubpath, typeImportSpecifiers, typesFromExports } from './type-resolve';
+import { declarationCandidates, specifierToSubpath, typesFromExports } from './type-resolve';
 
 export type FilterPattern = string | RegExp | (string | RegExp)[];
 
@@ -28,21 +36,39 @@ function toArray<T>(v: T | T[] | undefined): T[] {
 // Inlined so the native plugin doesn't pull the Babel-based compiler modules.
 const ANY_DIRECTIVE = /@(?:inline|flatten|sroa|unroll|optimize)\b/;
 const TRANSFORMABLE = /\.(?:js|jsx|ts|tsx|mjs|cjs|mts|cts)$/;
-// Any `… from "<spec>"` import — relative (`./x`, `../x`) or bare (`pkg`).
-const IMPORT_FROM = /import\b[^'"]*?from\s*['"]([^'"]+)['"]/g;
-// Flat re-exports only — `export * from S` and `export {…}`/`export type {…} from S`;
-// EXCLUDES `export * as ns from S`, which contributes `ns.X` not a flat name and so is
-// never followed for flat type resolution (matches the core). Keeps the donor set to a
-// package's real flat surface rather than every namespaced submodule. Used only by the
-// SEPARATE `.d.ts` type-donor path (`gatherTypeSourceDonors`); the runtime donor BFS
-// follows edges via the core's AST-based `donorEdges` instead.
-const EXPORT_FLAT_FROM = /export\s+(?:type\s+)?(?:\*(?!\s*as\b)|\{[^}]*\})\s*from\s*['"]([^'"]+)['"]/g;
 
-// Extensions/index files tried when resolving a relative import ourselves —
-// cheap fs probes instead of the bundler's `this.resolve`, which is only needed
-// for bare specifiers (aliases, package exports, node_modules layout).
-const REL_EXTS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'];
-const REL_INDEX = ['/index.ts', '/index.tsx', '/index.js', '/index.mjs', '/index.cjs'];
+// Directories the build-start `@inline`-def scan never descends into (build
+// output, deps, VCS metadata) — pruned whole so a large repo scan stays cheap.
+const PRUNE_DIRS = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.next', '.cache', 'coverage', '.turbo']);
+
+// A `/* @inline */` (JSDoc / line / block comment carrying `@inline`) immediately
+// before a function/const DEFINITION — `export? (async)? function NAME` or
+// `export? (const|let|var) NAME = …`. This is the C++-`inline`-style DEF marker;
+// captures the defined NAME. Distinct from a call-site marker (`/* @inline */
+// foo()` before a CALL, where a `(` or `.` follows the comment instead of a
+// declaration keyword) — only DEFS go in the index. A regex candidate scan is
+// enough: the core's real `@inline`-export detection confirms the actual export,
+// so a false-positive name merely yields a resolve that finds no `@inline` export
+// → a harmless no-op.
+const INLINE_DEF =
+    /@inline\b[^\n]*(?:\r?\n\s*(?:\/\/[^\n]*\r?\n\s*|\/\*[\s\S]*?\*\/\s*)*)?\*?\/?\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\*?\s+|(?:const|let|var)\s+)([A-Za-z_$][\w$]*)/g;
+
+// Scan one source file for its first-party `@inline`-DEF names (the marker sits on
+// a comment immediately before the definition). Returns the defined names.
+function scanInlineDefNames(code: string): string[] {
+    if (!code.includes('@inline')) return [];
+    const names: string[] = [];
+    INLINE_DEF.lastIndex = 0;
+    for (let m = INLINE_DEF.exec(code); m !== null; m = INLINE_DEF.exec(code)) {
+        // Guard against a call-site marker (`/* @inline */ foo(` / `ns.foo(`): the
+        // capture would only match a real declaration keyword, but a stray match on a
+        // name directly followed by `(`/`.` (with no `function`/`const`) can't occur
+        // because the pattern requires one of those keywords. Nothing extra needed.
+        names.push(m[1]);
+    }
+    return names;
+}
+
 const statCache = new Map<string, boolean>();
 function isFile(p: string): boolean {
     const hit = statCache.get(p);
@@ -55,19 +81,6 @@ function isFile(p: string): boolean {
     }
     statCache.set(p, ok);
     return ok;
-}
-function resolveRelative(importerId: string, spec: string): string | null {
-    const abs = path.resolve(path.dirname(importerId), spec);
-    // Only probe the exact path when the specifier already has an extension —
-    // `./foo` goes straight to `./foo.ts`, halving the stat count in TS projects.
-    if (path.extname(abs) !== '' && isFile(abs)) return abs;
-    for (const ext of REL_EXTS) {
-        if (isFile(abs + ext)) return abs + ext;
-    }
-    for (const idx of REL_INDEX) {
-        if (isFile(abs + idx)) return abs + idx;
-    }
-    return null;
 }
 
 // Given a resolved RUNTIME module path, find its TypeScript declaration companion
@@ -102,7 +115,7 @@ function findPackageDir(startPath: string): string | null {
     return null;
 }
 
-interface PluginDonor {
+interface PluginDependency {
     specifier: string;
     path: string;
     code: string;
@@ -112,7 +125,7 @@ interface PluginDonor {
 export interface Options {
     /** Module ids compilecat operates on — its **scope** (picomatch globs and/or
      *  RegExps). Required; there is no implicit default. Both the files that get
-     *  transformed *and* the donor modules that may be read+inlined are limited
+     *  transformed *and* the dependency modules that may be read+inlined are limited
      *  to this scope, so `node_modules` is never trawled unless a package is
      *  explicitly listed (e.g. `['**​/src/**', '**​/node_modules/mathcat/**']`).
      *  For rolldown, wired through the native hook-filter API so out-of-scope
@@ -123,27 +136,30 @@ export interface Options {
     /** Emit source maps. @default true */
     sourcemap?: boolean;
     /** Print a per-build timing/counter breakdown at `buildEnd` (how many files
-     *  were seen vs optimized, and where wall time went: donor resolve, fs read,
+     *  were seen vs optimized, and where wall time went: dependency resolve, fs read,
      *  native compile). @default false */
     debug?: boolean;
+    /** Directory the build-start `@inline`-def scan walks to build its first-party
+     *  index (so a directive-less file that CALLS an in-project `/* @inline *​/`
+     *  function still inlines it). @default `process.cwd()` — normally the project
+     *  root, where the in-scope src lives. */
+    scanRoot?: string;
 }
 
 interface PluginStats {
     files: number; // transform() calls (transformable files)
     directiveFiles: number; // files carrying a directive
-    skippedNoDirective: number; // returned early (no directive / no donor directive)
-    compiledFile: number; // compileFile calls (no donors)
-    compiledCross: number; // compileFileCross calls (with donors)
+    skippedNoDirective: number; // returned early (no directive / no dependency directive)
+    compiledFile: number; // compileFile calls (no dependencies)
+    compiledCross: number; // compileFileCross calls (with dependencies)
     changed: number; // files actually rewritten
     resolves: number; // this.resolve calls (cache misses)
     resolveCacheHits: number;
-    donorReads: number; // fs reads (cache misses)
-    donorCacheHits: number;
-    edgeScans: number; // donorEdges() parses (cache misses)
-    edgeCacheHits: number;
+    dependencyReads: number; // fs reads (cache misses)
+    dependencyCacheHits: number;
     scanMs: number; // directive/import regex scans
     resolveMs: number; // this.resolve
-    readMs: number; // fs.readFileSync donors
+    readMs: number; // fs.readFileSync dependencies
     compileMs: number; // native compileFile/compileFileCross
     totalMs: number; // total in transform()
 }
@@ -155,10 +171,9 @@ function reportStats(s: PluginStats): void {
         `[compilecat-native] ${s.files} files seen, ${s.directiveFiles} with directive, ` +
             `${s.skippedNoDirective} skipped, ${s.compiledFile + s.compiledCross} compiled ` +
             `(${s.compiledCross} cross-file), ${s.changed} changed.\n` +
-            `  resolves=${s.resolves} (cacheHits=${s.resolveCacheHits}) donorReads=${s.donorReads} (cacheHits=${s.donorCacheHits}) ` +
-            `edgeScans=${s.edgeScans} (cacheHits=${s.edgeCacheHits})\n` +
+            `  resolves=${s.resolves} (cacheHits=${s.resolveCacheHits}) dependencyReads=${s.dependencyReads} (cacheHits=${s.dependencyCacheHits})\n` +
             `${row('scan (regex)', s.scanMs)}\n${row('resolve', s.resolveMs)}\n` +
-            `${row('read donors (fs)', s.readMs)}\n${row('native compile', s.compileMs)}\n` +
+            `${row('read dependencies (fs)', s.readMs)}\n${row('native compile', s.compileMs)}\n` +
             `  ${'TOTAL in transform'.padEnd(20)} ${s.totalMs.toFixed(1).padStart(9)}ms`,
     );
 }
@@ -169,8 +184,8 @@ type Ctx = any;
 export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta) => {
     const compiler = createCompiler();
     const sourcemap = options.sourcemap ?? true;
-    // Scope: which module ids may be transformed and read as donors. `inScope`
-    // gates donor reads in JS; the transform filter gates the hook in the bundler
+    // Scope: which module ids may be transformed and read as dependencies. `inScope`
+    // gates dependency reads in JS; the transform filter gates the hook in the bundler
     // (Rust for rolldown, JS for others), so out-of-scope files cost nothing.
     const inScope = createFilter(options.include, options.exclude);
     const include = toArray(options.include);
@@ -185,10 +200,8 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
               changed: 0,
               resolves: 0,
               resolveCacheHits: 0,
-              donorReads: 0,
-              donorCacheHits: 0,
-              edgeScans: 0,
-              edgeCacheHits: 0,
+              dependencyReads: 0,
+              dependencyCacheHits: 0,
               scanMs: 0,
               resolveMs: 0,
               readMs: 0,
@@ -198,22 +211,99 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         : null;
 
     // Build-scoped caches (the plugin instance lives for the whole build):
-    //  - donorCache: read + directive-scan a donor once, not once per consumer.
-    //  - consumersByDonor: reverse map donorPath → the files that inlined it.
+    //  - dependencyCache: read + directive-scan a dependency once, not once per consumer.
+    //  - consumersByDependency: reverse map dependencyPath → the files that inlined it.
     //    Inlining removes the import edge, so the module graph no longer carries
-    //    donor→consumer; a Vite HMR adapter uses this to invalidate consumers
-    //    when a donor changes. `watchChange` also uses it to evict the cache.
-    //    `edges` (the core's AST-derived re-export/re-bind specifiers) is memoized
-    //    lazily on the entry the first time the BFS needs it, so `donorEdges` PARSES
-    //    each donor once per build, not once per consumer that imports it. It rides
-    //    on the same entry `watchChange` evicts, so a donor edit recomputes it.
-    const donorCache = new Map<string, { code: string; hasDirective: boolean; edges?: string[] }>();
-    const consumersByDonor = new Map<string, Set<string>>();
+    //    dependency→consumer; a Vite HMR adapter uses this to invalidate consumers
+    //    when a dependency changes. `watchChange` also uses it to evict the cache.
+    const dependencyCache = new Map<string, { code: string; hasDirective: boolean }>();
+    const consumersByDependency = new Map<string, Set<string>>();
+    //  - inlineDefIndex: first-party `@inline`-DEF names, built once at `buildStart`
+    //    by walking `scanRoot` (see `scanInlineDefIndex`). Feeds two things: the
+    //    transform GATE (a directive-less file that CALLS one of these is no longer
+    //    short-circuited) and the FRONTIER (`inline_def_names` → the def's module is
+    //    gathered so the `require_inline` path inlines the call). Rebuilt lazily on the
+    //    first transform if `buildStart` never ran (some bundler paths), and kept
+    //    correct by `watchChange` (re-scan a changed file, add/remove its names).
+    const inlineDefIndex = new Set<string>();
+    let inlineDefIndexBuilt = false;
+    const scanRoot = options.scanRoot ?? process.cwd();
+    // The names each in-scope file contributed, so a `watchChange` re-scan can remove
+    // the file's stale names before adding its fresh ones (a def deleted/renamed in an
+    // edit must leave the index).
+    const inlineDefNamesByFile = new Map<string, Set<string>>();
+    // Bumped whenever the index MEMBERSHIP changes (build, watch re-scan). The gate
+    // regex is cached against it, so a watch edit that swaps one name for another (same
+    // size) still rebuilds the gate.
+    let inlineDefIndexVersion = 0;
+    const buildInlineDefIndex = () => {
+        if (inlineDefIndexBuilt) return;
+        inlineDefIndexBuilt = true;
+        inlineDefIndex.clear();
+        inlineDefNamesByFile.clear();
+        // Re-derive per-file contributions so the whole index is refreshable; the walk
+        // reads each file once, so re-scan them here to populate `inlineDefNamesByFile`
+        // alongside the aggregate set. Cheap (a few ms per the spike).
+        const stack: string[] = [scanRoot];
+        while (stack.length) {
+            const dir = stack.pop() as string;
+            let entries: fs.Dirent[];
+            try {
+                entries = fs.readdirSync(dir, { withFileTypes: true });
+            } catch {
+                continue;
+            }
+            for (const e of entries) {
+                const full = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                    if (!PRUNE_DIRS.has(e.name) && !e.name.startsWith('.')) stack.push(full);
+                    continue;
+                }
+                if (!e.isFile() || !TRANSFORMABLE.test(e.name) || !inScope(full)) continue;
+                let code: string;
+                try {
+                    code = fs.readFileSync(full, 'utf8');
+                } catch {
+                    continue;
+                }
+                const names = scanInlineDefNames(code);
+                if (names.length) {
+                    inlineDefNamesByFile.set(full, new Set(names));
+                    for (const n of names) inlineDefIndex.add(n);
+                }
+            }
+        }
+        inlineDefIndexVersion++;
+    };
+    // Alternation regex over the current index names, cached until the set changes —
+    // the per-file gate that lets a directive-less caller through. `null` when the
+    // index is empty (no `@inline` defs → the gate reduces to the directive check).
+    let defCallGate: RegExp | null = null;
+    let defCallGateVersion = -1;
+    const defCallGateFor = (): RegExp | null => {
+        if (defCallGateVersion === inlineDefIndexVersion) return defCallGate;
+        defCallGateVersion = inlineDefIndexVersion;
+        if (inlineDefIndex.size === 0) {
+            defCallGate = null;
+        } else {
+            const alt = [...inlineDefIndex].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+            // A call to one of the def names: `\b(name1|name2|…)\s*(` — a word-boundary'd
+            // name followed by a call `(`. Loose (a same-named local/property call also
+            // matches), but the gate only decides whether to PROCEED — the frontier +
+            // core then confirm the real import/export, so a false match is a no-op.
+            defCallGate = new RegExp(`\\b(?:${alt})\\s*\\(`);
+        }
+        return defCallGate;
+    };
     //  - resolveCache: `this.resolve` is the dominant cost (it walks the bundler's
     //    resolver + plugin pipeline). The same (importer, specifier) pair recurs
     //    constantly — every directive file re-walks the same barrel graph — so
     //    memoize results for the whole build. Keyed `importer\0specifier`.
-    const resolveCache = new Map<string, { id: string; external?: boolean } | null>();
+    // Stores the in-flight PROMISE (not the result) so concurrent transforms that
+    // request the same specifier share ONE `this.resolve` — rolldown runs transform
+    // hooks concurrently, so a result-cache would let N files all miss + resolve
+    // `mathcat` before any populates it (N× the pipeline warmup).
+    const resolveCache = new Map<string, Promise<{ id: string; external?: boolean } | null>>();
     //  - pkgTypeEntryCache: a bare package's resolved `.d.ts` type entry (or null),
     //    keyed `importer\0specifier`. Resolving it walks package.json/exports (see
     //    `resolvePackageTypeEntry`), so memoize per build. Stores the package.json path
@@ -234,49 +324,59 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         pkgJsonCache.set(dir, parsed);
         return parsed;
     };
-    const readDonor = (donorPath: string): { code: string; hasDirective: boolean } | null => {
-        const hit = donorCache.get(donorPath);
+    const readDependency = (dependencyPath: string): { code: string; hasDirective: boolean } | null => {
+        const hit = dependencyCache.get(dependencyPath);
         if (hit) {
-            if (stats) stats.donorCacheHits++;
+            if (stats) stats.dependencyCacheHits++;
             return hit;
         }
         let code: string;
         const r0 = stats ? performance.now() : 0;
         try {
-            code = fs.readFileSync(donorPath, 'utf8');
+            code = fs.readFileSync(dependencyPath, 'utf8');
         } catch {
             return null;
         }
         if (stats) {
             stats.readMs += performance.now() - r0;
-            stats.donorReads++;
+            stats.dependencyReads++;
         }
         const entry = { code, hasDirective: ANY_DIRECTIVE.test(code) };
-        donorCache.set(donorPath, entry);
+        dependencyCache.set(dependencyPath, entry);
         return entry;
-    };
-    // The core's AST re-export/re-bind edges for a donor, computed once per build.
-    // `donorEdges` parses the donor with oxc, so memoize it on the cache entry —
-    // otherwise every consumer importing the same donor re-parses it for the same
-    // result. `(donorPath, code)` are the only inputs and both are stable per
-    // cached entry (the entry is dropped on change), so the memo is a pure one.
-    const donorEdgesFor = (donorPath: string, entry: { code: string; edges?: string[] }): string[] => {
-        if (entry.edges !== undefined) {
-            if (stats) stats.edgeCacheHits++;
-            return entry.edges;
-        }
-        if (stats) stats.edgeScans++;
-        entry.edges = donorEdges(donorPath, entry.code);
-        return entry.edges;
     };
 
     return {
         name: 'compilecat',
-        // A changed donor drops from the read cache so the next transform re-reads.
+        // Build the first-party `@inline`-def index ONCE per build (walk `scanRoot`
+        // for in-scope defs — see `buildInlineDefIndex`). Cheap (a few ms) and it
+        // gates + feeds the demand-driven inline of directive-less callers.
+        buildStart() {
+            buildInlineDefIndex();
+        },
+        // A changed dependency drops from the read cache so the next transform re-reads.
         // Rollup watch re-runs the consumer's transform via `addWatchFile`; a Vite
-        // dev adapter additionally invalidates `consumersByDonor[changedId]`.
+        // dev adapter additionally invalidates `consumersByDependency[changedId]`.
         watchChange(this: Ctx, changedId: string) {
-            donorCache.delete(changedId);
+            dependencyCache.delete(changedId);
+            // An in-scope file's `@inline`-def set may have changed — re-scan it and
+            // rebuild the index's names for that file (remove its stale names, add its
+            // fresh ones). Correct over clever: a def deleted/renamed in an edit must
+            // leave the index, a new one must enter. Recompute the aggregate set from
+            // the per-file map so a removed name that no OTHER file still defines drops.
+            if (TRANSFORMABLE.test(changedId) && (inScope(changedId) || inlineDefNamesByFile.has(changedId))) {
+                let fresh: string[] = [];
+                try {
+                    fresh = scanInlineDefNames(fs.readFileSync(changedId, 'utf8'));
+                } catch {
+                    fresh = []; // deleted / unreadable → contributes nothing
+                }
+                if (fresh.length) inlineDefNamesByFile.set(changedId, new Set(fresh));
+                else inlineDefNamesByFile.delete(changedId);
+                inlineDefIndex.clear();
+                for (const set of inlineDefNamesByFile.values()) for (const n of set) inlineDefIndex.add(n);
+                inlineDefIndexVersion++;
+            }
             // A dep's package.json edit can change its `types`/`exports` entry, so the
             // derived type-entry + parsed-package caches must drop too (keys don't
             // include the changed path, so clear both — package.json edits are rare).
@@ -312,128 +412,122 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
     }
 
     async function runTransform(this: Ctx, code: string, id: string) {
+        // The index must exist before the gate can consult it; build it lazily if
+        // `buildStart` never fired (some bundler adapters skip it). No-op once built.
+        buildInlineDefIndex();
         const consumerHasDirective = ANY_DIRECTIVE.test(code);
         if (stats && consumerHasDirective) stats.directiveFiles++;
 
-        // Gather donor modules via BFS over the consumer's imports and the
-        // re-export edges of each donor (so `export * as vec3 from './vec3'`
-        // barrels resolve). The bundler owns resolution; we read raw source
-        // and record each resolved edge so the core can follow re-exports by
-        // path without re-implementing module resolution. Follow every import;
-        // the `inScope` check on the *resolved* path is what keeps the BFS
-        // inside `include` (so node_modules outside the scope is never read).
-        const byPath = new Map<string, PluginDonor>();
-        const seen = new Set<string>();
-        // queue items carry the donor that imported them (for edge recording);
-        // `null` importer = the consumer itself (no donor to attach the edge to).
-        const queue: { specifier: string; importer: PluginDonor | null }[] = [];
-        for (const m of code.matchAll(IMPORT_FROM)) {
-            const spec = m[1];
-            // Relative (first-party) imports are always followed — that's how a
-            // `@inline` function in your own src takes effect even when the
-            // caller has no directive. Bare/node_modules imports are followed
-            // only when the consumer itself opts in (`@optimize`/`@inline`),
-            // so node_modules is never trawled from directive-less files.
-            if (spec.startsWith('.') || consumerHasDirective) {
-                queue.push({ specifier: spec, importer: null });
-            }
-        }
-
-        // No donor-count cap: the `seen` set visits each resolved module once and
-        // `inScope` bounds the frontier, so this terminates on the finite reachable
-        // graph — like a bundler, which never silently stops at a magic import count.
-        while (queue.length > 0) {
-            const { specifier, importer } = queue.shift() as (typeof queue)[number];
-            const importerId = importer ? importer.path : id;
-            const cacheKey = `${importerId} ${specifier}`;
-            let resolved: { id: string; external?: boolean } | null;
-            if (resolveCache.has(cacheKey)) {
-                if (stats) stats.resolveCacheHits++;
-                resolved = resolveCache.get(cacheKey) ?? null;
-            } else {
-                const rs0 = stats ? performance.now() : 0;
-                // Relative imports resolve with a cheap fs probe (≈0.05ms) —
-                // the bundler's `this.resolve` (≈5ms, full plugin pipeline) is
-                // reserved for bare specifiers, which only directive consumers
-                // follow. This keeps the first-party `@inline` scan fast.
-                try {
-                    if (specifier.startsWith('.')) {
-                        const id2 = resolveRelative(importerId, specifier);
-                        resolved = id2 ? { id: id2, external: false } : null;
-                    } else {
-                        resolved = (await this.resolve?.(specifier, importerId)) ?? null;
-                    }
-                } catch {
-                    resolved = null;
-                } finally {
-                    if (stats) {
-                        stats.resolveMs += performance.now() - rs0;
-                        stats.resolves++;
-                    }
-                }
-                resolveCache.set(cacheKey, resolved);
-            }
-            // Skip unresolved, externalized, and out-of-scope donors — the
-            // last is what stops node_modules (outside `include`) being read.
-            if (!resolved || resolved.external || !inScope(resolved.id)) continue;
-            // Record the edge on the importing donor so the core can follow it.
-            if (importer) importer.resolved.push({ specifier, path: resolved.id });
-            if (seen.has(resolved.id)) continue;
-            seen.add(resolved.id);
-
-            const cached = readDonor(resolved.id);
-            if (!cached) continue; // unreadable donor — skip
-            this.addWatchFile?.(resolved.id);
-            const donor: PluginDonor = {
-                specifier,
-                path: resolved.id,
-                code: cached.code,
-                resolved: [],
-            };
-            byPath.set(resolved.id, donor);
-            // Follow this donor's edges to find more donors — computed by the core
-            // by PARSING (oxc), not regex. `donorEdges` returns every specifier that
-            // could surface an inlinable callable: re-export edges (barrels), a
-            // re-exported namespace object (`import * as ns from S; export { ns }`),
-            // and a re-exported imported binding (`import { set as set$1 } from S;
-            // const set = set$1; export { set }` — quat-as-vec4). AST-correct, so it
-            // catches minified / multi-declarator / ASI shapes the old regexes missed.
-            for (const s of donorEdgesFor(resolved.id, cached)) {
-                queue.push({ specifier: s, importer: donor });
-            }
-        }
-
-        const runtimeDonors = [...byPath.values()];
-        // Track which consumer inlined which donor (for HMR invalidation).
-        for (const d of runtimeDonors) {
-            let set = consumersByDonor.get(d.path);
-            if (!set) {
-                set = new Set();
-                consumersByDonor.set(d.path, set);
-            }
-            set.add(id);
-        }
-        const donorHasDirective = runtimeDonors.some((d) => donorCache.get(d.path)?.hasDirective ?? false);
-        if (!consumerHasDirective && !donorHasDirective) {
+        // GATE first, before ANY resolution: a file that neither carries a directive
+        // NOR calls a first-party `@inline`-def name gathers nothing (the core's
+        // `resolutionFrontier` yields `[]` for it), so short-circuit it here — zero
+        // resolves/reads (the point of the pull model). A directive-less file that
+        // CALLS an `@inline` def (one cheap regex over the index name-set) proceeds:
+        // its def's module must be gathered so the call inlines (the C++-`inline`
+        // "mark once, inline everywhere" ergonomic).
+        const gate = defCallGateFor();
+        if (!consumerHasDirective && !gate?.test(code)) {
             if (stats) stats.skippedNoDirective++;
             return null;
         }
 
-        // Type-source donors: only a directive consumer runs type-directed passes
-        // (SROA, etc.) that need imported shapes, so gather the `.d.ts` surface of
-        // the consumer's imports only then (it's fs-cheap and resolve-cached).
-        const typeImports = consumerHasDirective ? typeImportSpecifiers(code) : [];
-        const typeDonors = typeImports.length > 0 ? await gatherTypeSourceDonors.call(this, id, typeImports) : [];
-        const donors = typeDonors.length > 0 ? [...runtimeDonors, ...typeDonors] : runtimeDonors;
+        // DEMAND-DRIVEN dependency gather. Instead of eagerly resolving the reachable
+        // graph, ask the core what modules are still MISSING to satisfy the host's
+        // directives (`resolutionFrontier`), resolve+read exactly those, record the
+        // edge that lets the core follow to them, and re-query until the frontier is
+        // empty (fixpoint). VALUE dependencies (runtime `.js`/`.ts`) are kept BEFORE TYPE
+        // dependencies (`.d.ts`) in the array handed to both the frontier and the inliner:
+        // the frontier's value-seed and the core `.find` the first dependency by specifier
+        // and must get the runtime one, not its `.d.ts` sibling.
+        const valueDeps: PluginDependency[] = [];
+        const typeDeps: PluginDependency[] = [];
+        const byPath = new Map<string, PluginDependency>();
+        const providedOf = () => (typeDeps.length ? [...valueDeps, ...typeDeps] : valueDeps);
+        // A request tried once (resolved, out-of-scope, or unresolvable) is never
+        // retried, so an unsatisfiable edge can't spin the loop.
+        const attempted = new Set<string>();
+
+        // The first-party `@inline`-def index, marshaled once for the fixpoint. The
+        // frontier turns a host's calls to these names into value needs so their
+        // defining modules (+ closure) get gathered; the core's `require_inline` path
+        // then inlines every such call. Empty array (no defs) → no extra needs.
+        const inlineDefNames = [...inlineDefIndex];
+
+        const f0 = stats ? performance.now() : 0;
+        let requests = resolutionFrontier(id, code, providedOf(), inlineDefNames);
+        if (stats) stats.compileMs += performance.now() - f0;
+
+        while (requests.length > 0) {
+            let addedDependency = false;
+            let addedEdge = false;
+            for (const req of requests) {
+                const attemptKey = `${req.specifier}\0${req.fromPath}\0${req.kind}`;
+                if (attempted.has(attemptKey)) continue;
+                attempted.add(attemptKey);
+
+                const resolvedPath =
+                    req.kind === 'type' ? await resolveTypeRequest.call(this, req) : await resolveValueRequest.call(this, req);
+                // Skip unresolved / externalized / out-of-scope - the last is what
+                // keeps node_modules outside `include` from being read.
+                if (!resolvedPath || !inScope(resolvedPath)) continue;
+
+                // Ensure ONE dependency per distinct resolved path.
+                let dependency = byPath.get(resolvedPath);
+                if (!dependency) {
+                    const cached = readDependency(resolvedPath);
+                    if (!cached) continue; // unreadable - skip
+                    this.addWatchFile?.(resolvedPath);
+                    dependency = { specifier: req.specifier, path: resolvedPath, code: cached.code, resolved: [] };
+                    byPath.set(resolvedPath, dependency);
+                    (req.kind === 'type' ? typeDeps : valueDeps).push(dependency);
+                    addedDependency = true;
+                }
+
+                // Record the edge so the frontier can follow it. A top-level seed
+                // (`fromPath === id`) is matched by SPECIFIER, so stamp the dependency's
+                // `.specifier`; a deeper edge is matched by PATH, so push it onto the
+                // importing dependency's `.resolved` (deduped).
+                if (req.fromPath === id) {
+                    if (dependency.specifier !== req.specifier) {
+                        dependency.specifier = req.specifier;
+                        addedEdge = true;
+                    }
+                } else {
+                    const from = byPath.get(req.fromPath);
+                    if (from && !from.resolved.some((e) => e.specifier === req.specifier && e.path === resolvedPath)) {
+                        from.resolved.push({ specifier: req.specifier, path: resolvedPath });
+                        addedEdge = true;
+                    }
+                }
+            }
+            // Fixpoint: a round that added neither a dependency nor an edge can't advance
+            // the frontier - the remaining requests are genuinely unresolvable, so
+            // their calls stay un-inlined (correct). Break before re-querying.
+            if (!addedDependency && !addedEdge) break;
+            const fN = stats ? performance.now() : 0;
+            requests = resolutionFrontier(id, code, providedOf(), inlineDefNames);
+            if (stats) stats.compileMs += performance.now() - fN;
+        }
+
+        const dependencies = providedOf();
+        // Track which consumer inlined which dependency (for HMR invalidation).
+        for (const d of dependencies) {
+            let set = consumersByDependency.get(d.path);
+            if (!set) {
+                set = new Set();
+                consumersByDependency.set(d.path, set);
+            }
+            set.add(id);
+        }
 
         const c0 = stats ? performance.now() : 0;
         const r =
-            donors.length > 0
-                ? compiler.compileFileCross(id, code, donors, { sourcemap })
+            dependencies.length > 0
+                ? compiler.compileFileCross(id, code, dependencies, { sourcemap })
                 : compiler.compileFile(id, code, { sourcemap });
         if (stats) {
             stats.compileMs += performance.now() - c0;
-            if (donors.length > 0) stats.compiledCross++;
+            if (dependencies.length > 0) stats.compiledCross++;
             else stats.compiledFile++;
         }
         if (!r.changed) return null;
@@ -441,55 +535,82 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
         return { code: r.code, map: r.map };
     }
 
-    // BFS the `.d.ts` type surface of a consumer's type imports so the core can resolve
-    // package type aliases. Donors carry `.d.ts` PATHS (the core parses by extension — a
-    // `.js` path silently drops the types) plus their resolved re-export edges, so the
-    // core follows re-exports without re-resolving modules.
-    async function gatherTypeSourceDonors(this: Ctx, consumerId: string, imports: string[]): Promise<PluginDonor[]> {
-        const byPath = new Map<string, PluginDonor>();
-        const seen = new Set<string>();
-        const queue: { specifier: string; importer: PluginDonor | null }[] = imports.map((specifier) => ({
-            specifier,
-            importer: null,
-        }));
-
-        // No cap: `seen` + flat-only following bound this to a package's finite type
-        // surface, so it gathers the complete set — never a silently-truncated one.
-        while (queue.length > 0) {
-            const { specifier, importer } = queue.shift() as (typeof queue)[number];
-            const importerId = importer ? importer.path : consumerId;
-
-            let dtsPath: string | null;
-            if (specifier.startsWith('.')) {
-                // A `.d.ts` re-export like `export * from './x.js'` often names a
-                // type-only module with no runtime `.js`, so probe the `.d.ts` directly
-                // before falling back to resolving a runtime module + its sibling.
-                const abs = path.resolve(path.dirname(importerId), specifier);
-                dtsPath = declarationCandidates(abs).find(isFile) ?? null;
-                if (!dtsPath) {
-                    const rt = resolveRelative(importerId, specifier);
-                    dtsPath = rt ? declarationFor(rt) : null;
+    // Resolve one VALUE frontier request to its runtime module path. Uses the
+    // bundler's `this.resolve` for BOTH bare and relative specifiers - resolution
+    // is then bundler-faithful (aliases, exports maps, extension order) with no
+    // hand-rolled probe to drift from it, and it's affordable now that the pull
+    // model resolves almost nothing. Bare specifiers are identity-cached by the
+    // specifier alone (so `mathcat` resolves once, not once per importer); relative
+    // ones by `dirname(fromPath)\0specifier`.
+    async function resolveValueRequest(this: Ctx, req: FrontierRequest): Promise<string | null> {
+        const bare = !req.specifier.startsWith('.');
+        const cacheKey = bare ? req.specifier : `${path.dirname(req.fromPath)}\0${req.specifier}`;
+        let p = resolveCache.get(cacheKey);
+        if (p) {
+            if (stats) stats.resolveCacheHits++;
+        } else {
+            if (stats) stats.resolves++;
+            const rs0 = performance.now();
+            // Start + cache the PROMISE synchronously (before any await) so concurrent
+            // callers dedup onto it. A relative specifier is resolved by a cheap fs-probe
+            // (relatives are never bundler-aliased, and it avoids `this.resolve`'s pipeline
+            // warmup) — but ONLY when the probe is UNAMBIGUOUS (exactly one candidate on
+            // disk). If both e.g. `foo.ts` and `foo.js` exist, the probe can't know which
+            // the bundler binds, so it DEFERS to `this.resolve` (soundness — never guess
+            // `.ts`-first and risk inlining the wrong module). Bare specifiers always go
+            // through `this.resolve` (that's where aliases / exports / plugins live).
+            const bundlerResolve = () => this.resolve?.(req.specifier, req.fromPath, { skipSelf: true });
+            p = (async () => {
+                try {
+                    if (bare) return (await bundlerResolve()) ?? null;
+                    const abs = path.resolve(path.dirname(req.fromPath), req.specifier);
+                    // Explicit extension → unambiguous if it exists; else defer (virtual/query).
+                    if (path.extname(abs)) return (isFile(abs) ? { id: abs } : await bundlerResolve()) ?? null;
+                    const cands: string[] = [];
+                    for (const e of ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'])
+                        if (isFile(abs + e)) cands.push(abs + e);
+                    for (const i of [
+                        '/index.ts',
+                        '/index.tsx',
+                        '/index.mts',
+                        '/index.cts',
+                        '/index.js',
+                        '/index.jsx',
+                        '/index.mjs',
+                        '/index.cjs',
+                    ])
+                        if (isFile(abs + i)) cands.push(abs + i);
+                    // Exactly one candidate → the bundler must bind it too (fast path).
+                    // Zero (virtual module) or two+ (ambiguous) → let the bundler decide.
+                    return cands.length === 1 ? { id: cands[0] } : ((await bundlerResolve()) ?? null);
+                } catch {
+                    return null;
+                } finally {
+                    if (stats) stats.resolveMs += performance.now() - rs0;
                 }
-            } else {
-                dtsPath = await resolvePackageTypeEntry.call(this, specifier, importerId);
-            }
-            if (!dtsPath || !inScope(dtsPath)) continue;
-            // Record the edge (by path) so the core follows this re-export to its target.
-            if (importer) importer.resolved.push({ specifier, path: dtsPath });
-            if (seen.has(dtsPath)) continue;
-            seen.add(dtsPath);
-
-            const cached = readDonor(dtsPath);
-            if (!cached) continue;
-            this.addWatchFile?.(dtsPath);
-            const donor: PluginDonor = { specifier, path: dtsPath, code: cached.code, resolved: [] };
-            byPath.set(dtsPath, donor);
-            for (const m of cached.code.matchAll(EXPORT_FLAT_FROM)) {
-                queue.push({ specifier: m[1], importer: donor });
-            }
+            })();
+            resolveCache.set(cacheKey, p);
         }
+        const resolved = await p;
+        if (!resolved || resolved.external) return null;
+        return resolved.id;
+    }
 
-        return [...byPath.values()];
+    // Resolve one TYPE frontier request to its `.d.ts` entry, on demand - the
+    // per-request form of the old eager type-dependency gather. Bare packages go through
+    // the package.json `exports`/`types` resolver; a relative type edge (a `.d.ts`
+    // re-export like `export * from './types.js'`, which often names a type-only
+    // module with no runtime `.js`) probes the `.d.ts` candidates directly, then
+    // falls back to a resolved runtime module's sibling `.d.ts`.
+    async function resolveTypeRequest(this: Ctx, req: FrontierRequest): Promise<string | null> {
+        if (!req.specifier.startsWith('.')) {
+            return resolvePackageTypeEntry.call(this, req.specifier, req.fromPath);
+        }
+        const abs = path.resolve(path.dirname(req.fromPath), req.specifier);
+        const direct = declarationCandidates(abs).find(isFile);
+        if (direct) return direct;
+        const rt = await resolveValueRequest.call(this, req);
+        return rt ? declarationFor(rt) : null;
     }
 
     // Resolve a bare package specifier to its `.d.ts` type entry, in TypeScript's
@@ -506,28 +627,14 @@ export const unpluginCompilecat = createUnplugin<Options, false>((options, _meta
             return hit.dts;
         }
 
-        // Node-resolve the runtime entry (shares the runtime resolve cache) — used to
-        // locate the package root and as the sibling-`.d.ts` fallback.
-        const cacheKey = `${importerId} ${specifier}`;
-        let runtimeId: string | null;
-        if (resolveCache.has(cacheKey)) {
-            if (stats) stats.resolveCacheHits++;
-            runtimeId = resolveCache.get(cacheKey)?.id ?? null;
-        } else {
-            const rs0 = stats ? performance.now() : 0;
-            try {
-                const r = (await this.resolve?.(specifier, importerId)) ?? null;
-                runtimeId = r?.id ?? null;
-                resolveCache.set(cacheKey, r);
-            } catch {
-                runtimeId = null;
-            } finally {
-                if (stats) {
-                    stats.resolveMs += performance.now() - rs0;
-                    stats.resolves++;
-                }
-            }
-        }
+        // Node-resolve the runtime entry — used to locate the package root and as the
+        // sibling-`.d.ts` fallback. Reuses `resolveValueRequest`'s promise-cache, so a
+        // package's runtime entry resolves ONCE across both its value and type needs.
+        const runtimeId = await resolveValueRequest.call(this, {
+            specifier,
+            fromPath: importerId,
+            kind: 'value',
+        } as FrontierRequest);
 
         const result = resolveTypeEntryFrom(runtimeId, specifier);
         if (result.pkgJson) this.addWatchFile?.(result.pkgJson);

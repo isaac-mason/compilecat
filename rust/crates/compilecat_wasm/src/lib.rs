@@ -19,9 +19,10 @@
 use std::cell::RefCell;
 
 use compilecat_core::{
-    donor_edges as core_donor_edges, format as core_format, run_pass as core_run_pass, transform,
-    transform_cross_file, Donor, Mode, ModuleCache, SourceType, Stats, TransformOptions,
-    TransformOutput,
+    dependency_edges as core_dependency_edges, format as core_format,
+    resolution_frontier as core_resolution_frontier, run_pass as core_run_pass, transform,
+    transform_cross_file, Dependency as CoreDependency, FrontierKind as CoreFrontierKind, Mode,
+    ModuleCache, SourceType, Stats, TransformOptions, TransformOutput,
 };
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
@@ -33,7 +34,7 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// A resolved `… from '<specifier>'` edge of a donor (specifier → path) — lets
+/// A resolved `… from '<specifier>'` edge of a dependency (specifier → path) — lets
 /// the core follow a re-export to the module at `path`.
 #[derive(Deserialize)]
 pub struct ResolvedEdge {
@@ -41,20 +42,50 @@ pub struct ResolvedEdge {
     pub path: String,
 }
 
-/// A donor module the consumer imports from. In the browser the *host* supplies
+/// A dependency module the consumer imports from. In the browser the *host* supplies
 /// these (a virtual FS / module map) exactly as the JS plugin does in Node — the
 /// core never touches a filesystem.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DonorModule {
+pub struct Dependency {
     pub specifier: String,
-    /// The donor's own resolved path — lets the core rebase the donor's relative
+    /// The dependency's own resolved path — lets the core rebase the dependency's relative
     /// imports when forwarding them, and match it as a re-export target.
     pub path: String,
     pub code: String,
-    /// Resolved re-export/import edges of this donor (specifier → path).
+    /// Resolved re-export/import edges of this dependency (specifier → path).
     #[serde(default)]
     pub resolved: Vec<ResolvedEdge>,
+}
+
+/// Which resolution a frontier request feeds — a `Value` need is a runtime `.js`,
+/// a `Type` need is a `.d.ts`. Serialized to the JS strings `"value"` / `"type"`.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FrontierKind {
+    Value,
+    Type,
+}
+
+impl From<CoreFrontierKind> for FrontierKind {
+    fn from(k: CoreFrontierKind) -> Self {
+        match k {
+            CoreFrontierKind::Value => FrontierKind::Value,
+            CoreFrontierKind::Type => FrontierKind::Type,
+        }
+    }
+}
+
+/// One module edge the host still needs but that isn't reachable within the
+/// dependencies gathered so far — the demand-driven counterpart to a `Dependency`,
+/// serialized to a camelCase JS object (`{ specifier, fromPath, kind }`) where
+/// `kind` is `"value"` (a runtime `.js`) or `"type"` (a `.d.ts`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrontierRequest {
+    pub specifier: String,
+    pub from_path: String,
+    pub kind: FrontierKind,
 }
 
 #[derive(Deserialize, Default)]
@@ -129,15 +160,52 @@ pub fn format(id: String, code: String) -> String {
     core_format(&code, &id)
 }
 
-/// The specifiers the donor BFS should follow from ONE module — the AST-based
-/// replacement for the plugin's donor-edge regexes. Mirrors `donorEdges` in the
-/// napi crate: `id` (the donor's path) picks the source type, and the return is a
-/// dedup'd, order-stable list of specifiers to read as further donors (see
-/// [`compilecat_core::donor_edges`]).
-#[wasm_bindgen(js_name = donorEdges)]
-pub fn donor_edges(id: String, code: String) -> Vec<String> {
+/// The specifiers the dependency BFS should follow from ONE module — the AST-based
+/// replacement for the plugin's dependency-edge regexes. Mirrors `dependencyEdges` in the
+/// napi crate: `id` (the dependency's path) picks the source type, and the return is a
+/// dedup'd, order-stable list of specifiers to read as further dependencies (see
+/// [`compilecat_core::dependency_edges`]).
+#[wasm_bindgen(js_name = dependencyEdges)]
+pub fn dependency_edges(id: String, code: String) -> Vec<String> {
     let source_type = SourceType::from_path(&id).unwrap_or_default();
-    core_donor_edges(&code, source_type)
+    core_dependency_edges(&code, source_type)
+}
+
+/// The module edges the host still needs given the dependencies gathered so far — the
+/// demand-driven dependency-gather fixpoint's "what's still missing?" query. Mirrors
+/// `resolutionFrontier` in the napi crate. STATELESS: the host calls it with a
+/// growing `provided` set until it returns `[]`, then hands the assembled set to
+/// `compileFileCross`. `id` (the host's path) picks the source type; `provided` is
+/// an array of `Dependency`. See [`compilecat_core::resolution_frontier`].
+#[wasm_bindgen(js_name = resolutionFrontier)]
+pub fn resolution_frontier(
+    id: String,
+    code: String,
+    provided: JsValue,
+    inline_def_names: JsValue,
+) -> Result<JsValue, JsValue> {
+    let provided: Vec<Dependency> = serde_wasm_bindgen::from_value(provided)?;
+    let provided: Vec<CoreDependency> = provided
+        .into_iter()
+        .map(|d| CoreDependency {
+            specifier: d.specifier,
+            path: d.path,
+            code: d.code,
+            resolved: d.resolved.into_iter().map(|r| (r.specifier, r.path)).collect(),
+        })
+        .collect();
+    let inline_def_names: Vec<String> = serde_wasm_bindgen::from_value(inline_def_names)?;
+    let requests: Vec<FrontierRequest> = core_resolution_frontier(
+        &id,
+        &code,
+        &provided,
+        &inline_def_names,
+        &TransformOptions { filename: id.clone(), source_type: None, mode: Mode::PerFile, sourcemap: false },
+    )
+    .into_iter()
+    .map(|(specifier, from_path, kind)| FrontierRequest { specifier, from_path, kind: kind.into() })
+    .collect();
+    Ok(serde_wasm_bindgen::to_value(&requests)?)
 }
 
 /// Run a single named pass in isolation (per-pass differential harness). Returns
@@ -157,7 +225,7 @@ pub fn run_pass(name: String, id: String, code: String) -> Result<JsValue, JsVal
 
 #[wasm_bindgen]
 pub struct Compiler {
-    /// Build-scoped parsed-module cache, amortized across calls (donors parsed
+    /// Build-scoped parsed-module cache, amortized across calls (dependencies parsed
     /// once). `RefCell` for interior mutability behind `&self`; wasm is
     /// single-threaded so the `!Send` oxc ASTs it holds are never shared.
     cache: RefCell<ModuleCache>,
@@ -171,23 +239,23 @@ impl Compiler {
         Compiler { cache: RefCell::new(ModuleCache::new()) }
     }
 
-    /// Cross-module per-file pass: inline `@inline` donors the consumer imports.
-    /// `donors` is an array of `DonorModule`; `options` may be omitted/undefined.
+    /// Cross-module per-file pass: inline `@inline` dependencies the consumer imports.
+    /// `dependencies` is an array of `Dependency`; `options` may be omitted/undefined.
     #[wasm_bindgen(js_name = compileFileCross)]
     pub fn compile_file_cross(
         &self,
         id: String,
         code: String,
-        donors: JsValue,
+        dependencies: JsValue,
         options: JsValue,
     ) -> Result<JsValue, JsValue> {
-        let donors: Vec<DonorModule> = serde_wasm_bindgen::from_value(donors)?;
+        let dependencies: Vec<Dependency> = serde_wasm_bindgen::from_value(dependencies)?;
         let options = parse_options(options)?;
         let sourcemap = options.sourcemap.unwrap_or(true);
 
-        let donors: Vec<Donor> = donors
+        let dependencies: Vec<CoreDependency> = dependencies
             .into_iter()
-            .map(|d| Donor {
+            .map(|d| CoreDependency {
                 specifier: d.specifier,
                 path: d.path,
                 code: d.code,
@@ -197,7 +265,7 @@ impl Compiler {
 
         let out = transform_cross_file(
             &code,
-            &donors,
+            &dependencies,
             &TransformOptions { filename: id, source_type: None, mode: Mode::PerFile, sourcemap },
             &mut self.cache.borrow_mut(),
         );

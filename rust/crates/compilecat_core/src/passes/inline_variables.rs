@@ -119,7 +119,7 @@ fn sweep<'a>(allocator: &'a Allocator, program: &mut Program<'a>, gate: &super::
             // constant — value-propagating it into use sites destroys authored
             // intent. The `export { X }` reference is not a plain read, so its
             // multi-use inline bails.
-            // Donor-private consts (cross-file `@inline`) are NOT exported, so
+            // Dependency-private consts (cross-file `@inline`) are NOT exported, so
             // they still fold — no regression there.
             if matches!(
                 nodes.parent_kind(nodes.parent_id(decl_id)),

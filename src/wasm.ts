@@ -7,15 +7,19 @@
 // addon can't load) import this via `compilecat/wasm` instead of the Node-only
 // `compilecat`.
 
-import initWasm, { Compiler as WasmCompiler, donorEdges as wasmDonorEdges, format as wasmFormat } from '@compilecat/wasm';
+import initWasm, {
+    Compiler as WasmCompiler,
+    dependencyEdges as wasmDependencyEdges,
+    format as wasmFormat,
+} from '@compilecat/wasm';
 import type { Compiler } from './compiler';
 
 export type {
     CompileOptions,
     CompileResult,
-    CompileStats,
-    DonorModule,
     Compiler,
+    CompileStats,
+    Dependency,
     ResolvedEdge,
 } from './compiler';
 
@@ -44,9 +48,9 @@ export async function format(id: string, code: string): Promise<string> {
     return wasmFormat(id, code);
 }
 
-/** The specifiers the donor BFS should follow from ONE module — the wasm twin of
- *  `compiler.ts`'s `donorEdges` (async: wasm must `init()` first). */
-export async function donorEdges(id: string, code: string): Promise<string[]> {
+/** The specifiers the dependency BFS should follow from ONE module — the wasm twin of
+ *  `compiler.ts`'s `dependencyEdges` (async: wasm must `init()` first). */
+export async function dependencyEdges(id: string, code: string): Promise<string[]> {
     await init();
-    return wasmDonorEdges(id, code);
+    return wasmDependencyEdges(id, code);
 }
