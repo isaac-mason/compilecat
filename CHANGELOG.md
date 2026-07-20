@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## v0.0.10 (Unreleased)
+## v0.0.10
 
 - feat: **demand-driven ("pull") module resolution.** The eager dependency-graph BFS is replaced by a stateless `resolutionFrontier`: the plugin asks the core which modules are still MISSING to satisfy a host's directives, resolves + reads only those in a fixpoint loop, and does ZERO work for a directive-less file. Resolution now goes through the bundler's own `this.resolve` (aliases / `exports` maps / `resolve.extensions` / plugins) — bundler-faithful rather than a reimplementation — with a promise-cache so concurrent transforms share one resolve, and a fs-probe fast path kept only for the case a probe can't get wrong (a relative specifier with an explicit, transformable extension on disk). A correctness + ecosystem win, not only perf. The `donor` concept is renamed to `dependency` throughout (core / napi / wasm / plugin)
 - feat: **full C++-style `@inline` directive surface.** `/* @inline */` on a call site now inlines that one call even when the callee is imported from another module (cross-file call-site inline); and a function whose *definition* is marked `@inline` is inlined at ALL its callers — including directive-less callers in other files ("mark once, inline everywhere") — via a build-start index of first-party `@inline` defs. Complements `@optimize` / `@flatten` / `@sroa` / `@unroll`
